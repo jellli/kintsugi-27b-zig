@@ -2,6 +2,8 @@ const std = @import("std");
 const config = @import("config.zig");
 const cuda = @import("cuda.zig");
 const gguf = @import("gguf.zig");
+const escha_ref = @import("escha_ref.zig");
+const escha_bench = @import("escha_bench.zig");
 
 const sm89_core_cubin = @embedFile("sm89_core.cubin");
 
@@ -19,6 +21,9 @@ pub fn main(init: std.process.Init) !void {
         const model_path = if (args.len >= 3) args[2] else default_model_path;
         const drafter_path = if (args.len >= 4) args[3] else default_drafter_path;
         try runInfo(allocator, model_path, drafter_path);
+    } else if (std.mem.eql(u8, cmd, "bench-escha")) {
+        const model_path = if (args.len >= 3) args[2] else default_model_path;
+        try escha_bench.run(allocator, model_path);
     } else {
         std.debug.print(
             \\kintsugi-zig — dedicated sm_89 CUDA runtime for Kintsugi-27B + DFlash2
@@ -26,6 +31,7 @@ pub fn main(init: std.process.Init) !void {
             \\Commands:
             \\  probe                         Verify RTX 4070 Ti CUDA Driver API, sm_89 CUBIN kernels & D2D bandwidth
             \\  info [model.gguf] [draft.gguf] Zero-copy mmap GGUF inspection & static VRAM KV budget plan
+            \\  bench-escha [model.gguf]      Verify Escha 2/3-bit sm_89 GEMV against CPU ref & benchmark geometries
             \\
         , .{});
     }
@@ -343,4 +349,5 @@ fn runInfo(allocator: std.mem.Allocator, model_path: []const u8, drafter_path: [
 test {
     _ = config;
     _ = gguf;
+    _ = escha_ref;
 }
