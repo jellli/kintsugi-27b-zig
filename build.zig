@@ -5,31 +5,40 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const sm_arch = b.option([]const u8, "arch", "CUDA SM architecture (default: sm_89)") orelse "sm_89";
 
-    // Step 1: Compile CUDA kernels -> sm_89 native CUBIN via CUDA 12.8 NVRTC
-    const compile_core = b.addSystemCommand(&.{ "python3", "tools/compile_cubin.py" });
-    compile_core.addFileArg(b.path("kernels/sm89_core.cu"));
-    const core_cubin_out = compile_core.addOutputFileArg("sm89_core.cubin");
-    compile_core.addArg(sm_arch);
-
-    const compile_escha = b.addSystemCommand(&.{ "python3", "tools/compile_cubin.py" });
-    compile_escha.addFileArg(b.path("kernels/escha_sm89.cu"));
-    const escha_cubin_out = compile_escha.addOutputFileArg("escha_sm89.cubin");
-    compile_escha.addArg(sm_arch);
-
-    // Step 2: Build self-contained Zig runtime embedding native sm_89 CUBINs
+    // Step 1: Build self-contained Zig runtime embedding all native sm_89 CUBINs
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    root_mod.addAnonymousImport("sm89_core.cubin", .{
-        .root_source_file = core_cubin_out,
-    });
-    root_mod.addAnonymousImport("escha_sm89.cubin", .{
-        .root_source_file = escha_cubin_out,
-    });
     root_mod.linkSystemLibrary("cuda", .{});
+
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    test_mod.linkSystemLibrary("cuda", .{});
+
+    // Compile every kernels/*.cu -> sm_89 native CUBIN via CUDA 12.8 NVRTC
+    const kernel_specs = [_]struct { src: []const u8, name: []const u8 }{
+        .{ .src = "kernels/sm89_core.cu", .name = "sm89_core.cubin" },
+        .{ .src = "kernels/escha_sm89.cu", .name = "escha_sm89.cubin" },
+        .{ .src = "kernels/gdn_sm89.cu", .name = "gdn_sm89.cubin" },
+        .{ .src = "kernels/attn_sm89.cu", .name = "attn_sm89.cubin" },
+        .{ .src = "kernels/lmhead_sm89.cu", .name = "lmhead_sm89.cubin" },
+    };
+    for (kernel_specs) |ks| {
+        const cmd = b.addSystemCommand(&.{"python3"});
+        cmd.addFileArg(b.path("tools/compile_cubin.py"));
+        cmd.addFileArg(b.path(ks.src));
+        const cubin_out = cmd.addOutputFileArg(ks.name);
+        cmd.addArg(sm_arch);
+        root_mod.addAnonymousImport(ks.name, .{ .root_source_file = cubin_out });
+        test_mod.addAnonymousImport(ks.name, .{ .root_source_file = cubin_out });
+    }
 
     const exe = b.addExecutable(.{
         .name = "kintsugi-zig",
@@ -45,20 +54,6 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // `zig build test` (CPU unit tests — no GPU needed)
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    test_mod.addAnonymousImport("sm89_core.cubin", .{
-        .root_source_file = core_cubin_out,
-    });
-    test_mod.addAnonymousImport("escha_sm89.cubin", .{
-        .root_source_file = escha_cubin_out,
-    });
-    test_mod.linkSystemLibrary("cuda", .{});
-
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
     });

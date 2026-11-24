@@ -48,7 +48,6 @@ def main() -> int:
         f"-I{os.path.join(cuda_home, 'include')}".encode(),
         f"-I{os.path.dirname(os.path.abspath(in_path))}".encode(),
         b"--std=c++17",
-        b"--use_fast_math",
         b"-lineinfo",
     ]
     c_opts = (ctypes.c_char_p * len(opts))(*opts)
