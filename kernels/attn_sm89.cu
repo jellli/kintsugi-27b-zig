@@ -70,6 +70,7 @@ static __device__ __forceinline__ void quantize_q4_0_warp(float val, uint8_t* ds
         float other = __shfl_xor_sync(0xffffffffu, amax, mask);
         if (fabsf(other) > fabsf(amax)) amax = other;
     }
+    amax = __shfl_sync(0xffffffffu, amax, 0);
     const float d = amax * (-0.125f); // amax / -8.0f
     const float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
 

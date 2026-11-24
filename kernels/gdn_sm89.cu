@@ -243,7 +243,7 @@ extern "C" __global__ void __launch_bounds__(128, 4) gdn_recurrence_sm89(
     const int col0 = (blockIdx.y * 4 + threadIdx.y) * 4; // 4 cols per warp
 
     const float* s_in_h = state_in + (size_t)h * (GDN_D * GDN_D);
-    float* s_out_h = state_out + (size_t)h * (GDN_D * GDN_D);
+    float* s_out_h = state_out ? (state_out + (size_t)h * (GDN_D * GDN_D)) : nullptr;
 
     float s[4][4];
     #pragma unroll
@@ -257,7 +257,7 @@ extern "C" __global__ void __launch_bounds__(128, 4) gdn_recurrence_sm89(
     const int commit_at = (n_commit > 0 && n_commit <= n_tokens) ? n_commit : n_tokens;
 
     for (int t = 0; t < n_tokens; ++t) {
-        const float* qt = q + ((size_t)t * GDN_HK + hk) * GDN_D;
+        const float* qt = attn_out ? (q + ((size_t)t * GDN_HK + hk) * GDN_D) : nullptr;
         const float* kt = k + ((size_t)t * GDN_HK + hk) * GDN_D;
         const float* vt = v + ((size_t)t * GDN_HV + h) * GDN_D;
         const float gv = g_exp[(size_t)t * GDN_HV + h];
@@ -268,10 +268,10 @@ extern "C" __global__ void __launch_bounds__(128, 4) gdn_recurrence_sm89(
         for (int r = 0; r < 4; ++r) {
             const int idx = r * 32 + lane;
             kr[r] = kt[idx];
-            qr[r] = qt[idx];
+            qr[r] = qt ? qt[idx] : 0.0f;
         }
 
-        float* out_t = attn_out + ((size_t)t * GDN_HV + h) * GDN_D;
+        float* out_t = attn_out ? (attn_out + ((size_t)t * GDN_HV + h) * GDN_D) : nullptr;
 
         #pragma unroll
         for (int c = 0; c < 4; ++c) {
@@ -284,15 +284,17 @@ extern "C" __global__ void __launch_bounds__(128, 4) gdn_recurrence_sm89(
             for (int r = 0; r < 4; ++r) {
                 const float ns = gv * s[c][r] + kr[r] * delta;
                 s[c][r] = ns;
-                o_part += ns * qr[r];
+                if (out_t) o_part += ns * qr[r];
             }
-            const float o_col = warp_sum_32(o_part);
-            if (lane == 0) {
-                out_t[col0 + c] = o_col * GDN_INV_SQRT128;
+            if (out_t) {
+                const float o_col = warp_sum_32(o_part);
+                if (lane == 0) {
+                    out_t[col0 + c] = o_col * GDN_INV_SQRT128;
+                }
             }
         }
 
-        if ((t + 1) == commit_at) {
+        if (s_out_h && (t + 1) == commit_at) {
             #pragma unroll
             for (int c = 0; c < 4; ++c) {
                 #pragma unroll
@@ -302,6 +304,31 @@ extern "C" __global__ void __launch_bounds__(128, 4) gdn_recurrence_sm89(
             }
         }
     }
+}
+
+// =============================================================================
+// 3b. Advance Conv1D state [3, 10240] in-place by n_commit tokens from saved qkv_in + bias
+//     Grid: (80, 1, 1), Block: (128, 1, 1)
+// =============================================================================
+extern "C" __global__ void __launch_bounds__(128, 4) gdn_commit_conv_state_f32(
+    const float* __restrict__ qkv_in,
+    const float* __restrict__ qkv_bias,
+    float* __restrict__ conv_state, // in-out [3, 10240]
+    int n_commit
+) {
+    const int ch = blockIdx.x * GDN_D + threadIdx.x;
+    const float b = qkv_bias ? qkv_bias[ch] : 0.0f;
+    float h0 = conv_state[0 * GDN_QKV_DIM + ch];
+    float h1 = conv_state[1 * GDN_QKV_DIM + ch];
+    float h2 = conv_state[2 * GDN_QKV_DIM + ch];
+    for (int t = 0; t < n_commit; ++t) {
+        h0 = h1;
+        h1 = h2;
+        h2 = qkv_in[(size_t)t * GDN_QKV_DIM + ch] + b;
+    }
+    conv_state[0 * GDN_QKV_DIM + ch] = h0;
+    conv_state[1 * GDN_QKV_DIM + ch] = h1;
+    conv_state[2 * GDN_QKV_DIM + ch] = h2;
 }
 
 // =============================================================================

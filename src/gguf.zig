@@ -202,6 +202,99 @@ pub const GgufFile = struct {
         const len: usize = @intCast(info.byteSize());
         return self.mapped[start .. start + len];
     }
+
+    pub const TokenizerMeta = struct {
+        tokens: [][]const u8,
+        merges: [][]const u8,
+        token_types: []i32,
+        eos_id: u32 = 248046,
+        bos_id: u32 = 248044,
+        pad_id: u32 = 248044,
+        mask_id: u32 = 248070,
+
+        pub fn deinit(self: *TokenizerMeta, allocator: std.mem.Allocator) void {
+            allocator.free(self.tokens);
+            allocator.free(self.merges);
+            allocator.free(self.token_types);
+        }
+    };
+
+    pub fn readTokenizerMeta(self: *const GgufFile, allocator: std.mem.Allocator) !TokenizerMeta {
+        var cur: usize = 4 + 4 + 8 + 8; // skip magic, version, n_tensors, n_kv
+        var meta: TokenizerMeta = .{
+            .tokens = &.{},
+            .merges = &.{},
+            .token_types = &.{},
+        };
+        errdefer {
+            if (meta.tokens.len > 0) allocator.free(meta.tokens);
+            if (meta.merges.len > 0) allocator.free(meta.merges);
+            if (meta.token_types.len > 0) allocator.free(meta.token_types);
+        }
+
+        for (0..@as(usize, @intCast(self.n_kv))) |_| {
+            const key = readStr(self.mapped, &cur);
+            const vtype = readInt(u32, self.mapped, &cur);
+            if (std.mem.eql(u8, key, "tokenizer.ggml.tokens") and vtype == 9) {
+                const elem_type = readInt(u32, self.mapped, &cur);
+                const len: usize = @intCast(readInt(u64, self.mapped, &cur));
+                if (elem_type != 8) return error.InvalidTokenizerMeta;
+                const arr = try allocator.alloc([]const u8, len);
+                for (0..len) |i| arr[i] = readStr(self.mapped, &cur);
+                meta.tokens = arr;
+            } else if (std.mem.eql(u8, key, "tokenizer.ggml.merges") and vtype == 9) {
+                const elem_type = readInt(u32, self.mapped, &cur);
+                const len: usize = @intCast(readInt(u64, self.mapped, &cur));
+                if (elem_type != 8) return error.InvalidTokenizerMeta;
+                const arr = try allocator.alloc([]const u8, len);
+                for (0..len) |i| arr[i] = readStr(self.mapped, &cur);
+                meta.merges = arr;
+            } else if (std.mem.eql(u8, key, "tokenizer.ggml.token_type") and vtype == 9) {
+                const elem_type = readInt(u32, self.mapped, &cur);
+                const len: usize = @intCast(readInt(u64, self.mapped, &cur));
+                if (elem_type != 5) return error.InvalidTokenizerMeta;
+                const arr = try allocator.alloc(i32, len);
+                for (0..len) |i| arr[i] = readInt(i32, self.mapped, &cur);
+                meta.token_types = arr;
+            } else if (std.mem.eql(u8, key, "tokenizer.ggml.eos_token_id") and vtype == 4) {
+                meta.eos_id = readInt(u32, self.mapped, &cur);
+            } else if (std.mem.eql(u8, key, "tokenizer.ggml.bos_token_id") and vtype == 4) {
+                meta.bos_id = readInt(u32, self.mapped, &cur);
+            } else if (std.mem.eql(u8, key, "tokenizer.ggml.padding_token_id") and vtype == 4) {
+                meta.pad_id = readInt(u32, self.mapped, &cur);
+            } else if (std.mem.eql(u8, key, "tokenizer.ggml.mask_token_id") and vtype == 4) {
+                meta.mask_id = readInt(u32, self.mapped, &cur);
+            } else {
+                try skipValue(self.mapped, &cur, vtype);
+            }
+        }
+        return meta;
+    }
+
+    pub fn readDflashTargetLayers(self: *const GgufFile, out: *[5]u32) !usize {
+        var cur: usize = 4 + 4 + 8 + 8;
+        for (0..@as(usize, @intCast(self.n_kv))) |_| {
+            const key = readStr(self.mapped, &cur);
+            const vtype = readInt(u32, self.mapped, &cur);
+            if (std.mem.eql(u8, key, "dflash.target_layers") and vtype == 9) {
+                const elem_type = readInt(u32, self.mapped, &cur);
+                const len: usize = @intCast(readInt(u64, self.mapped, &cur));
+                const n = @min(len, out.len);
+                for (0..len) |i| {
+                    const v: u32 = switch (elem_type) {
+                        4 => readInt(u32, self.mapped, &cur),
+                        5 => @intCast(readInt(i32, self.mapped, &cur)),
+                        else => return error.InvalidTargetLayers,
+                    };
+                    if (i < n) out[i] = v;
+                }
+                return n;
+            } else {
+                try skipValue(self.mapped, &cur, vtype);
+            }
+        }
+        return 0;
+    }
 };
 
 fn alignUp(v: u64, a: u64) u64 {

@@ -476,3 +476,12 @@ extern "C" __global__ void __launch_bounds__(128, 8) escha_gemv_k3_m8_narrow_s4(
 extern "C" __global__ void __launch_bounds__(512, 2) escha_gemv_k3_m8_narrow_w1s16(
     const __half* A, const uint16_t* B, const __half* rout, float* C, int m, int k, int n
 ) { escha_gemv_impl<3, 1, 1, 16, false>(A, B, rout, C, m, k, n); }
+
+// 8. M=1 single-token high-SM-saturation narrow unfused: WNT=2, S=16, G=1 -> 512 threads, grid OC/32
+extern "C" __global__ void __launch_bounds__(512, 2) escha_gemv_k2_m1_narrow_s16(
+    const __half* A, const uint16_t* B, const __half* rout, float* C, int m, int k, int n
+) { escha_gemv_impl<2, 0, 2, 16, false>(A, B, rout, C, m, k, n); }
+
+extern "C" __global__ void __launch_bounds__(512, 2) escha_gemv_k3_m1_narrow_s16(
+    const __half* A, const uint16_t* B, const __half* rout, float* C, int m, int k, int n
+) { escha_gemv_impl<3, 0, 2, 16, false>(A, B, rout, C, m, k, n); }

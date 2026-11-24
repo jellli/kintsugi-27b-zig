@@ -1,0 +1,920 @@
+//! Complete 64-layer Kintsugi-27B (Qwen3.8-27B) sm_89 Inference Engine (M=1..8).
+//! Runs 48 GDN + 16 Full-Attention (Q4_0 KV cache) + 64 SwiGLU FFN + 2-Stage LM Head
+//! with zero ggml graph overhead, narrow16 60-SM wave-saturated Escha GEMV,
+//! speculative GDN state verify/commit, and DFlash2 hidden-state capture.
+
+const std = @import("std");
+const config = @import("config.zig");
+const cuda = @import("cuda.zig");
+const model_mod = @import("model.zig");
+
+const Spec = config.ModelSpec;
+
+const sm89_core_cubin align(8) = @embedFile("sm89_core.cubin");
+const escha_sm89_cubin align(8) = @embedFile("escha_sm89.cubin");
+const gdn_sm89_cubin align(8) = @embedFile("gdn_sm89.cubin");
+const attn_sm89_cubin align(8) = @embedFile("attn_sm89.cubin");
+const lmhead_sm89_cubin align(8) = @embedFile("lmhead_sm89.cubin");
+
+pub const MAX_M: usize = 8;
+pub const TOPK_K: usize = 64;
+pub const TOPK_BLOCKS: usize = 64;
+pub const MAX_SPLITS: usize = 8;
+pub const Q4_HEAD_BYTES: usize = 144; // 256 / 32 * 18
+pub const GDN_QKV_DIM: usize = 10240;
+
+pub const Kernels = struct {
+    mod_core: cuda.Module,
+    mod_escha: cuda.Module,
+    mod_gdn: cuda.Module,
+    mod_attn: cuda.Module,
+    mod_lm: cuda.Module,
+
+    // Core
+    fn_norm_2x: cuda.CUfunction,
+    fn_norm_3x: cuda.CUfunction,
+    fn_norm_f32: cuda.CUfunction,
+    fn_capture: cuda.CUfunction,
+    fn_q8_to_q4: cuda.CUfunction,
+
+    // Escha
+    fn_escha_k2_m1: cuda.CUfunction,
+    fn_escha_k3_m1: cuda.CUfunction,
+    fn_escha_k2_m8: cuda.CUfunction,
+    fn_escha_k3_m8: cuda.CUfunction,
+    fn_escha_had_out: cuda.CUfunction,
+
+    // GDN
+    fn_gdn_conv: cuda.CUfunction,
+    fn_gdn_ab: cuda.CUfunction,
+    fn_gdn_rec: cuda.CUfunction,
+    fn_gdn_commit_conv: cuda.CUfunction,
+    fn_gdn_post: cuda.CUfunction,
+
+    // FullAttn
+    fn_attn_q: cuda.CUfunction,
+    fn_attn_kv: cuda.CUfunction,
+    fn_attn_fa_naive: cuda.CUfunction,
+    fn_attn_fa_gqa6: cuda.CUfunction,
+    fn_attn_red: cuda.CUfunction,
+
+    // FFN + 2-Stage LM Head
+    fn_swiglu: cuda.CUfunction,
+    fn_q81: cuda.CUfunction,
+    fn_q4_gemv: cuda.CUfunction,
+    fn_topk1: cuda.CUfunction,
+    fn_topk2: cuda.CUfunction,
+
+    pub fn load() !Kernels {
+        var mod_core = try cuda.Module.loadData(sm89_core_cubin);
+        errdefer mod_core.deinit();
+        var mod_escha = try cuda.Module.loadData(escha_sm89_cubin);
+        errdefer mod_escha.deinit();
+        var mod_gdn = try cuda.Module.loadData(gdn_sm89_cubin);
+        errdefer mod_gdn.deinit();
+        var mod_attn = try cuda.Module.loadData(attn_sm89_cubin);
+        errdefer mod_attn.deinit();
+        var mod_lm = try cuda.Module.loadData(lmhead_sm89_cubin);
+        errdefer mod_lm.deinit();
+
+        return .{
+            .mod_core = mod_core,
+            .mod_escha = mod_escha,
+            .mod_gdn = mod_gdn,
+            .mod_attn = mod_attn,
+            .mod_lm = mod_lm,
+
+            .fn_norm_2x = try mod_core.getFunction("fused_add_bias_rmsnorm_had128_2x_f16"),
+            .fn_norm_3x = try mod_core.getFunction("fused_add_bias_rmsnorm_had128_3x_f16"),
+            .fn_norm_f32 = try mod_core.getFunction("fused_add_bias_rmsnorm_f32"),
+            .fn_capture = try mod_core.getFunction("capture_layer_inp_f32"),
+            .fn_q8_to_q4 = try mod_core.getFunction("convert_q8_0_to_q4_0_sm89"),
+
+            .fn_escha_k2_m1 = try mod_escha.getFunction("escha_gemv_k2_m1_narrow_s16"),
+            .fn_escha_k3_m1 = try mod_escha.getFunction("escha_gemv_k3_m1_narrow_s16"),
+            .fn_escha_k2_m8 = try mod_escha.getFunction("escha_gemv_k2_m8_narrow_s16"),
+            .fn_escha_k3_m8 = try mod_escha.getFunction("escha_gemv_k3_m8_narrow_s16"),
+            .fn_escha_had_out = try mod_escha.getFunction("escha_had_out_f32"),
+
+            .fn_gdn_conv = try mod_gdn.getFunction("gdn_conv1d_silu_l2norm_f32"),
+            .fn_gdn_ab = try mod_gdn.getFunction("gdn_alpha_beta_f16_f32"),
+            .fn_gdn_rec = try mod_gdn.getFunction("gdn_recurrence_sm89"),
+            .fn_gdn_commit_conv = try mod_gdn.getFunction("gdn_commit_conv_state_f32"),
+            .fn_gdn_post = try mod_gdn.getFunction("gdn_norm_gate_had128_f16"),
+
+            .fn_attn_q = try mod_attn.getFunction("attn_q_norm_mrope_split_f32"),
+            .fn_attn_kv = try mod_attn.getFunction("attn_k_norm_mrope_kv_q4_0_store"),
+            .fn_attn_fa_naive = try mod_attn.getFunction("attn_decode_q4_0_splitk_sm89"),
+            .fn_attn_fa_gqa6 = try mod_attn.getFunction("attn_decode_q4_0_gqa6_sm89"),
+            .fn_attn_red = try mod_attn.getFunction("attn_splitk_reduce_gate_had128_f16"),
+
+            .fn_swiglu = try mod_lm.getFunction("fused_swiglu_had128_f16"),
+            .fn_q81 = try mod_lm.getFunction("quantize_f32_to_q8_1_sm89"),
+            .fn_q4_gemv = try mod_lm.getFunction("q4_0_q8_1_gemv_sm89"),
+            .fn_topk1 = try mod_lm.getFunction("topk64_stage1_sm89"),
+            .fn_topk2 = try mod_lm.getFunction("topk64_stage2_sm89"),
+        };
+    }
+
+    pub fn deinit(self: *Kernels) void {
+        self.mod_lm.deinit();
+        self.mod_attn.deinit();
+        self.mod_gdn.deinit();
+        self.mod_escha.deinit();
+        self.mod_core.deinit();
+    }
+};
+
+pub const CandidateList = struct {
+    ids: [TOPK_K]i32,
+    logits: [TOPK_K]f32,
+};
+
+pub const StepOutput = struct {
+    tokens: [MAX_M]u32 = @splat(0),
+    top_logits: [MAX_M]f32 = @splat(0),
+    cands: [MAX_M]CandidateList = undefined,
+};
+
+pub const Engine = struct {
+    allocator: std.mem.Allocator,
+    ctx: *const cuda.Context,
+    ks: *const Kernels,
+    model: *const model_mod.TargetModel,
+
+    // GDN recurrent state (48 layers)
+    d_gdn_state: cuda.CUdeviceptr, // [48, 48, 128, 128] f32 = 144 MiB
+    d_gdn_conv: cuda.CUdeviceptr,  // [48, 3, 10240] f32 = 5.625 MiB
+
+    // Speculative M>1 GDN verify save buffers (48 layers, ~28.5 MiB)
+    d_gdn_save_qkv: cuda.CUdeviceptr,  // [48, 8, 10240] f32 = 15 MiB
+    d_gdn_save_k: cuda.CUdeviceptr,    // [48, 8, 2048] f32  = 3 MiB
+    d_gdn_save_v: cuda.CUdeviceptr,    // [48, 8, 6144] f32  = 9 MiB
+    d_gdn_save_g: cuda.CUdeviceptr,    // [48, 8, 48] f32
+    d_gdn_save_beta: cuda.CUdeviceptr, // [48, 8, 48] f32
+
+    // Q4_0 KV cache (16 FullAttn layers)
+    d_kv_k: cuda.CUdeviceptr, // [16, max_kv_cells, 4, 144] u8
+    d_kv_v: cuda.CUdeviceptr, // [16, max_kv_cells, 4, 144] u8
+    max_kv_cells: u32,
+    kv_layer_bytes: usize,
+
+    // Static decode scratchpad (~14 MiB)
+    d_scratch: cuda.CUdeviceptr,
+    d_residual: cuda.CUdeviceptr,  // [8, 5120] f32
+    d_delta: cuda.CUdeviceptr,     // [8, 5120] f32 (ssm_out / attn_output / ffn_down output)
+    d_xnorm: cuda.CUdeviceptr,     // [8, 5120] f32 (GDN alpha/beta input & final output_norm)
+    d_xh0: cuda.CUdeviceptr,       // [8, 17408] f16 (sized for ffn_down too!)
+    d_xh1: cuda.CUdeviceptr,       // [8, 5120] f16
+    d_xh2: cuda.CUdeviceptr,       // [8, 5120] f16
+    d_buf_a: cuda.CUdeviceptr,     // [8, 17408] f32 (ffn_gate / attn_q[12288] / attn_qkv[10240])
+    d_buf_b: cuda.CUdeviceptr,     // [8, 17408] f32 (ffn_up / attn_gate[6144] / q_rot[6144])
+    d_buf_c: cuda.CUdeviceptr,     // [8, 6144] f32  (gdn_attn_out / attn_gate_split / k_in+v_in)
+    d_gdn_q: cuda.CUdeviceptr,     // [8, 2048] f32
+    d_gdn_k: cuda.CUdeviceptr,     // [8, 2048] f32
+    d_gdn_v: cuda.CUdeviceptr,     // [8, 6144] f32
+    d_gdn_g: cuda.CUdeviceptr,     // [8, 48] f32
+    d_gdn_beta: cuda.CUdeviceptr,  // [8, 48] f32
+    d_part_o: cuda.CUdeviceptr,    // [8, 24, 8, 256] f32 = 1.5 MiB
+    d_part_m: cuda.CUdeviceptr,    // [8, 24, 8] f32
+    d_part_l: cuda.CUdeviceptr,    // [8, 24, 8] f32
+    d_xq81: cuda.CUdeviceptr,      // [8, 160 * 36] u8
+    d_logits: cuda.CUdeviceptr,    // [8, 248320] f32 = 7.58 MiB
+    d_topk_pval: cuda.CUdeviceptr, // [8, 64 * 64] f32
+    d_topk_pidx: cuda.CUdeviceptr, // [8, 64 * 64] i32
+    d_topk_oval: cuda.CUdeviceptr, // [8, 64] f32
+    d_topk_oidx: cuda.CUdeviceptr, // [8, 64] i32
+    d_cap_buf: cuda.CUdeviceptr,   // [8, 5 * 5120] f32 (DFlash2 captured target hidden states!)
+
+    // Host staging buffers
+    h_emb_buf: []f32,     // [8 * 5120]
+    h_out_norm: []f32,    // [8 * 5120]
+    h_cand_ids: []i32,    // [8 * 64]
+    h_cand_vals: []f32,   // [8 * 64]
+
+    // DFlash2 capture config (default: [6, 20, 34, 48, 62])
+    capture_enabled: bool = false,
+    capture_layers: [5]u32 = .{ 6, 20, 34, 48, 62 },
+
+    // Sequence state
+    pos: u32 = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        ctx: *const cuda.Context,
+        ks: *const Kernels,
+        model: *const model_mod.TargetModel,
+        reserve_vram_mib: u64,
+    ) !Engine {
+        // 1. GDN states (48 layers)
+        const gdn_state_bytes: usize = 48 * 48 * 128 * 128 * 4;
+        const gdn_conv_bytes: usize = 48 * 3 * GDN_QKV_DIM * 4;
+        const d_gdn_state = try cuda.Context.alloc(gdn_state_bytes);
+        errdefer cuda.Context.free(d_gdn_state);
+        const d_gdn_conv = try cuda.Context.alloc(gdn_conv_bytes);
+        errdefer cuda.Context.free(d_gdn_conv);
+
+        // 2. Speculative GDN verify buffers
+        const d_gdn_save_qkv = try cuda.Context.alloc(48 * MAX_M * GDN_QKV_DIM * 4);
+        errdefer cuda.Context.free(d_gdn_save_qkv);
+        const d_gdn_save_k = try cuda.Context.alloc(48 * MAX_M * 2048 * 4);
+        errdefer cuda.Context.free(d_gdn_save_k);
+        const d_gdn_save_v = try cuda.Context.alloc(48 * MAX_M * 6144 * 4);
+        errdefer cuda.Context.free(d_gdn_save_v);
+        const d_gdn_save_g = try cuda.Context.alloc(48 * MAX_M * 48 * 4);
+        errdefer cuda.Context.free(d_gdn_save_g);
+        const d_gdn_save_beta = try cuda.Context.alloc(48 * MAX_M * 48 * 4);
+        errdefer cuda.Context.free(d_gdn_save_beta);
+
+        // 3. Static scratch arena
+        var sc_off: usize = 0;
+        const off_residual = bump(&sc_off, MAX_M * Spec.d_model * 4);
+        const off_delta = bump(&sc_off, MAX_M * Spec.d_model * 4);
+        const off_xnorm = bump(&sc_off, MAX_M * Spec.d_model * 4);
+        const off_xh0 = bump(&sc_off, MAX_M * Spec.d_ff * 2);
+        const off_xh1 = bump(&sc_off, MAX_M * Spec.d_model * 2);
+        const off_xh2 = bump(&sc_off, MAX_M * Spec.d_model * 2);
+        const off_buf_a = bump(&sc_off, MAX_M * Spec.d_ff * 4);
+        const off_buf_b = bump(&sc_off, MAX_M * Spec.d_ff * 4);
+        const off_buf_c = bump(&sc_off, MAX_M * 6144 * 4);
+        const off_gdn_q = bump(&sc_off, MAX_M * 2048 * 4);
+        const off_gdn_k = bump(&sc_off, MAX_M * 2048 * 4);
+        const off_gdn_v = bump(&sc_off, MAX_M * 6144 * 4);
+        const off_gdn_g = bump(&sc_off, MAX_M * 48 * 4);
+        const off_gdn_beta = bump(&sc_off, MAX_M * 48 * 4);
+        const off_part_o = bump(&sc_off, MAX_M * Spec.n_heads * MAX_SPLITS * Spec.head_dim * 4);
+        const off_part_m = bump(&sc_off, MAX_M * Spec.n_heads * MAX_SPLITS * 4);
+        const off_part_l = bump(&sc_off, MAX_M * Spec.n_heads * MAX_SPLITS * 4);
+        const off_xq81 = bump(&sc_off, MAX_M * (Spec.d_model / 32) * 36);
+        const off_logits = bump(&sc_off, MAX_M * Spec.n_vocab * 4);
+        const off_tk_pval = bump(&sc_off, MAX_M * TOPK_BLOCKS * TOPK_K * 4);
+        const off_tk_pidx = bump(&sc_off, MAX_M * TOPK_BLOCKS * TOPK_K * 4);
+        const off_tk_oval = bump(&sc_off, MAX_M * TOPK_K * 4);
+        const off_tk_oidx = bump(&sc_off, MAX_M * TOPK_K * 4);
+        const off_cap_buf = bump(&sc_off, MAX_M * 5 * Spec.d_model * 4);
+
+        const d_scratch = try cuda.Context.alloc(sc_off);
+        errdefer cuda.Context.free(d_scratch);
+
+        // 4. Query remaining free VRAM and maximize static Q4_0 KV cache cells!
+        const dev_info = try ctx.queryInfo();
+        const reserve_bytes = (reserve_vram_mib + 160) * 1024 * 1024; // reserve for DFlash2 + driver headroom
+        const kv_budget: u64 = if (dev_info.free_vram > reserve_bytes) dev_info.free_vram - reserve_bytes else 64 * 1024 * 1024;
+        const raw_cells = kv_budget / Spec.kv_bytes_per_token;
+        const aligned_cells = @min(@as(u64, Spec.max_ctx), @max(@as(u64, 4096), (raw_cells / 4096) * 4096));
+        const max_kv_cells: u32 = @intCast(aligned_cells);
+        const kv_layer_bytes: usize = @as(usize, max_kv_cells) * Spec.n_kv_heads * Q4_HEAD_BYTES;
+        const kv_half_total: usize = Spec.n_full_attn_layers * kv_layer_bytes;
+
+        const d_kv_k = try cuda.Context.alloc(kv_half_total);
+        errdefer cuda.Context.free(d_kv_k);
+        const d_kv_v = try cuda.Context.alloc(kv_half_total);
+        errdefer cuda.Context.free(d_kv_v);
+
+        const h_emb_buf = try allocator.alloc(f32, MAX_M * Spec.d_model);
+        errdefer allocator.free(h_emb_buf);
+        const h_out_norm = try allocator.alloc(f32, MAX_M * Spec.d_model);
+        errdefer allocator.free(h_out_norm);
+        const h_cand_ids = try allocator.alloc(i32, MAX_M * TOPK_K);
+        errdefer allocator.free(h_cand_ids);
+        const h_cand_vals = try allocator.alloc(f32, MAX_M * TOPK_K);
+        errdefer allocator.free(h_cand_vals);
+
+        var eng: Engine = .{
+            .allocator = allocator,
+            .ctx = ctx,
+            .ks = ks,
+            .model = model,
+            .d_gdn_state = d_gdn_state,
+            .d_gdn_conv = d_gdn_conv,
+            .d_gdn_save_qkv = d_gdn_save_qkv,
+            .d_gdn_save_k = d_gdn_save_k,
+            .d_gdn_save_v = d_gdn_save_v,
+            .d_gdn_save_g = d_gdn_save_g,
+            .d_gdn_save_beta = d_gdn_save_beta,
+            .d_kv_k = d_kv_k,
+            .d_kv_v = d_kv_v,
+            .max_kv_cells = max_kv_cells,
+            .kv_layer_bytes = kv_layer_bytes,
+            .d_scratch = d_scratch,
+            .d_residual = d_scratch + off_residual,
+            .d_delta = d_scratch + off_delta,
+            .d_xnorm = d_scratch + off_xnorm,
+            .d_xh0 = d_scratch + off_xh0,
+            .d_xh1 = d_scratch + off_xh1,
+            .d_xh2 = d_scratch + off_xh2,
+            .d_buf_a = d_scratch + off_buf_a,
+            .d_buf_b = d_scratch + off_buf_b,
+            .d_buf_c = d_scratch + off_buf_c,
+            .d_gdn_q = d_scratch + off_gdn_q,
+            .d_gdn_k = d_scratch + off_gdn_k,
+            .d_gdn_v = d_scratch + off_gdn_v,
+            .d_gdn_g = d_scratch + off_gdn_g,
+            .d_gdn_beta = d_scratch + off_gdn_beta,
+            .d_part_o = d_scratch + off_part_o,
+            .d_part_m = d_scratch + off_part_m,
+            .d_part_l = d_scratch + off_part_l,
+            .d_xq81 = d_scratch + off_xq81,
+            .d_logits = d_scratch + off_logits,
+            .d_topk_pval = d_scratch + off_tk_pval,
+            .d_topk_pidx = d_scratch + off_tk_pidx,
+            .d_topk_oval = d_scratch + off_tk_oval,
+            .d_topk_oidx = d_scratch + off_tk_oidx,
+            .d_cap_buf = d_scratch + off_cap_buf,
+            .h_emb_buf = h_emb_buf,
+            .h_out_norm = h_out_norm,
+            .h_cand_ids = h_cand_ids,
+            .h_cand_vals = h_cand_vals,
+        };
+        try eng.reset();
+        return eng;
+    }
+
+    pub fn deinit(self: *Engine) void {
+        self.allocator.free(self.h_cand_vals);
+        self.allocator.free(self.h_cand_ids);
+        self.allocator.free(self.h_out_norm);
+        self.allocator.free(self.h_emb_buf);
+        cuda.Context.free(self.d_kv_v);
+        cuda.Context.free(self.d_kv_k);
+        cuda.Context.free(self.d_scratch);
+        cuda.Context.free(self.d_gdn_save_beta);
+        cuda.Context.free(self.d_gdn_save_g);
+        cuda.Context.free(self.d_gdn_save_v);
+        cuda.Context.free(self.d_gdn_save_k);
+        cuda.Context.free(self.d_gdn_save_qkv);
+        cuda.Context.free(self.d_gdn_conv);
+        cuda.Context.free(self.d_gdn_state);
+    }
+
+    pub fn reset(self: *Engine) !void {
+        self.pos = 0;
+        try self.ctx.memsetZeroAsync(self.d_gdn_state, 48 * 48 * 128 * 128 * 4);
+        try self.ctx.memsetZeroAsync(self.d_gdn_conv, 48 * 3 * GDN_QKV_DIM * 4);
+        try self.ctx.sync();
+    }
+
+    fn launchEscha(
+        self: *const Engine,
+        proj: model_mod.EschaProj,
+        d_xh: cuda.CUdeviceptr,
+        d_out: cuda.CUdeviceptr,
+        m: u32,
+    ) !void {
+        const fn_gemv = if (m == 1)
+            (if (proj.k_bits == 2) self.ks.fn_escha_k2_m1 else self.ks.fn_escha_k3_m1)
+        else
+            (if (proj.k_bits == 2) self.ks.fn_escha_k2_m8 else self.ks.fn_escha_k3_m8);
+
+        var p_a = d_xh;
+        var p_b = proj.code;
+        var p_rout = proj.rout;
+        var p_c = d_out;
+        var p_m: c_int = @intCast(m);
+        var p_k: c_int = @intCast(proj.ic);
+        var p_n: c_int = @intCast(proj.oc);
+        var params = [_]?*anyopaque{
+            @ptrCast(&p_a),
+            @ptrCast(&p_b),
+            @ptrCast(&p_rout),
+            @ptrCast(&p_c),
+            @ptrCast(&p_m),
+            @ptrCast(&p_k),
+            @ptrCast(&p_n),
+        };
+        try cuda.launch(fn_gemv, .{ proj.oc / 32, 1, 1 }, .{ 512, 1, 1 }, 0, self.ctx.stream, &params);
+
+        // In-place 128-pt output Hadamard + escha_rout scaling (~1.5 us)
+        var p_oc: c_int = @intCast(proj.oc);
+        var p_rows: c_int = @intCast(m);
+        var p_had = [_]?*anyopaque{
+            @ptrCast(&p_c),
+            @ptrCast(&p_rout),
+            @ptrCast(&p_c),
+            @ptrCast(&p_oc),
+            @ptrCast(&p_rows),
+        };
+        const n_blks: u32 = (m * (proj.oc / 128) + 7) / 8;
+        try cuda.launch(self.ks.fn_escha_had_out, .{ n_blks, 1, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_had);
+    }
+
+    /// Run a forward pass on `tokens[0..m]` (`1 <= m <= 8`) starting at `self.pos`.
+    /// - If `commit_immediately == true`: advances GDN recurrent & conv state in-place for all `m` tokens and sets `self.pos += m`.
+    /// - If `commit_immediately == false` (speculative verify): keeps GDN state untouched at `self.pos`, saves per-layer GDN step
+    ///   inputs so caller can call `commitSpeculative(n_commit)` once acceptance length is known!
+    /// - If `compute_logits == false`: skips LM head (fast prefill for intermediate prompt chunks!).
+    pub fn forward(
+        self: *Engine,
+        tokens: []const u32,
+        commit_immediately: bool,
+        compute_logits: bool,
+    ) !StepOutput {
+        const m: u32 = @intCast(tokens.len);
+        std.debug.assert(m >= 1 and m <= MAX_M);
+        if (self.pos + m > self.max_kv_cells) return error.ContextFull;
+
+        // 1. Embed tokens on CPU from host mmap Q8_0 -> H2D (only 20-160 KiB!)
+        for (tokens, 0..) |tok, r| {
+            self.model.embedToken(tok, self.h_emb_buf[r * Spec.d_model ..][0..Spec.d_model]);
+        }
+        try self.ctx.copyHtoDAsync(self.d_residual, std.mem.sliceAsBytes(self.h_emb_buf[0 .. m * Spec.d_model]));
+
+        var prev_bias: cuda.CUdeviceptr = 0;
+        var has_delta: c_int = 0;
+        var p_dim: c_int = Spec.d_model;
+        var p_eps: f32 = Spec.rms_eps;
+        var p_m: c_int = @intCast(m);
+        var p_pos: c_int = @intCast(self.pos);
+        var p_fb: f32 = Spec.rope_theta;
+
+        // 2. Execute all 64 layers!
+        for (0..Spec.n_layers) |l| {
+            // Check if this layer's input should be captured for DFlash2
+            var cap_slot: ?c_int = null;
+            if (self.capture_enabled) {
+                for (self.capture_layers, 0..) |cl, sidx| {
+                    if (cl == l) {
+                        cap_slot = @intCast(sidx);
+                        break;
+                    }
+                }
+            }
+
+            switch (self.model.layers[l]) {
+                .gdn => |gl| {
+                    // 2A. Fused Residual(+prev_ffn_down+bias) + RMSNorm + 2x Had128 (qkv, gate) + x_norm_f32
+                    var p_res = self.d_residual;
+                    var p_del = self.d_delta;
+                    var p_db = prev_bias;
+                    var p_nw = gl.attn_norm;
+                    var p_r0 = gl.attn_qkv.rin;
+                    var p_r1 = gl.attn_gate.rin;
+                    var p_x0 = self.d_xh0;
+                    var p_x1 = self.d_xh1;
+                    var p_xn = self.d_xnorm;
+                    var p_n2 = [_]?*anyopaque{
+                        @ptrCast(&p_res), @ptrCast(&p_del), @ptrCast(&p_db), @ptrCast(&p_nw),
+                        @ptrCast(&p_r0),  @ptrCast(&p_r1),  @ptrCast(&p_x0), @ptrCast(&p_x1),
+                        @ptrCast(&p_xn),  @ptrCast(&p_dim), @ptrCast(&p_eps), @ptrCast(&has_delta),
+                    };
+                    try cuda.launch(self.ks.fn_norm_2x, .{ m, 1, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_n2);
+
+                    if (cap_slot) |slot| {
+                        try self.launchCapture(m, slot);
+                    }
+
+                    // 2B. Escha projections: attn_qkv (10240) and attn_gate (6144)
+                    const g_idx: usize = gl.gdn_idx;
+                    const qkv_dst = if (commit_immediately)
+                        self.d_buf_a
+                    else
+                        self.d_gdn_save_qkv + g_idx * MAX_M * GDN_QKV_DIM * 4;
+                    try self.launchEscha(gl.attn_qkv, self.d_xh0, qkv_dst, m);
+                    try self.launchEscha(gl.attn_gate, self.d_xh1, self.d_buf_b, m);
+
+                    // 2C. GDN Conv1D + SiLU + L2-Norm
+                    const d_k_out = if (commit_immediately) self.d_gdn_k else self.d_gdn_save_k + g_idx * MAX_M * 2048 * 4;
+                    const d_v_out = if (commit_immediately) self.d_gdn_v else self.d_gdn_save_v + g_idx * MAX_M * 6144 * 4;
+                    const d_conv_st = self.d_gdn_conv + g_idx * 3 * GDN_QKV_DIM * 4;
+                    var p_qkv = qkv_dst;
+                    var p_qb = gl.attn_qkv.bias;
+                    var p_cw = gl.ssm_conv1d;
+                    var p_cin = d_conv_st;
+                    var p_cout: cuda.CUdeviceptr = if (commit_immediately) d_conv_st else 0;
+                    var p_qo = self.d_gdn_q;
+                    var p_ko = d_k_out;
+                    var p_vo = d_v_out;
+                    var p_nc: c_int = @intCast(m);
+                    var p_conv = [_]?*anyopaque{
+                        @ptrCast(&p_qkv), @ptrCast(&p_qb),  @ptrCast(&p_cw),
+                        @ptrCast(&p_cin), @ptrCast(&p_cout), @ptrCast(&p_qo),
+                        @ptrCast(&p_ko),  @ptrCast(&p_vo),  @ptrCast(&p_m),
+                        @ptrCast(&p_nc),  @ptrCast(&p_eps),
+                    };
+                    try cuda.launch(self.ks.fn_gdn_conv, .{ 80, 1, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &p_conv);
+
+                    // 2D. GDN alpha + beta FP16 GEMV + exp/sigmoid gates
+                    const d_g_out = if (commit_immediately) self.d_gdn_g else self.d_gdn_save_g + g_idx * MAX_M * 48 * 4;
+                    const d_beta_out = if (commit_immediately) self.d_gdn_beta else self.d_gdn_save_beta + g_idx * MAX_M * 48 * 4;
+                    var p_aw = gl.ssm_alpha;
+                    var p_bw = gl.ssm_beta;
+                    var p_dtb = gl.ssm_dt_bias;
+                    var p_sa = gl.ssm_a;
+                    var p_go = d_g_out;
+                    var p_bo = d_beta_out;
+                    var p_ab = [_]?*anyopaque{
+                        @ptrCast(&p_xn), @ptrCast(&p_aw), @ptrCast(&p_bw),
+                        @ptrCast(&p_dtb), @ptrCast(&p_sa), @ptrCast(&p_go),
+                        @ptrCast(&p_bo), @ptrCast(&p_m), @ptrCast(&p_dim),
+                    };
+                    try cuda.launch(self.ks.fn_gdn_ab, .{ 96, 1, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_ab);
+
+                    // 2E. GDN register-resident recurrence (commit in-place if commit_immediately, else read-only verify)
+                    const d_st = self.d_gdn_state + g_idx * 48 * 128 * 128 * 4;
+                    var p_sin = d_st;
+                    var p_sout: cuda.CUdeviceptr = if (commit_immediately) d_st else 0;
+                    var p_aout = self.d_buf_c;
+                    var p_rec = [_]?*anyopaque{
+                        @ptrCast(&p_qo), @ptrCast(&p_ko), @ptrCast(&p_vo),
+                        @ptrCast(&p_go), @ptrCast(&p_bo), @ptrCast(&p_sin),
+                        @ptrCast(&p_sout), @ptrCast(&p_aout), @ptrCast(&p_m),
+                        @ptrCast(&p_nc),
+                    };
+                    try cuda.launch(self.ks.fn_gdn_rec, .{ 48, 8, 1 }, .{ 32, 4, 1 }, 0, self.ctx.stream, &p_rec);
+
+                    // 2F. Fused GDN RMSNorm(128) * SiLU(z + z_bias) * rin + Had128 -> FP16
+                    var p_z = self.d_buf_b;
+                    var p_zb = gl.attn_gate.bias;
+                    var p_snw = gl.ssm_norm;
+                    var p_srin = gl.ssm_out.rin;
+                    var p_sxh = self.d_xh0;
+                    var p_post = [_]?*anyopaque{
+                        @ptrCast(&p_aout), @ptrCast(&p_z), @ptrCast(&p_zb),
+                        @ptrCast(&p_snw),  @ptrCast(&p_srin), @ptrCast(&p_sxh),
+                        @ptrCast(&p_m),    @ptrCast(&p_eps),
+                    };
+                    try cuda.launch(self.ks.fn_gdn_post, .{ (m * 48 + 7) / 8, 1, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_post);
+
+                    // 2G. ssm_out Escha GEMV -> d_delta
+                    try self.launchEscha(gl.ssm_out, self.d_xh0, self.d_delta, m);
+
+                    // 2H. FFN block (residual += ssm_out + ssm_out.bias, post_attn_norm, gate/up/SwiGLU/down)
+                    try self.runFfnBlock(gl.post_attn_norm, gl.ssm_out.bias, gl.ffn_gate, gl.ffn_up, gl.ffn_down, m);
+                    prev_bias = gl.ffn_down.bias;
+                    has_delta = 1;
+                },
+
+                .full_attn => |al| {
+                    // 2A. Fused Residual(+prev_ffn_down+bias) + RMSNorm + 3x Had128 (q, k, v)
+                    var p_res = self.d_residual;
+                    var p_del = self.d_delta;
+                    var p_db = prev_bias;
+                    var p_nw = al.attn_norm;
+                    var p_r0 = al.attn_q.rin;
+                    var p_r1 = al.attn_k.rin;
+                    var p_r2 = al.attn_v.rin;
+                    var p_x0 = self.d_xh0;
+                    var p_x1 = self.d_xh1;
+                    var p_x2 = self.d_xh2;
+                    var p_n3 = [_]?*anyopaque{
+                        @ptrCast(&p_res), @ptrCast(&p_del), @ptrCast(&p_db), @ptrCast(&p_nw),
+                        @ptrCast(&p_r0),  @ptrCast(&p_r1),  @ptrCast(&p_r2), @ptrCast(&p_x0),
+                        @ptrCast(&p_x1),  @ptrCast(&p_x2),  @ptrCast(&p_dim), @ptrCast(&p_eps),
+                        @ptrCast(&has_delta),
+                    };
+                    try cuda.launch(self.ks.fn_norm_3x, .{ m, 1, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_n3);
+
+                    if (cap_slot) |slot| {
+                        try self.launchCapture(m, slot);
+                    }
+
+                    // 2B. Escha projections: attn_q (12288), attn_k (1024), attn_v (1024)
+                    const d_kin = self.d_gdn_q; // [8, 1024] fits easily in d_gdn_q [8, 2048]
+                    const d_vin = self.d_gdn_k; // [8, 1024] fits easily in d_gdn_k [8, 2048]
+                    try self.launchEscha(al.attn_q, self.d_xh0, self.d_buf_a, m);
+                    try self.launchEscha(al.attn_k, self.d_xh1, d_kin, m);
+                    try self.launchEscha(al.attn_v, self.d_xh2, d_vin, m);
+
+                    // 2C. Q RMSNorm + MRoPE + [Q, gate] split
+                    var p_qfull = self.d_buf_a;
+                    var p_qb = al.attn_q.bias;
+                    var p_qn = al.attn_q_norm;
+                    var p_qrot = self.d_buf_b; // [8, 6144]
+                    var p_gate = self.d_buf_c; // [8, 6144]
+                    var p_q = [_]?*anyopaque{
+                        @ptrCast(&p_qfull), @ptrCast(&p_qb), @ptrCast(&p_qn),
+                        @ptrCast(&p_qrot),  @ptrCast(&p_gate), @ptrCast(&p_pos),
+                        @ptrCast(&p_fb),    @ptrCast(&p_eps),
+                    };
+                    try cuda.launch(self.ks.fn_attn_q, .{ Spec.n_heads, m, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_q);
+
+                    // 2D. K RMSNorm + MRoPE + Q4_0 KV Cache Append at [pos .. pos+m)
+                    const d_kc = self.d_kv_k + @as(usize, al.attn_idx) * self.kv_layer_bytes;
+                    const d_vc = self.d_kv_v + @as(usize, al.attn_idx) * self.kv_layer_bytes;
+                    var p_ki = d_kin;
+                    var p_vi = d_vin;
+                    var p_kb = al.attn_k.bias;
+                    var p_vb = al.attn_v.bias;
+                    var p_kn = al.attn_k_norm;
+                    var p_kcp = d_kc;
+                    var p_vcp = d_vc;
+                    var p_kv = [_]?*anyopaque{
+                        @ptrCast(&p_ki),  @ptrCast(&p_vi),  @ptrCast(&p_kb), @ptrCast(&p_vb),
+                        @ptrCast(&p_kn),  @ptrCast(&p_kcp), @ptrCast(&p_vcp), @ptrCast(&p_pos),
+                        @ptrCast(&p_fb),  @ptrCast(&p_eps),
+                    };
+                    try cuda.launch(self.ks.fn_attn_kv, .{ Spec.n_kv_heads, m, 2 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_kv);
+
+                    // 2E. Split-K Q4_0 FlashAttention (adaptive: GQA6x4 tiled for seq >= 256, 1-warp for short seq!)
+                    const total_seq = self.pos + m;
+                    const n_splits: u32 = if (total_seq >= 1024) 7 else if (total_seq >= 256) 4 else 1;
+                    var p_po = self.d_part_o;
+                    var p_pm = self.d_part_m;
+                    var p_pl = self.d_part_l;
+                    var p_ns: c_int = @intCast(n_splits);
+
+                    if (total_seq >= 256) {
+                        var p_fa = [_]?*anyopaque{
+                            @ptrCast(&p_qrot), @ptrCast(&p_kcp), @ptrCast(&p_vcp),
+                            @ptrCast(&p_po),   @ptrCast(&p_pm),  @ptrCast(&p_pl),
+                            @ptrCast(&p_pos),  @ptrCast(&p_m),   @ptrCast(&p_ns),
+                        };
+                        const gqa6_ty: u32 = (m + 3) / 4;
+                        try cuda.launch(self.ks.fn_attn_fa_gqa6, .{ Spec.n_kv_heads, gqa6_ty, n_splits }, .{ 768, 1, 1 }, 0, self.ctx.stream, &p_fa);
+                    } else {
+                        var p_fa = [_]?*anyopaque{
+                            @ptrCast(&p_qrot), @ptrCast(&p_kcp), @ptrCast(&p_vcp),
+                            @ptrCast(&p_po),   @ptrCast(&p_pm),  @ptrCast(&p_pl),
+                            @ptrCast(&p_pos),  @ptrCast(&p_ns),
+                        };
+                        try cuda.launch(self.ks.fn_attn_fa_naive, .{ Spec.n_heads, m, n_splits }, .{ 32, 1, 1 }, 0, self.ctx.stream, &p_fa);
+                    }
+
+                    // 2F. Fused Split-K Reduce + sigmoid(gate) + rin + Had128 -> FP16
+                    var p_orin = al.attn_output.rin;
+                    var p_oxh = self.d_xh0;
+                    var p_red = [_]?*anyopaque{
+                        @ptrCast(&p_po),   @ptrCast(&p_pm),   @ptrCast(&p_pl),
+                        @ptrCast(&p_gate), @ptrCast(&p_orin), @ptrCast(&p_oxh),
+                        @ptrCast(&p_ns),
+                    };
+                    try cuda.launch(self.ks.fn_attn_red, .{ 48, m, 1 }, .{ 32, 1, 1 }, 0, self.ctx.stream, &p_red);
+
+                    // 2G. attn_output Escha GEMV -> d_delta
+                    try self.launchEscha(al.attn_output, self.d_xh0, self.d_delta, m);
+
+                    // 2H. FFN block
+                    try self.runFfnBlock(al.post_attn_norm, al.attn_output.bias, al.ffn_gate, al.ffn_up, al.ffn_down, m);
+                    prev_bias = al.ffn_down.bias;
+                    has_delta = 1;
+                },
+            }
+        }
+
+        // 3. Final residual add (+ blk.63.ffn_down.bias) + output_norm -> d_xnorm [m, 5120]
+        {
+            var p_res = self.d_residual;
+            var p_del = self.d_delta;
+            var p_db = prev_bias;
+            var p_nw = self.model.output_norm;
+            var p_yo = self.d_xnorm;
+            var p_fin = [_]?*anyopaque{
+                @ptrCast(&p_res), @ptrCast(&p_del), @ptrCast(&p_db), @ptrCast(&p_nw),
+                @ptrCast(&p_yo),  @ptrCast(&p_dim), @ptrCast(&p_eps), @ptrCast(&has_delta),
+            };
+            try cuda.launch(self.ks.fn_norm_f32, .{ m, 1, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_fin);
+        }
+
+        if (commit_immediately) {
+            self.pos += m;
+        }
+
+        var out: StepOutput = .{};
+        if (!compute_logits) {
+            return out;
+        }
+
+        // 4. Two-Stage LM Head:
+        //    Stage 1 (GPU, 682 MiB Q4_0): Q8_1 quant -> dp4a Q4_0xQ8_1 GEMV -> Exact Parallel-Bitonic Top-64
+        try self.runTwoStageLmHead(m, &out);
+        return out;
+    }
+
+    fn runFfnBlock(
+        self: *const Engine,
+        post_norm: cuda.CUdeviceptr,
+        attn_out_bias: cuda.CUdeviceptr,
+        ffn_gate: model_mod.EschaProj,
+        ffn_up: model_mod.EschaProj,
+        ffn_down: model_mod.EschaProj,
+        m: u32,
+    ) !void {
+        var p_res = self.d_residual;
+        var p_del = self.d_delta;
+        var p_db = attn_out_bias;
+        var p_nw = post_norm;
+        var p_r0 = ffn_gate.rin;
+        var p_r1 = ffn_up.rin;
+        var p_x0 = self.d_xh0;
+        var p_x1 = self.d_xh1;
+        var p_null: cuda.CUdeviceptr = 0;
+        var p_dim: c_int = Spec.d_model;
+        var p_eps: f32 = Spec.rms_eps;
+        var p_hd: c_int = 1;
+        var p_n2 = [_]?*anyopaque{
+            @ptrCast(&p_res), @ptrCast(&p_del), @ptrCast(&p_db),  @ptrCast(&p_nw),
+            @ptrCast(&p_r0),  @ptrCast(&p_r1),  @ptrCast(&p_x0),  @ptrCast(&p_x1),
+            @ptrCast(&p_null), @ptrCast(&p_dim), @ptrCast(&p_eps), @ptrCast(&p_hd),
+        };
+        try cuda.launch(self.ks.fn_norm_2x, .{ m, 1, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_n2);
+
+        try self.launchEscha(ffn_gate, self.d_xh0, self.d_buf_a, m);
+        try self.launchEscha(ffn_up, self.d_xh1, self.d_buf_b, m);
+
+        var p_g = self.d_buf_a;
+        var p_u = self.d_buf_b;
+        var p_gb = ffn_gate.bias;
+        var p_ub = ffn_up.bias;
+        var p_drin = ffn_down.rin;
+        var p_dxh = self.d_xh0;
+        var p_dff: c_int = Spec.d_ff;
+        var p_m: c_int = @intCast(m);
+        var p_sw = [_]?*anyopaque{
+            @ptrCast(&p_g),  @ptrCast(&p_u),    @ptrCast(&p_gb),  @ptrCast(&p_ub),
+            @ptrCast(&p_drin), @ptrCast(&p_dxh), @ptrCast(&p_dff), @ptrCast(&p_m),
+        };
+        const gx: u32 = (m * (Spec.d_ff / 128) + 7) / 8;
+        try cuda.launch(self.ks.fn_swiglu, .{ gx, 1, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_sw);
+
+        try self.launchEscha(ffn_down, self.d_xh0, self.d_delta, m);
+    }
+
+    fn launchCapture(self: *const Engine, m: u32, slot: c_int) !void {
+        var p_res = self.d_residual;
+        var p_cap = self.d_cap_buf;
+        var p_slot = slot;
+        var p_dim: c_int = Spec.d_model;
+        var params = [_]?*anyopaque{ @ptrCast(&p_res), @ptrCast(&p_cap), @ptrCast(&p_slot), @ptrCast(&p_dim) };
+        try cuda.launch(self.ks.fn_capture, .{ m, 20, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &params);
+    }
+
+    /// Commit exact `n_commit` (`1..8`) tokens into all 48 GDN states after speculative verification!
+    pub fn commitSpeculative(self: *Engine, n_commit: u32) !void {
+        std.debug.assert(n_commit >= 1 and n_commit <= MAX_M);
+        var p_nc: c_int = @intCast(n_commit);
+        var p_null: cuda.CUdeviceptr = 0;
+
+        for (0..Spec.n_layers) |l| {
+            switch (self.model.layers[l]) {
+                .gdn => |gl| {
+                    const g_idx: usize = gl.gdn_idx;
+                    const d_qkv = self.d_gdn_save_qkv + g_idx * MAX_M * GDN_QKV_DIM * 4;
+                    const d_conv = self.d_gdn_conv + g_idx * 3 * GDN_QKV_DIM * 4;
+                    var p_qkv = d_qkv;
+                    var p_qb = gl.attn_qkv.bias;
+                    var p_cs = d_conv;
+                    var p_cc = [_]?*anyopaque{ @ptrCast(&p_qkv), @ptrCast(&p_qb), @ptrCast(&p_cs), @ptrCast(&p_nc) };
+                    try cuda.launch(self.ks.fn_gdn_commit_conv, .{ 80, 1, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &p_cc);
+
+                    var p_k = self.d_gdn_save_k + g_idx * MAX_M * 2048 * 4;
+                    var p_v = self.d_gdn_save_v + g_idx * MAX_M * 6144 * 4;
+                    var p_g = self.d_gdn_save_g + g_idx * MAX_M * 48 * 4;
+                    var p_b = self.d_gdn_save_beta + g_idx * MAX_M * 48 * 4;
+                    var p_st = self.d_gdn_state + g_idx * 48 * 128 * 128 * 4;
+                    var p_rec = [_]?*anyopaque{
+                        @ptrCast(&p_null), @ptrCast(&p_k),  @ptrCast(&p_v),
+                        @ptrCast(&p_g),    @ptrCast(&p_b),  @ptrCast(&p_st),
+                        @ptrCast(&p_st),   @ptrCast(&p_null), @ptrCast(&p_nc),
+                        @ptrCast(&p_nc),
+                    };
+                    try cuda.launch(self.ks.fn_gdn_rec, .{ 48, 8, 1 }, .{ 32, 4, 1 }, 0, self.ctx.stream, &p_rec);
+                },
+                .full_attn => {},
+            }
+        }
+        self.pos += n_commit;
+    }
+
+    /// Run Stage-1 Q4_0 LM head + Top-64 on GPU, then exact Q8_0 Stage-2 rescore on CPU (zero VRAM!)
+    pub fn runTwoStageLmHead(self: *Engine, m: u32, out: *StepOutput) !void {
+        var p_x = self.d_xnorm;
+        var p_xq81 = self.d_xq81;
+        var p_k: c_int = Spec.d_model;
+        var p_m: c_int = @intCast(m);
+        var p_nv: c_int = Spec.n_vocab;
+
+        // 1. Quantize x_norm [m, 5120] -> Q8_1
+        var p_q81 = [_]?*anyopaque{ @ptrCast(&p_x), @ptrCast(&p_xq81), @ptrCast(&p_k), @ptrCast(&p_m) };
+        const nb = Spec.d_model / 32;
+        try cuda.launch(self.ks.fn_q81, .{ (m * nb + 7) / 8, 1, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_q81);
+
+        // 2. Stage-1 Q4_0 x Q8_1 __dp4a GEMV over full 248,320 vocab
+        var p_w = self.model.head_q4_0;
+        var p_y = self.d_logits;
+        var p_gemv = [_]?*anyopaque{
+            @ptrCast(&p_w), @ptrCast(&p_xq81), @ptrCast(&p_y),
+            @ptrCast(&p_m), @ptrCast(&p_k),    @ptrCast(&p_nv),
+        };
+        try cuda.launch(self.ks.fn_q4_gemv, .{ (Spec.n_vocab + 3) / 4, 1, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &p_gemv);
+
+        // 3. Exact GPU Parallel-Bitonic Top-64
+        var p_pv = self.d_topk_pval;
+        var p_pi = self.d_topk_pidx;
+        var p_ov = self.d_topk_oval;
+        var p_oi = self.d_topk_oidx;
+        var p_tk1 = [_]?*anyopaque{ @ptrCast(&p_y), @ptrCast(&p_pv), @ptrCast(&p_pi), @ptrCast(&p_nv) };
+        var p_tk2 = [_]?*anyopaque{ @ptrCast(&p_pv), @ptrCast(&p_pi), @ptrCast(&p_ov), @ptrCast(&p_oi) };
+        try cuda.launch(self.ks.fn_topk1, .{ TOPK_BLOCKS, m, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &p_tk1);
+        try cuda.launch(self.ks.fn_topk2, .{ 1, m, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &p_tk2);
+
+        // 4. Tiny D2H: cand_ids[m, 64] (<= 2 KiB) + x_norm[m, 5120] (<= 160 KiB)
+        try self.ctx.copyDtoHAsync(std.mem.sliceAsBytes(self.h_cand_ids[0 .. m * TOPK_K]), self.d_topk_oidx);
+        try self.ctx.copyDtoHAsync(std.mem.sliceAsBytes(self.h_out_norm[0 .. m * Spec.d_model]), self.d_xnorm);
+        try self.ctx.sync();
+
+        // 5. Stage-2 Exact Q8_0 rescore of Top-64 candidates directly from host mmap (ZERO VRAM, ~20 us/tok!)
+        for (0..m) |r| {
+            const x_row = self.h_out_norm[r * Spec.d_model ..][0..Spec.d_model];
+            var best_id: u32 = 0;
+            var best_val: f32 = -3.4028234e38;
+            for (0..TOPK_K) |k| {
+                const cid = self.h_cand_ids[r * TOPK_K + k];
+                out.cands[r].ids[k] = cid;
+                if (cid >= 0) {
+                    const score = self.model.rescoreQ8_0Row(@intCast(cid), x_row);
+                    out.cands[r].logits[k] = score;
+                    if (score > best_val) {
+                        best_val = score;
+                        best_id = @intCast(cid);
+                    }
+                } else {
+                    out.cands[r].logits[k] = -3.4028234e38;
+                }
+            }
+            out.tokens[r] = best_id;
+            out.top_logits[r] = best_val;
+        }
+    }
+
+    /// Fast prefill of arbitrary prompt length in chunks of MAX_M (8).
+    /// Returns the StepOutput for the final chunk (last token's logits/next token are at index `last_chunk_len - 1`).
+    pub fn prefill(self: *Engine, prompt_tokens: []const u32) !StepOutput {
+        std.debug.assert(prompt_tokens.len > 0);
+        var offset: usize = 0;
+        while (offset < prompt_tokens.len) {
+            const chunk = @min(MAX_M, prompt_tokens.len - offset);
+            const is_last = (offset + chunk == prompt_tokens.len);
+            const res = try self.forward(prompt_tokens[offset .. offset + chunk], true, is_last);
+            if (is_last) return res;
+            offset += chunk;
+        }
+        unreachable;
+    }
+};
+
+fn bump(off: *usize, bytes: usize) usize {
+    const aligned = (off.* + 255) & ~@as(usize, 255);
+    off.* = aligned + bytes;
+    return aligned;
+}
+
+/// Top-k + top-p + temperature sampler on the exact Stage-2 Top-64 candidates!
+pub fn sampleFromCandidates(cands: *const CandidateList, temp: f32, top_k: u32, top_p: f32, rng: *std.Random.DefaultPrng) u32 {
+    if (temp <= 0.0 or top_k == 1) {
+        var best_idx: usize = 0;
+        var best_v: f32 = cands.logits[0];
+        for (1..TOPK_K) |i| {
+            if (cands.logits[i] > best_v) {
+                best_v = cands.logits[i];
+                best_idx = i;
+            }
+        }
+        return @intCast(@max(0, cands.ids[best_idx]));
+    }
+
+    const Entry = struct { id: u32, val: f32 };
+    var entries: [TOPK_K]Entry = undefined;
+    var n: usize = 0;
+    for (0..TOPK_K) |i| {
+        if (cands.ids[i] >= 0) {
+            entries[n] = .{ .id = @intCast(cands.ids[i]), .val = cands.logits[i] };
+            n += 1;
+        }
+    }
+    if (n == 0) return 0;
+
+    std.mem.sort(Entry, entries[0..n], {}, struct {
+        fn gt(_: void, a: Entry, b: Entry) bool {
+            return a.val > b.val;
+        }
+    }.gt);
+
+    const k_lim = if (top_k > 0 and top_k < n) @as(usize, top_k) else n;
+    const inv_t: f32 = 1.0 / temp;
+    const max_v = entries[0].val;
+    var probs: [TOPK_K]f32 = undefined;
+    var sum: f32 = 0.0;
+    for (0..k_lim) |i| {
+        const p = @exp((entries[i].val - max_v) * inv_t);
+        probs[i] = p;
+        sum += p;
+    }
+    const inv_sum = 1.0 / sum;
+    var cum: f32 = 0.0;
+    var cut: usize = k_lim;
+    for (0..k_lim) |i| {
+        probs[i] *= inv_sum;
+        cum += probs[i];
+        if (cum >= top_p) {
+            cut = i + 1;
+            break;
+        }
+    }
+    const r = rng.random().float(f32) * cum;
+    var acc: f32 = 0.0;
+    for (0..cut) |i| {
+        acc += probs[i];
+        if (r <= acc) return entries[i].id;
+    }
+    return entries[cut - 1].id;
+}

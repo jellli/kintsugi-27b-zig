@@ -5,6 +5,9 @@ const gguf = @import("gguf.zig");
 const escha_ref = @import("escha_ref.zig");
 const escha_bench = @import("escha_bench.zig");
 const ops_bench = @import("ops_bench.zig");
+const tokenizer_mod = @import("tokenizer.zig");
+const model_mod = @import("model.zig");
+const engine_mod = @import("engine.zig");
 
 const sm89_core_cubin = @embedFile("sm89_core.cubin");
 
@@ -28,6 +31,11 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "bench-ops")) {
         const model_path = if (args.len >= 3) args[2] else default_model_path;
         try ops_bench.run(allocator, model_path);
+    } else if (std.mem.eql(u8, cmd, "verify-e2e")) {
+        const model_path = if (args.len >= 3) args[2] else default_model_path;
+        try runVerifyE2E(allocator, model_path);
+    } else if (std.mem.eql(u8, cmd, "generate")) {
+        try runGenerate(allocator, args[2..]);
     } else {
         std.debug.print(
             \\kintsugi-zig — dedicated sm_89 CUDA runtime for Kintsugi-27B + DFlash2
@@ -37,6 +45,8 @@ pub fn main(init: std.process.Init) !void {
             \\  info [model.gguf] [draft.gguf] Zero-copy mmap GGUF inspection & static VRAM KV budget plan
             \\  bench-escha [model.gguf]      Verify Escha 2/3-bit sm_89 GEMV against CPU ref & benchmark geometries
             \\  bench-ops [model.gguf]        Verify & benchmark all 14 GDN, FullAttn/Q4_0 KV, SwiGLU & LM-head kernels
+            \\  verify-e2e [model.gguf]       Verify full 64-layer target engine + tokenizer exact match vs llama-server
+            \\  generate [--prompt S] [--max-tokens N] [--model P]  Run greedy/sampled target text generation
             \\
         , .{});
     }
@@ -351,8 +361,238 @@ fn runInfo(allocator: std.mem.Allocator, model_path: []const u8, drafter_path: [
     );
 }
 
+pub fn nowMs() f64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(f64, @floatFromInt(ts.sec)) * 1000.0 + @as(f64, @floatFromInt(ts.nsec)) / 1.0e6;
+}
+
+fn runVerifyE2E(allocator: std.mem.Allocator, model_path: []const u8) !void {
+    std.debug.print("=== kintsugi-zig Phase 1 Step 3: Full 64-Layer E2E Verification vs llama-server ===\n", .{});
+    const t0 = nowMs();
+
+    var ctx = try cuda.Context.init(0);
+    defer ctx.deinit();
+    var ks = try engine_mod.Kernels.load();
+    defer ks.deinit();
+
+    var model = try model_mod.TargetModel.load(allocator, &ctx, ks.fn_q8_to_q4, model_path);
+    defer model.deinit();
+    const t_load = nowMs();
+
+    var tok = try tokenizer_mod.Tokenizer.init(allocator, &model.gguf_file);
+    defer tok.deinit();
+    const t_tok = nowMs();
+
+    var eng = try engine_mod.Engine.init(allocator, &ctx, &ks, &model, 1120); // reserve 1120 MiB for DFlash2
+    defer eng.deinit();
+    const gpu_after = try ctx.queryInfo();
+
+    std.debug.print(
+        "Loaded 27B   : trunk {d:.1} MiB + head1 {d:.1} MiB in {d:.0} ms | tokenizer {d:.0} ms ({d} vocab)\n",
+        .{
+            @as(f64, @floatFromInt(model.trunk_bytes)) / (1024.0 * 1024.0),
+            @as(f64, @floatFromInt(model.head_q4_bytes)) / (1024.0 * 1024.0),
+            t_load - t0,
+            t_tok - t_load,
+            tok.meta.tokens.len,
+        },
+    );
+    std.debug.print(
+        "VRAM KV pool : {d} Q4_0 KV cells allocated (free VRAM remaining for DFlash2: {d} MiB)\n",
+        .{ eng.max_kv_cells, gpu_after.free_vram / (1024 * 1024) },
+    );
+
+    const Case = struct {
+        name: []const u8,
+        prompt: []const u8,
+        ref_prompt_toks: []const u32,
+        ref_gen_prefix: []const u32,
+    };
+
+    const cases = [_]Case{
+        .{
+            .name = "France",
+            .prompt = "The capital of France is",
+            .ref_prompt_toks = &[_]u32{ 760, 6511, 314, 9338, 369 },
+            .ref_gen_prefix = &[_]u32{ 11751, 13, 198, 760, 6511, 314, 9338, 369 },
+        },
+        .{
+            .name = "Fibonacci",
+            .prompt = "def fibonacci(n):\n    if n <= 1:\n        return n\n    return",
+            .ref_prompt_toks = &[_]u32{ 727, 73111, 1393, 1590, 198, 262, 413, 307, 2564, 220, 16, 25, 198, 285, 460, 307, 198, 262, 460 },
+            .ref_gen_prefix = &[_]u32{ 73111, 1393, 12, 16, 8, 478, 73111, 1393 },
+        },
+    };
+
+    var all_pass = true;
+    for (cases) |c| {
+        std.debug.print("\n--- Case: {s} ---\n", .{c.name});
+        const enc = try tok.encode(allocator, c.prompt);
+        defer allocator.free(enc);
+        const tok_match = std.mem.eql(u32, enc, c.ref_prompt_toks);
+        std.debug.print("Tokenizer    : {d} toks -> {s}", .{ enc.len, if (tok_match) "EXACT MATCH" else "MISMATCH" });
+        if (!tok_match) {
+            std.debug.print("\n  got: {any}\n  ref: {any}", .{ enc, c.ref_prompt_toks });
+            all_pass = false;
+        }
+        std.debug.print("\n", .{});
+
+        // 1. Greedy M=1 generation (32 tokens)
+        try eng.reset();
+        const tp0 = nowMs();
+        const pf = try eng.prefill(enc);
+        const tp1 = nowMs();
+        const last_idx = (enc.len - 1) % engine_mod.MAX_M;
+        var cur_tok = pf.tokens[last_idx];
+
+        var gen_m1: [32]u32 = undefined;
+        gen_m1[0] = cur_tok;
+        const td0 = nowMs();
+        for (1..32) |step| {
+            const out = try eng.forward(&[_]u32{cur_tok}, true, true);
+            cur_tok = out.tokens[0];
+            gen_m1[step] = cur_tok;
+        }
+        const td1 = nowMs();
+
+        var prefix_match = true;
+        for (c.ref_gen_prefix, 0..) |ref_id, i| {
+            if (gen_m1[i] != ref_id) prefix_match = false;
+        }
+        if (!prefix_match) all_pass = false;
+
+        const text = try tok.decode(allocator, &gen_m1);
+        defer allocator.free(text);
+        const decode_ms = td1 - td0;
+        const ms_per_tok = decode_ms / 31.0;
+        const tok_s = 1000.0 / ms_per_tok;
+
+        std.debug.print("M=1 Greedy   : prefix8={s} | prefill={d:.1} ms | decode={d:.2} ms/tok ({d:.2} tok/s)\n", .{
+            if (prefix_match) "EXACT MATCH" else "MISMATCH",
+            tp1 - tp0,
+            ms_per_tok,
+            tok_s,
+        });
+        std.debug.print("  ids[0..8]  : {any}\n", .{gen_m1[0..8]});
+        std.debug.print("  ref[0..8]  : {any}\n", .{c.ref_gen_prefix});
+        std.debug.print("  text       : \"{s}\"\n", .{text});
+
+        // 2. Verify M=8 speculative verify (read-only GDN) + partial commitSpeculative(5) matches M=1!
+        try eng.reset();
+        const pf2 = try eng.prefill(enc);
+        const t0_id = pf2.tokens[last_idx];
+        // Feed 8 tokens: [t0, gen_m1[1], gen_m1[2], gen_m1[3], gen_m1[4], WRONG, WRONG, WRONG]
+        const spec_in = [8]u32{ t0_id, gen_m1[1], gen_m1[2], gen_m1[3], gen_m1[4], 100, 101, 102 };
+        const tv0 = nowMs();
+        const vout = try eng.forward(&spec_in, false, true);
+        const tv1 = nowMs();
+        var spec_ok = true;
+        for (0..5) |k| {
+            if (vout.tokens[k] != gen_m1[k + 1]) spec_ok = false;
+        }
+        // Commit only the 5 accepted tokens, then step M=1 to check GDN state fidelity!
+        const tc0 = nowMs();
+        try eng.commitSpeculative(5);
+        try ctx.sync();
+        const tc1 = nowMs();
+        const next_after_commit = try eng.forward(&[_]u32{gen_m1[5]}, true, true);
+        const commit_ok = (next_after_commit.tokens[0] == gen_m1[6]);
+        if (!spec_ok or !commit_ok) all_pass = false;
+
+        std.debug.print("M=8 SpecTest : verify5={s} ({d:.2} ms/step) | commit5={s} ({d:.2} ms) | post_commit_tok={d} (exp {d})\n", .{
+            if (spec_ok) "EXACT MATCH" else "MISMATCH",
+            tv1 - tv0,
+            if (commit_ok) "EXACT MATCH" else "MISMATCH",
+            tc1 - tc0,
+            next_after_commit.tokens[0],
+            gen_m1[6],
+        });
+    }
+
+    if (!all_pass) return error.E2EVerificationFailed;
+    std.debug.print("\n[ALL E2E CHECKS PASSED: Tokenizer + 64L Target M=1 + M=8 Speculative Verify/Commit == llama-server!]\n", .{});
+}
+
+fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var model_path: []const u8 = default_model_path;
+    var prompt: []const u8 = "The capital of France is";
+    var max_tokens: usize = 64;
+    var temp: f32 = 0.0;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--model") and i + 1 < args.len) {
+            i += 1;
+            model_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--prompt") and i + 1 < args.len) {
+            i += 1;
+            prompt = args[i];
+        } else if (std.mem.eql(u8, args[i], "--max-tokens") and i + 1 < args.len) {
+            i += 1;
+            max_tokens = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--temp") and i + 1 < args.len) {
+            i += 1;
+            temp = try std.fmt.parseFloat(f32, args[i]);
+        }
+    }
+
+    var ctx = try cuda.Context.init(0);
+    defer ctx.deinit();
+    var ks = try engine_mod.Kernels.load();
+    defer ks.deinit();
+    var model = try model_mod.TargetModel.load(allocator, &ctx, ks.fn_q8_to_q4, model_path);
+    defer model.deinit();
+    var tok = try tokenizer_mod.Tokenizer.init(allocator, &model.gguf_file);
+    defer tok.deinit();
+    var eng = try engine_mod.Engine.init(allocator, &ctx, &ks, &model, 1120);
+    defer eng.deinit();
+
+    const prompt_toks = try tok.encode(allocator, prompt);
+    defer allocator.free(prompt_toks);
+
+    var rng = std.Random.DefaultPrng.init(42);
+    const tp0 = nowMs();
+    const pf = try eng.prefill(prompt_toks);
+    const tp1 = nowMs();
+
+    const last_idx = (prompt_toks.len - 1) % engine_mod.MAX_M;
+    var cur = engine_mod.sampleFromCandidates(&pf.cands[last_idx], temp, 64, 0.95, &rng);
+    var gen: std.ArrayListUnmanaged(u32) = .empty;
+    defer gen.deinit(allocator);
+
+    const td0 = nowMs();
+    var piece_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer piece_buf.deinit(allocator);
+
+    for (0..max_tokens) |step| {
+        if (tok.isEos(cur)) break;
+        try gen.append(allocator, cur);
+        piece_buf.clearRetainingCapacity();
+        try tok.decodeTokenTo(cur, &piece_buf, allocator);
+        std.debug.print("{s}", .{piece_buf.items});
+        if (step + 1 == max_tokens) break;
+        const out = try eng.forward(&[_]u32{cur}, true, true);
+        cur = engine_mod.sampleFromCandidates(&out.cands[0], temp, 64, 0.95, &rng);
+    }
+    const td1 = nowMs();
+    const dec_toks = if (gen.items.len > 1) gen.items.len - 1 else 1;
+    std.debug.print(
+        "\n\n[prompt: {d} toks in {d:.1} ms | generated: {d} toks in {d:.1} ms ({d:.2} tok/s) | KV pool: {d} cells]\n",
+        .{
+            prompt_toks.len,
+            tp1 - tp0,
+            gen.items.len,
+            td1 - td0,
+            @as(f64, @floatFromInt(dec_toks)) * 1000.0 / (td1 - td0),
+            eng.max_kv_cells,
+        },
+    );
+}
+
 test {
     _ = config;
     _ = gguf;
     _ = escha_ref;
+    _ = tokenizer_mod;
 }
