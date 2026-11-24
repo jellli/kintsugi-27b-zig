@@ -1,0 +1,15 @@
+.{
+    .name = .kintsugi_zig,
+    .version = "0.1.0",
+    .fingerprint = 0xdb50958820faefba,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "kernels",
+        "tools",
+        "README.md",
+    },
+}

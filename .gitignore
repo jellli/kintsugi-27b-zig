@@ -1,0 +1,9 @@
+.zig-cache/
+zig-out/
+*.cubin
+*.ptx
+*.o
+*.a
+__pycache__/
+*.pyc
+.DS_Store
