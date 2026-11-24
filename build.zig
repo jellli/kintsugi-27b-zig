@@ -29,6 +29,7 @@ pub fn build(b: *std.Build) void {
         .{ .src = "kernels/gdn_sm89.cu", .name = "gdn_sm89.cubin" },
         .{ .src = "kernels/attn_sm89.cu", .name = "attn_sm89.cubin" },
         .{ .src = "kernels/lmhead_sm89.cu", .name = "lmhead_sm89.cubin" },
+        .{ .src = "kernels/dflash_sm89.cu", .name = "dflash_sm89.cubin" },
     };
     for (kernel_specs) |ks| {
         const cmd = b.addSystemCommand(&.{"python3"});

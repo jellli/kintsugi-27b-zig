@@ -29,6 +29,10 @@ const KernelSet = struct {
     k2_m8_narrow_s4: cuda.CUfunction,
     k3_m8_narrow_s4: cuda.CUfunction,
     k3_m8_narrow_w1s16: cuda.CUfunction,
+    k2_m8_fused_w2s4: cuda.CUfunction,
+    k3_m8_fused_w2s4: cuda.CUfunction,
+    k2_m8_narrow_s12: cuda.CUfunction,
+    k3_m8_narrow_s12: cuda.CUfunction,
 
     fn load(mod: *const cuda.Module) !KernelSet {
         return .{
@@ -49,6 +53,10 @@ const KernelSet = struct {
             .k2_m8_narrow_s4 = try mod.getFunction("escha_gemv_k2_m8_narrow_s4"),
             .k3_m8_narrow_s4 = try mod.getFunction("escha_gemv_k3_m8_narrow_s4"),
             .k3_m8_narrow_w1s16 = try mod.getFunction("escha_gemv_k3_m8_narrow_w1s16"),
+            .k2_m8_fused_w2s4 = try mod.getFunction("escha_gemv_k2_m8_fused_w2s4"),
+            .k3_m8_fused_w2s4 = try mod.getFunction("escha_gemv_k3_m8_fused_w2s4"),
+            .k2_m8_narrow_s12 = try mod.getFunction("escha_gemv_k2_m8_narrow_s12"),
+            .k3_m8_narrow_s12 = try mod.getFunction("escha_gemv_k3_m8_narrow_s12"),
         };
     }
 };
@@ -337,7 +345,7 @@ fn testAndBenchTensor(
     if (!run_m8_bench) return;
 
     // 3. Benchmark M=8 geometries on RTX 4070 Ti (same pre-rotated d_xh)
-    var variants_buf: [7]BenchVariant = undefined;
+    var variants_buf: [9]BenchVariant = undefined;
     var n_variants: usize = 0;
     variants_buf[n_variants] = .{
         .label = "base      WNT=2 S=8  1024t (OC/128 fused)",
@@ -348,18 +356,10 @@ fn testAndBenchTensor(
     };
     n_variants += 1;
     variants_buf[n_variants] = .{
-        .label = "sm89_w4s8 WNT=4 S=8   512t (OC/128 fused)",
-        .func = if (k_bits == 2) ks.k2_m8_w4s8 else ks.k3_m8_w4s8,
+        .label = "fused2s4  WNT=2 S=4   512t (OC/128 fused)",
+        .func = if (k_bits == 2) ks.k2_m8_fused_w2s4 else ks.k3_m8_fused_w2s4,
         .grid_div = 128,
         .block_x = 512,
-        .unfused = false,
-    };
-    n_variants += 1;
-    variants_buf[n_variants] = .{
-        .label = "sm89_w4s4 WNT=4 S=4   256t (OC/128 fused)",
-        .func = if (k_bits == 2) ks.k2_m8_w4s4 else ks.k3_m8_w4s4,
-        .grid_div = 128,
-        .block_x = 256,
         .unfused = false,
     };
     n_variants += 1;
@@ -368,6 +368,14 @@ fn testAndBenchTensor(
         .func = if (k_bits == 2) ks.k2_m8_narrow_s16 else ks.k3_m8_narrow_s16,
         .grid_div = 32,
         .block_x = 512,
+        .unfused = true,
+    };
+    n_variants += 1;
+    variants_buf[n_variants] = .{
+        .label = "narrow12  WNT=2 S=12  384t (OC/32 +hadOut)",
+        .func = if (k_bits == 2) ks.k2_m8_narrow_s12 else ks.k3_m8_narrow_s12,
+        .grid_div = 32,
+        .block_x = 384,
         .unfused = true,
     };
     n_variants += 1;
@@ -387,16 +395,6 @@ fn testAndBenchTensor(
         .unfused = true,
     };
     n_variants += 1;
-    if (k_bits == 3) {
-        variants_buf[n_variants] = .{
-            .label = "narrow1x16 WNT=1 S=16 512t (OC/16 +hadOut)",
-            .func = ks.k3_m8_narrow_w1s16,
-            .grid_div = 16,
-            .block_x = 512,
-            .unfused = true,
-        };
-        n_variants += 1;
-    }
 
     var timer = try cuda.Timer.init();
     defer timer.deinit();
@@ -492,10 +490,14 @@ pub fn run(allocator: std.mem.Allocator, model_path: []const u8) !void {
     // 2. 2-bit OC=5120 tensor (7.50 MiB) — exact 60-SM underutilization geometry
     try testAndBenchTensor(allocator, &ctx, &ks, &model, dep_k2, dep_k3, "blk.3.attn_output", false, true);
 
-    // 3. 3-bit OC=5120 tensor (11.25 MiB) — runs automatically when >= 16 MiB VRAM is free
+    // 3. 3-bit OC=5120 tensor (11.25 MiB)
     try testAndBenchTensor(allocator, &ctx, &ks, &model, dep_k2, dep_k3, "blk.0.ssm_out", false, true);
 
-    // 4. 3-bit FFN down tensor (31.88 MiB, 25% of model!) — runs automatically on clean card
+    // 4. Wide-OC projections (attn_qkv OC=10240, ffn_gate OC=17408)
+    try testAndBenchTensor(allocator, &ctx, &ks, &model, dep_k2, dep_k3, "blk.0.attn_qkv", false, true);
+    try testAndBenchTensor(allocator, &ctx, &ks, &model, dep_k2, dep_k3, "blk.0.ffn_gate", false, true);
+
+    // 5. 3-bit FFN down tensor (31.88 MiB, 25% of model!)
     try testAndBenchTensor(allocator, &ctx, &ks, &model, dep_k2, dep_k3, "blk.0.ffn_down", false, true);
 
     std.debug.print("\nAll runnable Escha sm_89 real-weight checks PASSED.\n", .{});

@@ -246,6 +246,127 @@ extern "C" __global__ void __launch_bounds__(128, 4) q4_0_q8_1_gemv_sm89(
 }
 
 // =============================================================================
+// 3b. Vectorized LDG.128 + Shared-Memory-Broadcast + Register-Pinned Q4_0 x Q8_1 GEMV
+//     Requires K % 1024 == 0 (nb % 32 == 0, satisfied by 4096, 5120, 17408, 25600).
+//     Grid : (ceil(N / 8), 1, 1) — 8 warps/block = 8 output rows sharing X_q8_1 in smem!
+//     Block: (256, 1, 1)
+// =============================================================================
+template <int M_FIXED>
+static __device__ __forceinline__ void q4_0_q8_1_gemv_fast_impl(
+    const uint8_t* __restrict__ W_q4_0,  // [N, K/32 * 18], 16-byte aligned per row & 32-blk tile
+    const uint8_t* __restrict__ X_q8_1,  // [M_FIXED, K/32 * 36], 16-byte aligned per row & 32-blk tile
+    float* __restrict__ Y,               // [M_FIXED, N]
+    int K,
+    int N
+) {
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;  // 0..7
+    const int lane = tid & 31;  // 0..31
+    const int row  = blockIdx.x * 8 + warp;
+    const bool valid_row = (row < N);
+
+    const int nb = K >> 5;
+    const size_t w_row_bytes = (size_t)nb * Q4_0_BYTES;
+    const size_t x_row_bytes = (size_t)nb * Q8_1_BYTES;
+    const uint8_t* w_row = W_q4_0 + (size_t)(valid_row ? row : 0) * w_row_bytes;
+
+    // 32 Q8_1 blocks = 1152 bytes = 72 uint4 per token; 32 Q4_0 blocks = 576 bytes = 36 uint4 per warp
+    __shared__ uint4 s_x[M_FIXED][72];
+    __shared__ uint4 s_w[8][36];
+
+    float acc[M_FIXED];
+    #pragma unroll
+    for (int m = 0; m < M_FIXED; ++m) acc[m] = 0.0f;
+
+    for (int b0 = 0; b0 < nb; b0 += 32) {
+        // 1. Collaboratively load X_q8_1[0..M_FIXED-1, b0..b0+31] via coalesced 128-bit loads
+        const int total_x_u4 = M_FIXED * 72;
+        for (int idx = tid; idx < total_x_u4; idx += 256) {
+            const int m = idx / 72;
+            const int q = idx - m * 72;
+            const uint4* x_src = reinterpret_cast<const uint4*>(
+                X_q8_1 + (size_t)m * x_row_bytes + (size_t)b0 * Q8_1_BYTES
+            );
+            s_x[m][q] = __ldg(x_src + q);
+        }
+
+        // 2. Each warp loads its 32 Q4_0 blocks (36 uint4 = 576 bytes) via coalesced 128-bit loads!
+        if (valid_row) {
+            const uint4* w_src = reinterpret_cast<const uint4*>(w_row + (size_t)b0 * Q4_0_BYTES);
+            s_w[warp][lane] = __ldg(w_src + lane);
+            if (lane < 4) {
+                s_w[warp][32 + lane] = __ldg(w_src + 32 + lane);
+            }
+        }
+        __syncthreads();
+
+        if (valid_row) {
+            // Unpack 1 Q4_0 block (18 bytes) for this lane from shared memory
+            const uint8_t* wb = reinterpret_cast<const uint8_t*>(s_w[warp]) + lane * Q4_0_BYTES;
+            const uint16_t dw_bits = (uint16_t)wb[0] | ((uint16_t)wb[1] << 8);
+            const float dw = __half2float(__ushort_as_half(dw_bits));
+
+            const uint16_t* w16 = reinterpret_cast<const uint16_t*>(wb + 2);
+            const uint32_t u0 = (uint32_t)w16[0] | ((uint32_t)w16[1] << 16);
+            const uint32_t u1 = (uint32_t)w16[2] | ((uint32_t)w16[3] << 16);
+            const uint32_t u2 = (uint32_t)w16[4] | ((uint32_t)w16[5] << 16);
+            const uint32_t u3 = (uint32_t)w16[6] | ((uint32_t)w16[7] << 16);
+
+            const int wl0 = (int)(u0 & 0x0f0f0f0fu);
+            const int wl1 = (int)(u1 & 0x0f0f0f0fu);
+            const int wl2 = (int)(u2 & 0x0f0f0f0fu);
+            const int wl3 = (int)(u3 & 0x0f0f0f0fu);
+            const int wh0 = (int)((u0 >> 4) & 0x0f0f0f0fu);
+            const int wh1 = (int)((u1 >> 4) & 0x0f0f0f0fu);
+            const int wh2 = (int)((u2 >> 4) & 0x0f0f0f0fu);
+            const int wh3 = (int)((u3 >> 4) & 0x0f0f0f0fu);
+
+            #pragma unroll
+            for (int m = 0; m < M_FIXED; ++m) {
+                const uint32_t* xb32 = reinterpret_cast<const uint32_t*>(s_x[m]) + lane * 9;
+                const half2 ds = *reinterpret_cast<const half2*>(xb32);
+                const int* xq = reinterpret_cast<const int*>(xb32 + 1);
+
+                int sumi = 0;
+                sumi = dp4a_i8(wl0, xq[0], sumi);
+                sumi = dp4a_i8(wl1, xq[1], sumi);
+                sumi = dp4a_i8(wl2, xq[2], sumi);
+                sumi = dp4a_i8(wl3, xq[3], sumi);
+                sumi = dp4a_i8(wh0, xq[4], sumi);
+                sumi = dp4a_i8(wh1, xq[5], sumi);
+                sumi = dp4a_i8(wh2, xq[6], sumi);
+                sumi = dp4a_i8(wh3, xq[7], sumi);
+
+                acc[m] += dw * (__low2float(ds) * (float)sumi - 8.0f * __high2float(ds));
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid_row) {
+        #pragma unroll
+        for (int m = 0; m < M_FIXED; ++m) {
+            const float tot = warp_sum_32(acc[m]);
+            if (lane == 0) {
+                Y[(size_t)m * N + row] = tot;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 4) q4_0_q8_1_gemv_m1_sm89(
+    const uint8_t* __restrict__ W_q4_0, const uint8_t* __restrict__ X_q8_1, float* __restrict__ Y, int K, int N
+) { q4_0_q8_1_gemv_fast_impl<1>(W_q4_0, X_q8_1, Y, K, N); }
+
+extern "C" __global__ void __launch_bounds__(256, 4) q4_0_q8_1_gemv_m7_sm89(
+    const uint8_t* __restrict__ W_q4_0, const uint8_t* __restrict__ X_q8_1, float* __restrict__ Y, int K, int N
+) { q4_0_q8_1_gemv_fast_impl<7>(W_q4_0, X_q8_1, Y, K, N); }
+
+extern "C" __global__ void __launch_bounds__(256, 4) q4_0_q8_1_gemv_m8_sm89(
+    const uint8_t* __restrict__ W_q4_0, const uint8_t* __restrict__ X_q8_1, float* __restrict__ Y, int K, int N
+) { q4_0_q8_1_gemv_fast_impl<8>(W_q4_0, X_q8_1, Y, K, N); }
+
+// =============================================================================
 // 4 & 5. Exact Parallel-Bitonic Threshold-Filtered Top-64 Selection (2-stage GPU)
 //    Stage 1: Grid=(64, M, 1), Block=(128, 1, 1) -> part_val[M, 64*64], part_idx[M, 64*64]
 //    Stage 2: Grid=(1,  M, 1), Block=(128, 1, 1) -> out_val[M, 64],     out_idx[M, 64]

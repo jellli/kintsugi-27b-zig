@@ -485,3 +485,22 @@ extern "C" __global__ void __launch_bounds__(512, 2) escha_gemv_k2_m1_narrow_s16
 extern "C" __global__ void __launch_bounds__(512, 2) escha_gemv_k3_m1_narrow_s16(
     const __half* A, const uint16_t* B, const __half* rout, float* C, int m, int k, int n
 ) { escha_gemv_impl<3, 0, 2, 16, false>(A, B, rout, C, m, k, n); }
+
+// 9. Fused 512t wide-OC geometry (OC>=10240: ffn_gate/up, attn_qkv, attn_q): WNT=2, S=4, G=4 -> 512t, grid OC/128 (zero hadOut!)
+extern "C" __global__ void __launch_bounds__(512, 2) escha_gemv_k2_m8_fused_w2s4(
+    const __half* A, const uint16_t* B, const __half* rout, float* C, int m, int k, int n
+) { escha_gemv_impl<2, 1, 2, 4, true>(A, B, rout, C, m, k, n); }
+
+extern "C" __global__ void __launch_bounds__(512, 2) escha_gemv_k3_m8_fused_w2s4(
+    const __half* A, const uint16_t* B, const __half* rout, float* C, int m, int k, int n
+) { escha_gemv_impl<3, 1, 2, 4, true>(A, B, rout, C, m, k, n); }
+
+// 10. 3-block/SM Ada single-wave geometry for OC=5120 (160 <= 180 blks/wave): WNT=2, S=12, G=1 -> 384t, grid OC/32
+extern "C" __global__ void __launch_bounds__(384, 3) escha_gemv_k2_m8_narrow_s12(
+    const __half* A, const uint16_t* B, const __half* rout, float* C, int m, int k, int n
+) { escha_gemv_impl<2, 1, 2, 12, false>(A, B, rout, C, m, k, n); }
+
+extern "C" __global__ void __launch_bounds__(384, 3) escha_gemv_k3_m8_narrow_s12(
+    const __half* A, const uint16_t* B, const __half* rout, float* C, int m, int k, int n
+) { escha_gemv_impl<3, 1, 2, 12, false>(A, B, rout, C, m, k, n); }
+

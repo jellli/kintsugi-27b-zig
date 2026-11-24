@@ -42,6 +42,7 @@ pub const Kernels = struct {
     fn_escha_k3_m1: cuda.CUfunction,
     fn_escha_k2_m8: cuda.CUfunction,
     fn_escha_k3_m8: cuda.CUfunction,
+    fn_escha_k3_m8_w1s16: cuda.CUfunction,
     fn_escha_had_out: cuda.CUfunction,
 
     // GDN
@@ -62,6 +63,9 @@ pub const Kernels = struct {
     fn_swiglu: cuda.CUfunction,
     fn_q81: cuda.CUfunction,
     fn_q4_gemv: cuda.CUfunction,
+    fn_q4_gemv_m1: cuda.CUfunction,
+    fn_q4_gemv_m7: cuda.CUfunction,
+    fn_q4_gemv_m8: cuda.CUfunction,
     fn_topk1: cuda.CUfunction,
     fn_topk2: cuda.CUfunction,
 
@@ -94,6 +98,7 @@ pub const Kernels = struct {
             .fn_escha_k3_m1 = try mod_escha.getFunction("escha_gemv_k3_m1_narrow_s16"),
             .fn_escha_k2_m8 = try mod_escha.getFunction("escha_gemv_k2_m8_narrow_s16"),
             .fn_escha_k3_m8 = try mod_escha.getFunction("escha_gemv_k3_m8_narrow_s16"),
+            .fn_escha_k3_m8_w1s16 = try mod_escha.getFunction("escha_gemv_k3_m8_narrow_w1s16"),
             .fn_escha_had_out = try mod_escha.getFunction("escha_had_out_f32"),
 
             .fn_gdn_conv = try mod_gdn.getFunction("gdn_conv1d_silu_l2norm_f32"),
@@ -102,15 +107,18 @@ pub const Kernels = struct {
             .fn_gdn_commit_conv = try mod_gdn.getFunction("gdn_commit_conv_state_f32"),
             .fn_gdn_post = try mod_gdn.getFunction("gdn_norm_gate_had128_f16"),
 
-            .fn_attn_q = try mod_attn.getFunction("attn_q_norm_mrope_split_f32"),
-            .fn_attn_kv = try mod_attn.getFunction("attn_k_norm_mrope_kv_q4_0_store"),
-            .fn_attn_fa_naive = try mod_attn.getFunction("attn_decode_q4_0_splitk_sm89"),
-            .fn_attn_fa_gqa6 = try mod_attn.getFunction("attn_decode_q4_0_gqa6_sm89"),
+            .fn_attn_q = try mod_attn.getFunction("attn_q_norm_mrope_split_f32_dpos"),
+            .fn_attn_kv = try mod_attn.getFunction("attn_k_norm_mrope_kv_q4_0_store_dpos"),
+            .fn_attn_fa_naive = try mod_attn.getFunction("attn_decode_q4_0_splitk_sm89_dpos"),
+            .fn_attn_fa_gqa6 = try mod_attn.getFunction("attn_decode_q4_0_gqa6_sm89_dpos"),
             .fn_attn_red = try mod_attn.getFunction("attn_splitk_reduce_gate_had128_f16"),
 
             .fn_swiglu = try mod_lm.getFunction("fused_swiglu_had128_f16"),
             .fn_q81 = try mod_lm.getFunction("quantize_f32_to_q8_1_sm89"),
             .fn_q4_gemv = try mod_lm.getFunction("q4_0_q8_1_gemv_sm89"),
+            .fn_q4_gemv_m1 = try mod_lm.getFunction("q4_0_q8_1_gemv_m1_sm89"),
+            .fn_q4_gemv_m7 = try mod_lm.getFunction("q4_0_q8_1_gemv_m7_sm89"),
+            .fn_q4_gemv_m8 = try mod_lm.getFunction("q4_0_q8_1_gemv_m8_sm89"),
             .fn_topk1 = try mod_lm.getFunction("topk64_stage1_sm89"),
             .fn_topk2 = try mod_lm.getFunction("topk64_stage2_sm89"),
         };
@@ -185,12 +193,18 @@ pub const Engine = struct {
     d_topk_oval: cuda.CUdeviceptr, // [8, 64] f32
     d_topk_oidx: cuda.CUdeviceptr, // [8, 64] i32
     d_cap_buf: cuda.CUdeviceptr,   // [8, 5 * 5120] f32 (DFlash2 captured target hidden states!)
+    d_meta_pos: cuda.CUdeviceptr,  // [1] i32 (device-side pos for static CUDA Graph capture!)
 
     // Host staging buffers
     h_emb_buf: []f32,     // [8 * 5120]
     h_out_norm: []f32,    // [8 * 5120]
     h_cand_ids: []i32,    // [8 * 64]
     h_cand_vals: []f32,   // [8 * 64]
+    h_meta_pos: i32 = 0,
+
+    // Cached static CUDA Graphs (eliminates ~1,550 kernel launches/step!)
+    g_verify8: [3]?cuda.GraphExec = .{ null, null, null },
+    g_commit: [MAX_M]?cuda.GraphExec = .{ null, null, null, null, null, null, null, null },
 
     // DFlash2 capture config (default: [6, 20, 34, 48, 62])
     capture_enabled: bool = false,
@@ -252,6 +266,7 @@ pub const Engine = struct {
         const off_tk_oval = bump(&sc_off, MAX_M * TOPK_K * 4);
         const off_tk_oidx = bump(&sc_off, MAX_M * TOPK_K * 4);
         const off_cap_buf = bump(&sc_off, MAX_M * 5 * Spec.d_model * 4);
+        const off_meta_pos = bump(&sc_off, 16);
 
         const d_scratch = try cuda.Context.alloc(sc_off);
         errdefer cuda.Context.free(d_scratch);
@@ -321,6 +336,7 @@ pub const Engine = struct {
             .d_topk_oval = d_scratch + off_tk_oval,
             .d_topk_oidx = d_scratch + off_tk_oidx,
             .d_cap_buf = d_scratch + off_cap_buf,
+            .d_meta_pos = d_scratch + off_meta_pos,
             .h_emb_buf = h_emb_buf,
             .h_out_norm = h_out_norm,
             .h_cand_ids = h_cand_ids,
@@ -331,6 +347,12 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine) void {
+        for (&self.g_verify8) |*g| {
+            if (g.*) |*exec| exec.deinit();
+        }
+        for (&self.g_commit) |*g| {
+            if (g.*) |*exec| exec.deinit();
+        }
         self.allocator.free(self.h_cand_vals);
         self.allocator.free(self.h_cand_ids);
         self.allocator.free(self.h_out_norm);
@@ -382,7 +404,8 @@ pub const Engine = struct {
             @ptrCast(&p_k),
             @ptrCast(&p_n),
         };
-        try cuda.launch(fn_gemv, .{ proj.oc / 32, 1, 1 }, .{ 512, 1, 1 }, 0, self.ctx.stream, &params);
+        const gx: u32 = proj.oc / 32;
+        try cuda.launch(fn_gemv, .{ gx, 1, 1 }, .{ 512, 1, 1 }, 0, self.ctx.stream, &params);
 
         // In-place 128-pt output Hadamard + escha_rout scaling (~1.5 us)
         var p_oc: c_int = @intCast(proj.oc);
@@ -413,21 +436,67 @@ pub const Engine = struct {
         std.debug.assert(m >= 1 and m <= MAX_M);
         if (self.pos + m > self.max_kv_cells) return error.ContextFull;
 
-        // 1. Embed tokens on CPU from host mmap Q8_0 -> H2D (only 20-160 KiB!)
+        // 1. Embed tokens on CPU from host mmap Q8_0 -> H2D (only 20-160 KiB!) + upload pos
         for (tokens, 0..) |tok, r| {
             self.model.embedToken(tok, self.h_emb_buf[r * Spec.d_model ..][0..Spec.d_model]);
         }
         try self.ctx.copyHtoDAsync(self.d_residual, std.mem.sliceAsBytes(self.h_emb_buf[0 .. m * Spec.d_model]));
+        self.h_meta_pos = @intCast(self.pos);
+        try self.ctx.copyHtoDAsync(self.d_meta_pos, std.mem.asBytes(&self.h_meta_pos));
 
+        const total_seq = self.pos + m;
+        const attn_bucket: usize = if (total_seq >= 1024) 2 else if (total_seq >= 256) 1 else 0;
+
+        // 2. Execute 64L Trunk (+ Stage-1 GPU LM Head if compute_logits)
+        //    Hot speculative verify path (m==8, !commit_immediately, compute_logits, capture_enabled)
+        //    uses a cached static CUDA Graph (eliminates ~1,300 kernel launches/step!).
+        if (m == 8 and !commit_immediately and compute_logits and self.capture_enabled) {
+            if (self.g_verify8[attn_bucket]) |exec| {
+                try exec.launch(self.ctx.stream);
+            } else {
+                try self.ctx.beginCapture();
+                try self.launchForwardBody(8, false, true, attn_bucket);
+                const exec = try self.ctx.endCaptureExec();
+                self.g_verify8[attn_bucket] = exec;
+                try exec.launch(self.ctx.stream);
+            }
+        } else {
+            try self.launchForwardBody(m, commit_immediately, compute_logits, attn_bucket);
+        }
+
+        if (commit_immediately) {
+            self.pos += m;
+        }
+
+        var out: StepOutput = .{};
+        if (!compute_logits) {
+            return out;
+        }
+
+        // 3. Stage-2 Exact Q8_0 rescore of Top-64 candidates on CPU (zero VRAM!)
+        try self.finishStage2LmHeadCpu(self.d_xnorm, m, &out);
+        return out;
+    }
+
+    fn launchForwardBody(
+        self: *const Engine,
+        m: u32,
+        commit_immediately: bool,
+        compute_logits: bool,
+        attn_bucket: usize,
+    ) !void {
         var prev_bias: cuda.CUdeviceptr = 0;
         var has_delta: c_int = 0;
         var p_dim: c_int = Spec.d_model;
         var p_eps: f32 = Spec.rms_eps;
         var p_m: c_int = @intCast(m);
-        var p_pos: c_int = @intCast(self.pos);
+        var p_dpos = self.d_meta_pos;
         var p_fb: f32 = Spec.rope_theta;
 
-        // 2. Execute all 64 layers!
+        const n_splits: u32 = if (attn_bucket == 2) 7 else if (attn_bucket == 1) 4 else 1;
+        const use_gqa6 = (attn_bucket >= 1);
+
+        // Execute all 64 layers!
         for (0..Spec.n_layers) |l| {
             // Check if this layer's input should be captured for DFlash2
             var cap_slot: ?c_int = null;
@@ -489,7 +558,7 @@ pub const Engine = struct {
                         @ptrCast(&p_qkv), @ptrCast(&p_qb),  @ptrCast(&p_cw),
                         @ptrCast(&p_cin), @ptrCast(&p_cout), @ptrCast(&p_qo),
                         @ptrCast(&p_ko),  @ptrCast(&p_vo),  @ptrCast(&p_m),
-                        @ptrCast(&p_nc),  @ptrCast(&p_eps),
+                        @ptrCast(&p_nc), @ptrCast(&p_eps),
                     };
                     try cuda.launch(self.ks.fn_gdn_conv, .{ 80, 1, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &p_conv);
 
@@ -583,12 +652,12 @@ pub const Engine = struct {
                     var p_gate = self.d_buf_c; // [8, 6144]
                     var p_q = [_]?*anyopaque{
                         @ptrCast(&p_qfull), @ptrCast(&p_qb), @ptrCast(&p_qn),
-                        @ptrCast(&p_qrot),  @ptrCast(&p_gate), @ptrCast(&p_pos),
+                        @ptrCast(&p_qrot),  @ptrCast(&p_gate), @ptrCast(&p_dpos),
                         @ptrCast(&p_fb),    @ptrCast(&p_eps),
                     };
                     try cuda.launch(self.ks.fn_attn_q, .{ Spec.n_heads, m, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_q);
 
-                    // 2D. K RMSNorm + MRoPE + Q4_0 KV Cache Append at [pos .. pos+m)
+                    // 2D. K RMSNorm + MRoPE + Q4_0 KV Cache Append at [*dpos .. *dpos+m)
                     const d_kc = self.d_kv_k + @as(usize, al.attn_idx) * self.kv_layer_bytes;
                     const d_vc = self.d_kv_v + @as(usize, al.attn_idx) * self.kv_layer_bytes;
                     var p_ki = d_kin;
@@ -600,24 +669,22 @@ pub const Engine = struct {
                     var p_vcp = d_vc;
                     var p_kv = [_]?*anyopaque{
                         @ptrCast(&p_ki),  @ptrCast(&p_vi),  @ptrCast(&p_kb), @ptrCast(&p_vb),
-                        @ptrCast(&p_kn),  @ptrCast(&p_kcp), @ptrCast(&p_vcp), @ptrCast(&p_pos),
+                        @ptrCast(&p_kn),  @ptrCast(&p_kcp), @ptrCast(&p_vcp), @ptrCast(&p_dpos),
                         @ptrCast(&p_fb),  @ptrCast(&p_eps),
                     };
                     try cuda.launch(self.ks.fn_attn_kv, .{ Spec.n_kv_heads, m, 2 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_kv);
 
                     // 2E. Split-K Q4_0 FlashAttention (adaptive: GQA6x4 tiled for seq >= 256, 1-warp for short seq!)
-                    const total_seq = self.pos + m;
-                    const n_splits: u32 = if (total_seq >= 1024) 7 else if (total_seq >= 256) 4 else 1;
                     var p_po = self.d_part_o;
                     var p_pm = self.d_part_m;
                     var p_pl = self.d_part_l;
                     var p_ns: c_int = @intCast(n_splits);
 
-                    if (total_seq >= 256) {
+                    if (use_gqa6) {
                         var p_fa = [_]?*anyopaque{
                             @ptrCast(&p_qrot), @ptrCast(&p_kcp), @ptrCast(&p_vcp),
                             @ptrCast(&p_po),   @ptrCast(&p_pm),  @ptrCast(&p_pl),
-                            @ptrCast(&p_pos),  @ptrCast(&p_m),   @ptrCast(&p_ns),
+                            @ptrCast(&p_dpos), @ptrCast(&p_m),   @ptrCast(&p_ns),
                         };
                         const gqa6_ty: u32 = (m + 3) / 4;
                         try cuda.launch(self.ks.fn_attn_fa_gqa6, .{ Spec.n_kv_heads, gqa6_ty, n_splits }, .{ 768, 1, 1 }, 0, self.ctx.stream, &p_fa);
@@ -625,7 +692,7 @@ pub const Engine = struct {
                         var p_fa = [_]?*anyopaque{
                             @ptrCast(&p_qrot), @ptrCast(&p_kcp), @ptrCast(&p_vcp),
                             @ptrCast(&p_po),   @ptrCast(&p_pm),  @ptrCast(&p_pl),
-                            @ptrCast(&p_pos),  @ptrCast(&p_ns),
+                            @ptrCast(&p_dpos), @ptrCast(&p_ns),
                         };
                         try cuda.launch(self.ks.fn_attn_fa_naive, .{ Spec.n_heads, m, n_splits }, .{ 32, 1, 1 }, 0, self.ctx.stream, &p_fa);
                     }
@@ -665,19 +732,10 @@ pub const Engine = struct {
             try cuda.launch(self.ks.fn_norm_f32, .{ m, 1, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_fin);
         }
 
-        if (commit_immediately) {
-            self.pos += m;
+        // 4. Stage-1 GPU LM Head + Exact Top-64 (captured inside CUDA Graph when verifying!)
+        if (compute_logits) {
+            try self.launchStage1LmHeadGpu(self.d_xnorm, m);
         }
-
-        var out: StepOutput = .{};
-        if (!compute_logits) {
-            return out;
-        }
-
-        // 4. Two-Stage LM Head:
-        //    Stage 1 (GPU, 682 MiB Q4_0): Q8_1 quant -> dp4a Q4_0xQ8_1 GEMV -> Exact Parallel-Bitonic Top-64
-        try self.runTwoStageLmHead(m, &out);
-        return out;
     }
 
     fn runFfnBlock(
@@ -738,9 +796,7 @@ pub const Engine = struct {
         try cuda.launch(self.ks.fn_capture, .{ m, 20, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &params);
     }
 
-    /// Commit exact `n_commit` (`1..8`) tokens into all 48 GDN states after speculative verification!
-    pub fn commitSpeculative(self: *Engine, n_commit: u32) !void {
-        std.debug.assert(n_commit >= 1 and n_commit <= MAX_M);
+    fn launchCommitBody(self: *const Engine, n_commit: u32) !void {
         var p_nc: c_int = @intCast(n_commit);
         var p_null: cuda.CUdeviceptr = 0;
 
@@ -772,30 +828,51 @@ pub const Engine = struct {
                 .full_attn => {},
             }
         }
+    }
+
+    /// Commit exact `n_commit` (`1..8`) tokens into all 48 GDN states after speculative verification!
+    pub fn commitSpeculative(self: *Engine, n_commit: u32) !void {
+        std.debug.assert(n_commit >= 1 and n_commit <= MAX_M);
+        const idx: usize = n_commit - 1;
+        if (self.g_commit[idx]) |exec| {
+            try exec.launch(self.ctx.stream);
+        } else {
+            try self.ctx.beginCapture();
+            try self.launchCommitBody(n_commit);
+            const exec = try self.ctx.endCaptureExec();
+            self.g_commit[idx] = exec;
+            try exec.launch(self.ctx.stream);
+        }
         self.pos += n_commit;
     }
 
-    /// Run Stage-1 Q4_0 LM head + Top-64 on GPU, then exact Q8_0 Stage-2 rescore on CPU (zero VRAM!)
-    pub fn runTwoStageLmHead(self: *Engine, m: u32, out: *StepOutput) !void {
-        var p_x = self.d_xnorm;
+    /// Launch Stage-1 Q4_0 LM head + Exact Top-64 on GPU (capturable inside a CUDA Graph!).
+    pub fn launchStage1LmHeadGpu(self: *const Engine, d_hidden: cuda.CUdeviceptr, m: u32) !void {
+        var p_x = d_hidden;
         var p_xq81 = self.d_xq81;
         var p_k: c_int = Spec.d_model;
         var p_m: c_int = @intCast(m);
         var p_nv: c_int = Spec.n_vocab;
 
-        // 1. Quantize x_norm [m, 5120] -> Q8_1
+        // 1. Quantize d_hidden [m, 5120] -> Q8_1
         var p_q81 = [_]?*anyopaque{ @ptrCast(&p_x), @ptrCast(&p_xq81), @ptrCast(&p_k), @ptrCast(&p_m) };
         const nb = Spec.d_model / 32;
         try cuda.launch(self.ks.fn_q81, .{ (m * nb + 7) / 8, 1, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_q81);
 
-        // 2. Stage-1 Q4_0 x Q8_1 __dp4a GEMV over full 248,320 vocab
+        // 2. Stage-1 Q4_0 x Q8_1 __dp4a GEMV over full 248,320 vocab (LDG.128 shmem fast path for M=1,7,8)
         var p_w = self.model.head_q4_0;
         var p_y = self.d_logits;
-        var p_gemv = [_]?*anyopaque{
-            @ptrCast(&p_w), @ptrCast(&p_xq81), @ptrCast(&p_y),
-            @ptrCast(&p_m), @ptrCast(&p_k),    @ptrCast(&p_nv),
-        };
-        try cuda.launch(self.ks.fn_q4_gemv, .{ (Spec.n_vocab + 3) / 4, 1, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &p_gemv);
+        if (m == 1 or m == 7 or m == 8) {
+            const fn_fast = if (m == 1) self.ks.fn_q4_gemv_m1 else if (m == 7) self.ks.fn_q4_gemv_m7 else self.ks.fn_q4_gemv_m8;
+            var p_fast = [_]?*anyopaque{ @ptrCast(&p_w), @ptrCast(&p_xq81), @ptrCast(&p_y), @ptrCast(&p_k), @ptrCast(&p_nv) };
+            try cuda.launch(fn_fast, .{ (Spec.n_vocab + 7) / 8, 1, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_fast);
+        } else {
+            var p_gemv = [_]?*anyopaque{
+                @ptrCast(&p_w), @ptrCast(&p_xq81), @ptrCast(&p_y),
+                @ptrCast(&p_m), @ptrCast(&p_k),    @ptrCast(&p_nv),
+            };
+            try cuda.launch(self.ks.fn_q4_gemv, .{ (Spec.n_vocab + 3) / 4, 1, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &p_gemv);
+        }
 
         // 3. Exact GPU Parallel-Bitonic Top-64
         var p_pv = self.d_topk_pval;
@@ -806,10 +883,13 @@ pub const Engine = struct {
         var p_tk2 = [_]?*anyopaque{ @ptrCast(&p_pv), @ptrCast(&p_pi), @ptrCast(&p_ov), @ptrCast(&p_oi) };
         try cuda.launch(self.ks.fn_topk1, .{ TOPK_BLOCKS, m, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &p_tk1);
         try cuda.launch(self.ks.fn_topk2, .{ 1, m, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &p_tk2);
+    }
 
-        // 4. Tiny D2H: cand_ids[m, 64] (<= 2 KiB) + x_norm[m, 5120] (<= 160 KiB)
+    /// D2H Top-64 IDs + hidden states, sync, and run exact Stage-2 Q8_0 rescore on CPU (zero VRAM!).
+    pub fn finishStage2LmHeadCpu(self: *Engine, d_hidden: cuda.CUdeviceptr, m: u32, out: *StepOutput) !void {
+        // 4. Tiny D2H: cand_ids[m, 64] (<= 2 KiB) + hidden[m, 5120] (<= 160 KiB)
         try self.ctx.copyDtoHAsync(std.mem.sliceAsBytes(self.h_cand_ids[0 .. m * TOPK_K]), self.d_topk_oidx);
-        try self.ctx.copyDtoHAsync(std.mem.sliceAsBytes(self.h_out_norm[0 .. m * Spec.d_model]), self.d_xnorm);
+        try self.ctx.copyDtoHAsync(std.mem.sliceAsBytes(self.h_out_norm[0 .. m * Spec.d_model]), d_hidden);
         try self.ctx.sync();
 
         // 5. Stage-2 Exact Q8_0 rescore of Top-64 candidates directly from host mmap (ZERO VRAM, ~20 us/tok!)
@@ -834,6 +914,16 @@ pub const Engine = struct {
             out.tokens[r] = best_id;
             out.top_logits[r] = best_val;
         }
+    }
+
+    /// Run Stage-1 Q4_0 LM head + Top-64 on GPU, then exact Q8_0 Stage-2 rescore on CPU (zero VRAM!)
+    pub fn runTwoStageLmHead(self: *Engine, m: u32, out: *StepOutput) !void {
+        return self.runTwoStageLmHeadFrom(self.d_xnorm, m, out);
+    }
+
+    pub fn runTwoStageLmHeadFrom(self: *Engine, d_hidden: cuda.CUdeviceptr, m: u32, out: *StepOutput) !void {
+        try self.launchStage1LmHeadGpu(d_hidden, m);
+        try self.finishStage2LmHeadCpu(d_hidden, m, out);
     }
 
     /// Fast prefill of arbitrary prompt length in chunks of MAX_M (8).

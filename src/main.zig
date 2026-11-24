@@ -8,6 +8,8 @@ const ops_bench = @import("ops_bench.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const engine_mod = @import("engine.zig");
+const dflash_mod = @import("dflash.zig");
+const server_mod = @import("server.zig");
 
 const sm89_core_cubin = @embedFile("sm89_core.cubin");
 
@@ -34,19 +36,27 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "verify-e2e")) {
         const model_path = if (args.len >= 3) args[2] else default_model_path;
         try runVerifyE2E(allocator, model_path);
+    } else if (std.mem.eql(u8, cmd, "bench-spec")) {
+        const model_path = if (args.len >= 3) args[2] else default_model_path;
+        const drafter_path = if (args.len >= 4) args[3] else default_drafter_path;
+        try runBenchSpec(allocator, model_path, drafter_path);
     } else if (std.mem.eql(u8, cmd, "generate")) {
         try runGenerate(allocator, args[2..]);
+    } else if (std.mem.eql(u8, cmd, "serve")) {
+        try runServe(allocator, args[2..]);
     } else {
         std.debug.print(
             \\kintsugi-zig — dedicated sm_89 CUDA runtime for Kintsugi-27B + DFlash2
             \\
             \\Commands:
-            \\  probe                         Verify RTX 4070 Ti CUDA Driver API, sm_89 CUBIN kernels & D2D bandwidth
-            \\  info [model.gguf] [draft.gguf] Zero-copy mmap GGUF inspection & static VRAM KV budget plan
-            \\  bench-escha [model.gguf]      Verify Escha 2/3-bit sm_89 GEMV against CPU ref & benchmark geometries
-            \\  bench-ops [model.gguf]        Verify & benchmark all 14 GDN, FullAttn/Q4_0 KV, SwiGLU & LM-head kernels
-            \\  verify-e2e [model.gguf]       Verify full 64-layer target engine + tokenizer exact match vs llama-server
-            \\  generate [--prompt S] [--max-tokens N] [--model P]  Run greedy/sampled target text generation
+            \\  probe                              Verify RTX 4070 Ti CUDA Driver API, sm_89 CUBIN kernels & D2D bandwidth
+            \\  info [model.gguf] [draft.gguf]     Zero-copy mmap GGUF inspection & static VRAM KV budget plan
+            \\  bench-escha [model.gguf]           Verify Escha 2/3-bit sm_89 GEMV against CPU ref & benchmark geometries
+            \\  bench-ops [model.gguf]             Verify & benchmark all 14 GDN, FullAttn/Q4_0 KV, SwiGLU & LM-head kernels
+            \\  verify-e2e [model.gguf]            Verify full 64-layer target engine + tokenizer exact match vs llama-server
+            \\  bench-spec [model.gguf] [draft]    Verify DFlash2 exact greedy match & benchmark 256-tok speculative decode
+            \\  generate [--prompt S] [--max-tokens N] [--temp T] [--no-spec]  Run text generation
+            \\  serve [--host H] [--port P] [--model M] [--draft D] [--no-spec]  Start OpenAI HTTP/1.1 + SSE server
             \\
         , .{});
     }
@@ -516,6 +526,8 @@ fn runVerifyE2E(allocator: std.mem.Allocator, model_path: []const u8) !void {
 
 fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var model_path: []const u8 = default_model_path;
+    var drafter_path: []const u8 = default_drafter_path;
+    var use_spec = true;
     var prompt: []const u8 = "The capital of France is";
     var max_tokens: usize = 64;
     var temp: f32 = 0.0;
@@ -525,6 +537,12 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         if (std.mem.eql(u8, args[i], "--model") and i + 1 < args.len) {
             i += 1;
             model_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--draft") and i + 1 < args.len) {
+            i += 1;
+            drafter_path = args[i];
+            use_spec = true;
+        } else if (std.mem.eql(u8, args[i], "--no-spec")) {
+            use_spec = false;
         } else if (std.mem.eql(u8, args[i], "--prompt") and i + 1 < args.len) {
             i += 1;
             prompt = args[i];
@@ -545,15 +563,24 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer model.deinit();
     var tok = try tokenizer_mod.Tokenizer.init(allocator, &model.gguf_file);
     defer tok.deinit();
-    var eng = try engine_mod.Engine.init(allocator, &ctx, &ks, &model, 1120);
+    var eng = try engine_mod.Engine.init(allocator, &ctx, &ks, &model, if (use_spec) 1060 else 160);
     defer eng.deinit();
+
+    var dflash_opt: ?dflash_mod.DFlashEngine = if (use_spec)
+        try dflash_mod.DFlashEngine.load(allocator, &ctx, drafter_path, &eng)
+    else
+        null;
+    defer if (dflash_opt) |*df| df.deinit();
 
     const prompt_toks = try tok.encode(allocator, prompt);
     defer allocator.free(prompt_toks);
 
     var rng = std.Random.DefaultPrng.init(42);
     const tp0 = nowMs();
-    const pf = try eng.prefill(prompt_toks);
+    const pf = if (dflash_opt) |*df|
+        try df.prefill(&eng, prompt_toks)
+    else
+        try eng.prefill(prompt_toks);
     const tp1 = nowMs();
 
     const last_idx = (prompt_toks.len - 1) % engine_mod.MAX_M;
@@ -565,29 +592,462 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var piece_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer piece_buf.deinit(allocator);
 
-    for (0..max_tokens) |step| {
-        if (tok.isEos(cur)) break;
-        try gen.append(allocator, cur);
-        piece_buf.clearRetainingCapacity();
-        try tok.decodeTokenTo(cur, &piece_buf, allocator);
-        std.debug.print("{s}", .{piece_buf.items});
-        if (step + 1 == max_tokens) break;
-        const out = try eng.forward(&[_]u32{cur}, true, true);
-        cur = engine_mod.sampleFromCandidates(&out.cands[0], temp, 64, 0.95, &rng);
+    var n_steps: usize = 0;
+    var total_drafted: usize = 0;
+    var total_accepted: usize = 0;
+
+    if (dflash_opt) |*df| {
+        if (!tok.isEos(cur) and max_tokens > 0) {
+            try gen.append(allocator, cur);
+            piece_buf.clearRetainingCapacity();
+            try tok.decodeTokenTo(cur, &piece_buf, allocator);
+            std.debug.print("{s}", .{piece_buf.items});
+
+            while (gen.items.len < max_tokens) {
+                var draft_toks: [dflash_mod.N_DRAFT]u32 = undefined;
+                const n_draft = try df.draft(&eng, cur, eng.pos, 0.0, &draft_toks);
+                total_drafted += n_draft;
+
+                var batch: [dflash_mod.BLOCK_SIZE]u32 = undefined;
+                batch[0] = cur;
+                for (0..n_draft) |k| batch[1 + k] = draft_toks[k];
+                const m: u32 = 1 + n_draft;
+
+                const out = try eng.forward(batch[0..m], false, true);
+                n_steps += 1;
+
+                var n_acc: u32 = 0;
+                var next_tok: u32 = 0;
+                var stopped = false;
+
+                for (0..n_draft) |k| {
+                    const t_tok = if (temp <= 0.0)
+                        out.tokens[k]
+                    else
+                        engine_mod.sampleFromCandidates(&out.cands[k], temp, 64, 0.95, &rng);
+                    if (tok.isEos(t_tok)) {
+                        stopped = true;
+                        break;
+                    }
+                    try gen.append(allocator, t_tok);
+                    piece_buf.clearRetainingCapacity();
+                    try tok.decodeTokenTo(t_tok, &piece_buf, allocator);
+                    std.debug.print("{s}", .{piece_buf.items});
+                    if (gen.items.len >= max_tokens) {
+                        stopped = true;
+                        break;
+                    }
+                    if (t_tok == draft_toks[k]) {
+                        n_acc += 1;
+                    } else {
+                        next_tok = t_tok;
+                        break;
+                    }
+                }
+                total_accepted += n_acc;
+
+                if (!stopped and n_acc == n_draft) {
+                    const bonus = if (temp <= 0.0)
+                        out.tokens[n_draft]
+                    else
+                        engine_mod.sampleFromCandidates(&out.cands[n_draft], temp, 64, 0.95, &rng);
+                    if (tok.isEos(bonus)) {
+                        stopped = true;
+                    } else {
+                        try gen.append(allocator, bonus);
+                        piece_buf.clearRetainingCapacity();
+                        try tok.decodeTokenTo(bonus, &piece_buf, allocator);
+                        std.debug.print("{s}", .{piece_buf.items});
+                        next_tok = bonus;
+                        if (gen.items.len >= max_tokens) stopped = true;
+                    }
+                }
+                if (stopped) break;
+
+                const n_commit = n_acc + 1;
+                const pos_before = eng.pos;
+                try eng.commitSpeculative(n_commit);
+                try df.encodeAndInject(&eng, n_commit, pos_before);
+                cur = next_tok;
+            }
+        }
+    } else {
+        for (0..max_tokens) |step| {
+            if (tok.isEos(cur)) break;
+            try gen.append(allocator, cur);
+            piece_buf.clearRetainingCapacity();
+            try tok.decodeTokenTo(cur, &piece_buf, allocator);
+            std.debug.print("{s}", .{piece_buf.items});
+            if (step + 1 == max_tokens) break;
+            const out = try eng.forward(&[_]u32{cur}, true, true);
+            cur = engine_mod.sampleFromCandidates(&out.cands[0], temp, 64, 0.95, &rng);
+        }
     }
+
     const td1 = nowMs();
     const dec_toks = if (gen.items.len > 1) gen.items.len - 1 else 1;
+    if (use_spec and n_steps > 0) {
+        std.debug.print(
+            "\n\n[prompt: {d} toks in {d:.1} ms | generated: {d} toks in {d:.1} ms ({d:.2} tok/s) | steps: {d} ({d:.2} tok/step, acc {d}/{d} = {d:.1}%) | KV pool: {d} cells]\n",
+            .{
+                prompt_toks.len,
+                tp1 - tp0,
+                gen.items.len,
+                td1 - td0,
+                @as(f64, @floatFromInt(dec_toks)) * 1000.0 / (td1 - td0),
+                n_steps,
+                @as(f64, @floatFromInt(dec_toks)) / @as(f64, @floatFromInt(n_steps)),
+                total_accepted,
+                total_drafted,
+                if (total_drafted > 0) @as(f64, @floatFromInt(total_accepted)) * 100.0 / @as(f64, @floatFromInt(total_drafted)) else 0.0,
+                eng.max_kv_cells,
+            },
+        );
+    } else {
+        std.debug.print(
+            "\n\n[prompt: {d} toks in {d:.1} ms | generated: {d} toks in {d:.1} ms ({d:.2} tok/s) | KV pool: {d} cells]\n",
+            .{
+                prompt_toks.len,
+                tp1 - tp0,
+                gen.items.len,
+                td1 - td0,
+                @as(f64, @floatFromInt(dec_toks)) * 1000.0 / (td1 - td0),
+                eng.max_kv_cells,
+            },
+        );
+    }
+}
+
+fn runBenchSpec(allocator: std.mem.Allocator, model_path: []const u8, drafter_path: []const u8) !void {
+    std.debug.print("=== kintsugi-zig Phase 2: DFlash2 Speculative Verify & 256-Tok Benchmark ===\n", .{});
+    var ctx = try cuda.Context.init(0);
+    defer ctx.deinit();
+
+    const t_load0 = nowMs();
+    var ks = try engine_mod.Kernels.load();
+    defer ks.deinit();
+    var model = try model_mod.TargetModel.load(allocator, &ctx, ks.fn_q8_to_q4, model_path);
+    defer model.deinit();
+    var tok = try tokenizer_mod.Tokenizer.init(allocator, &model.gguf_file);
+    defer tok.deinit();
+    var eng = try engine_mod.Engine.init(allocator, &ctx, &ks, &model, 1060);
+    defer eng.deinit();
+    var df = try dflash_mod.DFlashEngine.load(allocator, &ctx, drafter_path, &eng);
+    defer df.deinit();
+    const t_load1 = nowMs();
+
+    const vinfo = try ctx.queryInfo();
     std.debug.print(
-        "\n\n[prompt: {d} toks in {d:.1} ms | generated: {d} toks in {d:.1} ms ({d:.2} tok/s) | KV pool: {d} cells]\n",
+        "Loaded Target + DFlash2 in {d:.0} ms | DFlash VRAM: {d:.1} MiB | Target KV pool: {d} cells | VRAM free: {d} MiB\n",
         .{
-            prompt_toks.len,
-            tp1 - tp0,
-            gen.items.len,
-            td1 - td0,
-            @as(f64, @floatFromInt(dec_toks)) * 1000.0 / (td1 - td0),
+            t_load1 - t_load0,
+            @as(f64, @floatFromInt(df.vram_bytes)) / (1024.0 * 1024.0),
             eng.max_kv_cells,
+            vinfo.free_vram / (1024 * 1024),
         },
     );
+
+    // Part 1: Strict greedy exactness check (M=1 vs DFlash2 Spec) on France & Fibonacci!
+    const exact_prompts = [_]struct { name: []const u8, text: []const u8 }{
+        .{ .name = "France (32 tok)", .text = "The capital of France is" },
+        .{ .name = "Fibonacci (32 tok)", .text = "def fibonacci(n):\n" },
+    };
+
+    for (exact_prompts) |ep| {
+        const ptoks = try tok.encode(allocator, ep.text);
+        defer allocator.free(ptoks);
+
+        // Reference M=1
+        try eng.reset();
+        eng.capture_enabled = false;
+        const pf1 = try eng.prefill(ptoks);
+        var ref_toks: [32]u32 = undefined;
+        var cur1 = pf1.tokens[(ptoks.len - 1) % engine_mod.MAX_M];
+        for (0..32) |k| {
+            ref_toks[k] = cur1;
+            if (k + 1 < 32) {
+                const o1 = try eng.forward(&[_]u32{cur1}, true, true);
+                cur1 = o1.tokens[0];
+            }
+        }
+
+        // DFlash2 Speculative
+        try eng.reset();
+        const pfs = try df.prefill(&eng, ptoks);
+        var spec_toks: std.ArrayListUnmanaged(u32) = .empty;
+        defer spec_toks.deinit(allocator);
+        var curs = pfs.tokens[(ptoks.len - 1) % engine_mod.MAX_M];
+        try spec_toks.append(allocator, curs);
+
+        var steps: usize = 0;
+        var acc_sum: usize = 0;
+        var dft_sum: usize = 0;
+        while (spec_toks.items.len < 32) {
+            var dt: [dflash_mod.N_DRAFT]u32 = undefined;
+            const nd = try df.draft(&eng, curs, eng.pos, 0.0, &dt);
+            dft_sum += nd;
+            var batch: [dflash_mod.BLOCK_SIZE]u32 = undefined;
+            batch[0] = curs;
+            for (0..nd) |k| batch[1 + k] = dt[k];
+            const os = try eng.forward(batch[0 .. 1 + nd], false, true);
+            steps += 1;
+
+            var na: u32 = 0;
+            var next_t: u32 = 0;
+            for (0..nd) |k| {
+                const tt = os.tokens[k];
+                try spec_toks.append(allocator, tt);
+                if (spec_toks.items.len >= 32) break;
+                if (tt == dt[k]) {
+                    na += 1;
+                } else {
+                    next_t = tt;
+                    break;
+                }
+            }
+            acc_sum += na;
+            if (spec_toks.items.len < 32 and na == nd) {
+                const bonus = os.tokens[nd];
+                try spec_toks.append(allocator, bonus);
+                next_t = bonus;
+            }
+            if (spec_toks.items.len >= 32) break;
+            const pb = eng.pos;
+            try eng.commitSpeculative(na + 1);
+            try df.encodeAndInject(&eng, na + 1, pb);
+            curs = next_t;
+        }
+
+        var mismatches: usize = 0;
+        for (0..32) |k| {
+            if (ref_toks[k] != spec_toks.items[k]) {
+                if (mismatches < 5) {
+                    std.debug.print("  MISMATCH at tok {d}: M=1={d} vs Spec={d}\n", .{ k, ref_toks[k], spec_toks.items[k] });
+                }
+                mismatches += 1;
+            }
+        }
+        std.debug.print(
+            "[{s}] M=1 vs DFlash2 Spec: {s} | steps={d}, accepted={d}/{d} ({d:.2} tok/step)\n",
+            .{
+                ep.name,
+                if (mismatches == 0) "EXACT MATCH (32/32)" else "FAIL",
+                steps,
+                acc_sum,
+                dft_sum,
+                31.0 / @as(f64, @floatFromInt(steps)),
+            },
+        );
+        if (mismatches != 0) return error.SpecExactMismatch;
+    }
+
+    // Part 2: 256-token Quicksort benchmark (same prompt as ref_llama_bench256.json!)
+    const bench_prompt = "Write a concise Python implementation of quicksort and explain its time complexity in detail.";
+    const b_ptoks = try tok.encode(allocator, bench_prompt);
+    defer allocator.free(b_ptoks);
+
+    try eng.reset();
+    const tp0 = nowMs();
+    const bpf = try df.prefill(&eng, b_ptoks);
+    try ctx.sync();
+    const tp1 = nowMs();
+
+    var gen: std.ArrayListUnmanaged(u32) = .empty;
+    defer gen.deinit(allocator);
+    var bcur = bpf.tokens[(b_ptoks.len - 1) % engine_mod.MAX_M];
+    try gen.append(allocator, bcur);
+
+    var n_steps: usize = 0;
+    var tot_drafted: usize = 0;
+    var tot_accepted: usize = 0;
+    var ms_verify: f64 = 0;
+
+    const td0 = nowMs();
+    while (gen.items.len < 256) {
+        var dt: [dflash_mod.N_DRAFT]u32 = undefined;
+        const nd = try df.draft(&eng, bcur, eng.pos, 0.0, &dt);
+        const t1 = nowMs();
+        tot_drafted += nd;
+
+        var batch: [dflash_mod.BLOCK_SIZE]u32 = undefined;
+        batch[0] = bcur;
+        for (0..nd) |k| batch[1 + k] = dt[k];
+
+        const os = try eng.forward(batch[0 .. 1 + nd], false, true);
+        const t2 = nowMs();
+        ms_verify += (t2 - t1);
+        n_steps += 1;
+
+        var na: u32 = 0;
+        var next_t: u32 = 0;
+        var hit_eos = false;
+        for (0..nd) |k| {
+            const tt = os.tokens[k];
+            if (tok.isEos(tt)) {
+                hit_eos = true;
+                break;
+            }
+            try gen.append(allocator, tt);
+            if (gen.items.len >= 256) break;
+            if (tt == dt[k]) {
+                na += 1;
+            } else {
+                next_t = tt;
+                break;
+            }
+        }
+        tot_accepted += na;
+        if (!hit_eos and gen.items.len < 256 and na == nd) {
+            const bonus = os.tokens[nd];
+            if (tok.isEos(bonus)) {
+                hit_eos = true;
+            } else {
+                try gen.append(allocator, bonus);
+                next_t = bonus;
+            }
+        }
+        if (hit_eos or gen.items.len >= 256) break;
+
+        const pb = eng.pos;
+        try eng.commitSpeculative(na + 1);
+        try df.encodeAndInject(&eng, na + 1, pb);
+        bcur = next_t;
+    }
+    const td1 = nowMs();
+
+    const gen_text = try tok.decode(allocator, gen.items);
+    defer allocator.free(gen_text);
+
+    const dec_toks = gen.items.len - 1;
+    const total_ms = td1 - td0;
+    const tok_per_s = @as(f64, @floatFromInt(dec_toks)) * 1000.0 / total_ms;
+    const nf: f64 = @floatFromInt(n_steps);
+    std.debug.print(
+        \\
+        \\[Quicksort 256-tok Benchmark]
+        \\  Prompt     : {d} toks in {d:.2} ms ({d:.1} tok/s)
+        \\  Decode     : {d} toks in {d:.2} ms -> {d:.2} tok/s (llama-server baseline: 123.89 tok/s)
+        \\  Spec stats : {d} steps, {d}/{d} accepted ({d:.1}%), mean {d:.2} tok/step (llama-server: 5.02 tok/step)
+        \\  Breakdown  : {d:.2} ms/step total = verify {d:.2} ms + commit+inject+draft {d:.2} ms
+        \\  KV Pool    : {d} Q4_0 cells (llama-server: 69,632 cells)
+        \\  Output     : "{s}..."
+        \\
+    , .{
+        b_ptoks.len,
+        tp1 - tp0,
+        @as(f64, @floatFromInt(b_ptoks.len)) * 1000.0 / (tp1 - tp0),
+        gen.items.len,
+        total_ms,
+        tok_per_s,
+        n_steps,
+        tot_accepted,
+        tot_drafted,
+        @as(f64, @floatFromInt(tot_accepted)) * 100.0 / @as(f64, @floatFromInt(tot_drafted)),
+        @as(f64, @floatFromInt(dec_toks)) / nf,
+        total_ms / nf,
+        ms_verify / nf,
+        (total_ms - ms_verify) / nf,
+        eng.max_kv_cells,
+        gen_text[0..@min(gen_text.len, 160)],
+    });
+
+    // Part 3: Fine-grained GPU/CPU stage latency breakdown (10 iterations at pos=128)
+    {
+        const prof_iters: usize = 10;
+        const dummy_batch = [_]u32{ 100, 101, 102, 103, 104, 105, 106, 107 };
+        var t_trunk: f64 = 0;
+        var t_lm_all: f64 = 0;
+        var t_lm_gpu: f64 = 0;
+        var t_df_all: f64 = 0;
+        var t_df_lm: f64 = 0;
+        var t_commit: f64 = 0;
+        var t_inject: f64 = 0;
+        var tmp_out: engine_mod.StepOutput = .{};
+        var tmp_dt: [dflash_mod.N_DRAFT]u32 = undefined;
+
+        for (0..prof_iters) |_| {
+            try ctx.sync();
+            const a0 = nowMs();
+            _ = try eng.forward(&dummy_batch, false, false);
+            try ctx.sync();
+            const a1 = nowMs();
+            try eng.runTwoStageLmHead(8, &tmp_out);
+            const a2 = nowMs();
+
+            try eng.launchStage1LmHeadGpu(eng.d_xnorm, 8);
+            try ctx.sync();
+            const a3 = nowMs();
+
+            _ = try df.draft(&eng, 100, eng.pos, 0.0, &tmp_dt);
+            const a4 = nowMs();
+            try eng.runTwoStageLmHeadFrom(df.d_norm + dflash_mod.D_MODEL * 4, 7, &tmp_out);
+            const a5 = nowMs();
+
+            const saved_pos = eng.pos;
+            try eng.commitSpeculative(5);
+            try ctx.sync();
+            const a6 = nowMs();
+            try df.encodeAndInject(&eng, 5, saved_pos);
+            try ctx.sync();
+            const a7 = nowMs();
+            eng.pos = saved_pos;
+
+            t_trunk += (a1 - a0);
+            t_lm_all += (a2 - a1);
+            t_lm_gpu += (a3 - a2);
+            t_df_all += (a4 - a3);
+            t_df_lm += (a5 - a4);
+            t_commit += (a6 - a5);
+            t_inject += (a7 - a6);
+        }
+        const pf: f64 = @floatFromInt(prof_iters);
+        std.debug.print(
+            \\
+            \\[Stage Breakdown (avg of {d} runs, M=8 verify / M=7 draft)]
+            \\  Target 64L Trunk     : {d:.2} ms
+            \\  Target LM Head Total : {d:.2} ms (GPU Q4_0+Top64: {d:.2} ms | CPU Q8_0 rescore: {d:.2} ms)
+            \\  DFlash2 Total Draft  : {d:.2} ms (5L Trunk+Sel: {d:.2} ms | LM Head (M=7): {d:.2} ms)
+            \\  GDN Commit (5 tok)   : {d:.2} ms | DFlash2 Inject (5 tok): {d:.2} ms
+            \\
+        , .{
+            prof_iters,
+            t_trunk / pf,
+            t_lm_all / pf,
+            t_lm_gpu / pf,
+            (t_lm_all - t_lm_gpu) / pf,
+            t_df_all / pf,
+            (t_df_all - t_df_lm) / pf,
+            t_df_lm / pf,
+            t_commit / pf,
+            t_inject / pf,
+        });
+    }
+}
+
+fn runServe(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var cfg: server_mod.ServeConfig = .{
+        .model_path = default_model_path,
+        .drafter_path = default_drafter_path,
+    };
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
+            i += 1;
+            cfg.host = args[i];
+        } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
+            i += 1;
+            cfg.port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--model") and i + 1 < args.len) {
+            i += 1;
+            cfg.model_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--draft") and i + 1 < args.len) {
+            i += 1;
+            cfg.drafter_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--no-spec")) {
+            cfg.use_spec = false;
+        }
+    }
+    try server_mod.run(allocator, cfg);
 }
 
 test {
@@ -595,4 +1055,6 @@ test {
     _ = gguf;
     _ = escha_ref;
     _ = tokenizer_mod;
+    _ = dflash_mod;
+    _ = server_mod;
 }

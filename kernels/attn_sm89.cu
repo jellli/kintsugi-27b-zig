@@ -101,7 +101,7 @@ static __device__ __forceinline__ void quantize_q4_0_warp(float val, uint8_t* ds
 //    Grid   : (24, n_tokens, 1) — 1 block = 1 head (256 threads = 8 warps)
 //    Block  : (256, 1, 1)
 // =============================================================================
-extern "C" __global__ void __launch_bounds__(256, 4) attn_q_norm_mrope_split_f32(
+static __device__ __forceinline__ void attn_q_norm_mrope_split_f32_impl(
     const float* __restrict__ q_full,
     const float* __restrict__ q_bias,
     const float* __restrict__ q_norm,
@@ -154,6 +154,16 @@ extern "C" __global__ void __launch_bounds__(256, 4) attn_q_norm_mrope_split_f32
     }
 }
 
+extern "C" __global__ void __launch_bounds__(256, 4) attn_q_norm_mrope_split_f32(
+    const float* __restrict__ q_full, const float* __restrict__ q_bias, const float* __restrict__ q_norm,
+    float* __restrict__ q_out, float* __restrict__ gate_out, int pos_base, float rope_freq_base, float eps
+) { attn_q_norm_mrope_split_f32_impl(q_full, q_bias, q_norm, q_out, gate_out, pos_base, rope_freq_base, eps); }
+
+extern "C" __global__ void __launch_bounds__(256, 4) attn_q_norm_mrope_split_f32_dpos(
+    const float* __restrict__ q_full, const float* __restrict__ q_bias, const float* __restrict__ q_norm,
+    float* __restrict__ q_out, float* __restrict__ gate_out, const int* __restrict__ pos_ptr, float rope_freq_base, float eps
+) { attn_q_norm_mrope_split_f32_impl(q_full, q_bias, q_norm, q_out, gate_out, *pos_ptr, rope_freq_base, eps); }
+
 // =============================================================================
 // 2. Fused K/V Bias + K RMSNorm(256) + Partial RoPE(64) + Q4_0 KV Cache Quantize & Store
 //    k_in, v_in     : [n_tokens, 4, 256] f32
@@ -164,7 +174,7 @@ extern "C" __global__ void __launch_bounds__(256, 4) attn_q_norm_mrope_split_f32
 //    Grid           : (4, n_tokens, 2) — z=0 processes K (norm+rope+quant), z=1 processes V (quant)
 //    Block          : (256, 1, 1) — 8 warps = 8 Q4_0 blocks of 32 elements
 // =============================================================================
-extern "C" __global__ void __launch_bounds__(256, 4) attn_k_norm_mrope_kv_q4_0_store(
+static __device__ __forceinline__ void attn_k_norm_mrope_kv_q4_0_store_impl(
     const float* __restrict__ k_in,
     const float* __restrict__ v_in,
     const float* __restrict__ k_bias,
@@ -229,6 +239,20 @@ extern "C" __global__ void __launch_bounds__(256, 4) attn_k_norm_mrope_kv_q4_0_s
     }
 }
 
+extern "C" __global__ void __launch_bounds__(256, 4) attn_k_norm_mrope_kv_q4_0_store(
+    const float* __restrict__ k_in, const float* __restrict__ v_in,
+    const float* __restrict__ k_bias, const float* __restrict__ v_bias,
+    const float* __restrict__ k_norm, uint8_t* __restrict__ k_cache_q4, uint8_t* __restrict__ v_cache_q4,
+    int pos_base, float rope_freq_base, float eps
+) { attn_k_norm_mrope_kv_q4_0_store_impl(k_in, v_in, k_bias, v_bias, k_norm, k_cache_q4, v_cache_q4, pos_base, rope_freq_base, eps); }
+
+extern "C" __global__ void __launch_bounds__(256, 4) attn_k_norm_mrope_kv_q4_0_store_dpos(
+    const float* __restrict__ k_in, const float* __restrict__ v_in,
+    const float* __restrict__ k_bias, const float* __restrict__ v_bias,
+    const float* __restrict__ k_norm, uint8_t* __restrict__ k_cache_q4, uint8_t* __restrict__ v_cache_q4,
+    const int* __restrict__ pos_ptr, float rope_freq_base, float eps
+) { attn_k_norm_mrope_kv_q4_0_store_impl(k_in, v_in, k_bias, v_bias, k_norm, k_cache_q4, v_cache_q4, *pos_ptr, rope_freq_base, eps); }
+
 // Helper: load 8 elements (4 low + 4 high) from one Q4_0 block for lane's (blk, sub)
 static __device__ __forceinline__ void load_q4_0_8(
     const uint8_t* head_ptr,
@@ -266,7 +290,7 @@ static __device__ __forceinline__ void load_q4_0_8(
 //      part_m : [n_tokens, 24, n_splits]
 //      part_l : [n_tokens, 24, n_splits]
 // =============================================================================
-extern "C" __global__ void __launch_bounds__(32, 16) attn_decode_q4_0_splitk_sm89(
+static __device__ __forceinline__ void attn_decode_q4_0_splitk_sm89_impl(
     const float* __restrict__ q_rot,        // [n_tokens, 24, 256]
     const uint8_t* __restrict__ k_cache_q4, // [max_cells, 4, 144]
     const uint8_t* __restrict__ v_cache_q4, // [max_cells, 4, 144]
@@ -356,6 +380,16 @@ extern "C" __global__ void __launch_bounds__(32, 16) attn_decode_q4_0_splitk_sm8
     dst_o[idx_hi + 0] = o4; dst_o[idx_hi + 1] = o5; dst_o[idx_hi + 2] = o6; dst_o[idx_hi + 3] = o7;
 }
 
+extern "C" __global__ void __launch_bounds__(32, 16) attn_decode_q4_0_splitk_sm89(
+    const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
+    float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, int pos_base, int n_splits
+) { attn_decode_q4_0_splitk_sm89_impl(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, pos_base, n_splits); }
+
+extern "C" __global__ void __launch_bounds__(32, 16) attn_decode_q4_0_splitk_sm89_dpos(
+    const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
+    float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, const int* __restrict__ pos_ptr, int n_splits
+) { attn_decode_q4_0_splitk_sm89_impl(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, *pos_ptr, n_splits); }
+
 // =============================================================================
 // 4. Fused Split-K Reduce + Sigmoid(gate) + escha_rin + Had128 -> FP16
 //    Merges partial (m, l, o) across n_splits, applies Qwen3.5 sigmoid(gate),
@@ -436,7 +470,7 @@ extern "C" __global__ void __launch_bounds__(32, 16) attn_splitk_reduce_gate_had
 // =============================================================================
 #define FA_TILE_KV 16
 
-extern "C" __global__ void __launch_bounds__(768, 1) attn_decode_q4_0_gqa6_sm89(
+static __device__ __forceinline__ void attn_decode_q4_0_gqa6_sm89_impl(
     const float* __restrict__ q_rot,        // [n_tokens, 24, 256]
     const uint8_t* __restrict__ k_cache_q4, // [max_cells, 4, 144]
     const uint8_t* __restrict__ v_cache_q4, // [max_cells, 4, 144]
@@ -611,3 +645,13 @@ extern "C" __global__ void __launch_bounds__(768, 1) attn_decode_q4_0_gqa6_sm89(
         dst_o[idx_hi + 0] = o4; dst_o[idx_hi + 1] = o5; dst_o[idx_hi + 2] = o6; dst_o[idx_hi + 3] = o7;
     }
 }
+
+extern "C" __global__ void __launch_bounds__(768, 1) attn_decode_q4_0_gqa6_sm89(
+    const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
+    float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, int pos_base, int n_tokens, int n_splits
+) { attn_decode_q4_0_gqa6_sm89_impl(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, pos_base, n_tokens, n_splits); }
+
+extern "C" __global__ void __launch_bounds__(768, 1) attn_decode_q4_0_gqa6_sm89_dpos(
+    const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
+    float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, const int* __restrict__ pos_ptr, int n_tokens, int n_splits
+) { attn_decode_q4_0_gqa6_sm89_impl(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, *pos_ptr, n_tokens, n_splits); }
