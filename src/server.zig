@@ -546,16 +546,167 @@ fn sendSseChunk(
     try sendAll(fd, j.items);
 }
 
+const MAX_CHECKPOINTS: usize = 4;
+
+const PrefixCheckpoint = struct {
+    valid: bool = false,
+    pinned: bool = false,
+    pos: u32 = 0,
+    last_used: u64 = 0,
+    gdn_state: ?[]u8 = null,
+    gdn_conv: ?[]u8 = null,
+    dflash_kv: ?[]u8 = null,
+
+    fn deinit(self: *PrefixCheckpoint, allocator: std.mem.Allocator) void {
+        if (self.gdn_state) |s| allocator.free(s);
+        if (self.gdn_conv) |c| allocator.free(c);
+        if (self.dflash_kv) |d| allocator.free(d);
+        self.* = .{};
+    }
+};
+
+fn longestCommonPrefix(a: []const u32, b: []const u32) usize {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < n and a[i] == b[i]) : (i += 1) {}
+    return i;
+}
+
 const ServerState = struct {
     allocator: std.mem.Allocator,
     tok: *tokenizer_mod.Tokenizer,
     eng: *engine_mod.Engine,
     dflash: ?*dflash_mod.DFlashEngine,
     req_counter: u64 = 0,
+    active_tokens: std.ArrayListUnmanaged(u32) = .empty,
+    checkpoints: [MAX_CHECKPOINTS]PrefixCheckpoint = .{ .{}, .{}, .{}, .{} },
+    ckpt_clock: u64 = 0,
+
+    fn deinit(self: *ServerState) void {
+        for (&self.checkpoints) |*c| c.deinit(self.allocator);
+        self.active_tokens.deinit(self.allocator);
+    }
 
     fn nextReqId(self: *ServerState, prefix: []const u8, buf: []u8) []const u8 {
         self.req_counter += 1;
         return std.fmt.bufPrint(buf, "{s}-kintsugi-{d}", .{ prefix, self.req_counter }) catch "kintsugi-0";
+    }
+
+    fn invalidateCheckpointsAfter(self: *ServerState, keep_pos: u32) void {
+        for (&self.checkpoints) |*c| {
+            if (c.valid and c.pos > keep_pos) {
+                c.valid = false;
+                c.pinned = false;
+            }
+        }
+    }
+
+    fn saveCheckpoint(self: *ServerState, pos: u32, pinned: bool) !void {
+        if (pos == 0) return;
+        self.ckpt_clock += 1;
+
+        // Reuse existing valid slot at same pos if present
+        for (&self.checkpoints) |*c| {
+            if (c.valid and c.pos == pos) {
+                c.pinned = c.pinned or pinned;
+                c.last_used = self.ckpt_clock;
+                return;
+            }
+        }
+
+        // Pick an invalid slot first; otherwise evict LRU non-pinned slot (or oldest overall)
+        var target_idx: usize = 0;
+        var found_free = false;
+        for (self.checkpoints, 0..) |c, idx| {
+            if (!c.valid) {
+                target_idx = idx;
+                found_free = true;
+                break;
+            }
+        }
+        if (!found_free) {
+            var best_lu: u64 = std.math.maxInt(u64);
+            var found_unpinned = false;
+            for (self.checkpoints, 0..) |c, idx| {
+                if (!c.pinned and c.last_used < best_lu) {
+                    best_lu = c.last_used;
+                    target_idx = idx;
+                    found_unpinned = true;
+                }
+            }
+            if (!found_unpinned) {
+                best_lu = std.math.maxInt(u64);
+                for (self.checkpoints, 0..) |c, idx| {
+                    if (c.last_used < best_lu) {
+                        best_lu = c.last_used;
+                        target_idx = idx;
+                    }
+                }
+            }
+        }
+
+        var slot = &self.checkpoints[target_idx];
+        if (slot.gdn_state == null) {
+            slot.gdn_state = try self.allocator.alloc(u8, engine_mod.GDN_STATE_BYTES);
+        }
+        if (slot.gdn_conv == null) {
+            slot.gdn_conv = try self.allocator.alloc(u8, engine_mod.GDN_CONV_BYTES);
+        }
+        if (self.dflash != null and slot.dflash_kv == null) {
+            slot.dflash_kv = try self.allocator.alloc(u8, dflash_mod.KV_RING_BYTES);
+        }
+
+        try self.eng.saveGdnStateToHost(slot.gdn_state.?, slot.gdn_conv.?);
+        if (self.dflash) |df| {
+            try df.saveKvRingToHost(slot.dflash_kv.?);
+        }
+        slot.pos = pos;
+        slot.valid = true;
+        slot.pinned = pinned;
+        slot.last_used = self.ckpt_clock;
+    }
+
+    fn prefillSegment(self: *ServerState, tokens: []const u32, need_logits: bool) !engine_mod.StepOutput {
+        errdefer {
+            self.active_tokens.clearRetainingCapacity();
+            self.invalidateCheckpointsAfter(0);
+        }
+        const res = if (self.dflash) |df|
+            try df.prefillRange(self.eng, tokens, need_logits)
+        else
+            try self.eng.prefillRange(tokens, need_logits);
+        try self.active_tokens.appendSlice(self.allocator, tokens);
+        return res;
+    }
+
+    /// Detect the token length of the first ChatML message (`...<|im_end|>\n`, e.g. system prompt + tools)
+    /// when it is long enough to be worth pinning as a reusable prefix checkpoint.
+    fn detectSystemBoundary(self: *ServerState, prompt: []const u8, prompt_toks: []const u32) ?usize {
+        const marker = "<|im_end|>\n";
+        const idx = std.mem.indexOf(u8, prompt, marker) orelse return null;
+        const byte_end = idx + marker.len;
+        if (byte_end < 512 or byte_end >= prompt.len) return null;
+        const sys_toks = self.tok.encode(self.allocator, prompt[0..byte_end]) catch return null;
+        defer self.allocator.free(sys_toks);
+        if (sys_toks.len < 256 or sys_toks.len >= prompt_toks.len) return null;
+        if (!std.mem.eql(u32, sys_toks, prompt_toks[0..sys_toks.len])) return null;
+        return sys_toks.len;
+    }
+
+    /// If the ChatML prompt ends with `<think>\n\n</think>\n` (enable_thinking=false),
+    /// return the token length right BEFORE that suffix (at `<|im_start|>assistant\n`).
+    /// On the next turn, the assistant's reply replaces that empty think block, so checkpointing
+    /// here guarantees multi-turn history cache hits across Turn 2, Turn 3, ..., Turn N!
+    fn detectTurnBoundary(self: *ServerState, prompt: []const u8, prompt_toks: []const u32) ?usize {
+        const suffix = "<think>\n\n</think>\n";
+        if (!std.mem.endsWith(u8, prompt, suffix)) return null;
+        const prefix_bytes = prompt.len - suffix.len;
+        if (prefix_bytes == 0) return null;
+        const pre_toks = self.tok.encode(self.allocator, prompt[0..prefix_bytes]) catch return null;
+        defer self.allocator.free(pre_toks);
+        if (pre_toks.len < 64 or pre_toks.len >= prompt_toks.len) return null;
+        if (!std.mem.eql(u32, pre_toks, prompt_toks[0..pre_toks.len])) return null;
+        return pre_toks.len;
     }
 
     fn runGeneration(
@@ -577,9 +728,6 @@ const ServerState = struct {
             return;
         }
 
-        try self.eng.reset();
-        self.eng.capture_enabled = (self.dflash != null);
-
         var id_buf: [64]u8 = undefined;
         const req_id = self.nextReqId(if (mode == .chat) "chatcmpl" else "cmpl", &id_buf);
         const created = unixSeconds();
@@ -591,12 +739,63 @@ const ServerState = struct {
             }
         }
 
-        var rng = std.Random.DefaultPrng.init(params.seed);
+        // Prefix cache lookup: find deepest checkpoint <= min(lcp, prompt_toks.len - 1)
         const tp0 = nowMs();
-        const pf = if (self.dflash) |df|
-            try df.prefill(self.eng, prompt_toks)
-        else
-            try self.eng.prefill(prompt_toks);
+        const lcp = longestCommonPrefix(self.active_tokens.items, prompt_toks);
+        const max_resume: usize = @min(lcp, prompt_toks.len - 1);
+
+        var best_ckpt_idx: ?usize = null;
+        var best_ckpt_pos: u32 = 0;
+        for (self.checkpoints, 0..) |c, idx| {
+            if (c.valid and c.pos > 0 and c.pos <= max_resume and c.pos >= best_ckpt_pos) {
+                best_ckpt_pos = c.pos;
+                best_ckpt_idx = idx;
+            }
+        }
+
+        var resume_pos: usize = 0;
+        if (best_ckpt_idx) |cidx| {
+            self.ckpt_clock += 1;
+            const ckpt = &self.checkpoints[cidx];
+            ckpt.last_used = self.ckpt_clock;
+            resume_pos = ckpt.pos;
+            self.invalidateCheckpointsAfter(ckpt.pos);
+            try self.eng.loadGdnStateFromHost(ckpt.gdn_state.?, ckpt.gdn_conv.?, ckpt.pos);
+            if (self.dflash) |df| {
+                try df.loadKvRingFromHost(ckpt.dflash_kv.?);
+            }
+            self.active_tokens.shrinkRetainingCapacity(resume_pos);
+        } else {
+            self.invalidateCheckpointsAfter(0);
+            self.active_tokens.clearRetainingCapacity();
+            try self.eng.reset();
+        }
+        self.eng.capture_enabled = (self.dflash != null);
+
+        var rng = std.Random.DefaultPrng.init(params.seed);
+
+        // Prefill uncached suffix (saving a pinned system-prompt checkpoint & turn-end checkpoint if crossed)
+        var cur_pos: usize = resume_pos;
+        if (self.detectSystemBoundary(prompt, prompt_toks)) |sys_end| {
+            if (cur_pos < sys_end and sys_end < prompt_toks.len) {
+                _ = try self.prefillSegment(prompt_toks[cur_pos..sys_end], false);
+                try self.saveCheckpoint(@intCast(sys_end), true);
+                cur_pos = sys_end;
+            }
+        }
+        if (self.detectTurnBoundary(prompt, prompt_toks)) |turn_end| {
+            if (cur_pos < turn_end and turn_end < prompt_toks.len) {
+                _ = try self.prefillSegment(prompt_toks[cur_pos..turn_end], false);
+                try self.saveCheckpoint(@intCast(turn_end), false);
+                cur_pos = turn_end;
+            }
+        }
+        const pf = try self.prefillSegment(prompt_toks[cur_pos..], true);
+
+        // Save prompt-end checkpoint so the next multi-turn request resumes right at prompt_toks.len!
+        if (prompt_toks.len >= 64) {
+            try self.saveCheckpoint(@intCast(prompt_toks.len), false);
+        }
         const tp1 = nowMs();
 
         var stats: GenStats = .{
@@ -688,8 +887,7 @@ const ServerState = struct {
             }
         }.call;
 
-        const last_idx = (prompt_toks.len - 1) % engine_mod.MAX_M;
-        var cur = engine_mod.sampleFromCandidates(&pf.cands[last_idx], params.temperature, params.top_k, params.top_p, &rng);
+        var cur = engine_mod.sampleFromCandidates(&pf.cands[0], params.temperature, params.top_k, params.top_p, &rng);
 
         const td0 = nowMs();
         if (params.max_tokens > 0) {
@@ -743,11 +941,13 @@ const ServerState = struct {
                         const pos_before = self.eng.pos;
                         try self.eng.commitSpeculative(n_commit);
                         try df.encodeAndInject(self.eng, n_commit, pos_before);
+                        try self.active_tokens.appendSlice(self.allocator, batch[0..n_commit]);
                         cur = next_tok;
                     }
                 } else {
                     while (!stopped and stats.completion_tokens < params.max_tokens) {
                         const out = try self.eng.forward(&[_]u32{cur}, true, true);
+                        try self.active_tokens.append(self.allocator, cur);
                         cur = engine_mod.sampleFromCandidates(&out.cands[0], params.temperature, params.top_k, params.top_p, &rng);
                         stopped = try emitToken(self, cur, fd, mode, req_id, created, params, max_stop_len, &piece_buf, &full_text, &stream_pending, &stats);
                     }
@@ -811,13 +1011,21 @@ const ServerState = struct {
             try sendHttpJson(fd, self.allocator, "200 OK", j.items);
         }
 
+        // Also save post-generation checkpoint if decode committed >= 16 tokens (helps clients that keep <think>)
+        if (self.eng.pos >= prompt_toks.len + 16) {
+            self.saveCheckpoint(self.eng.pos, false) catch {};
+        }
+
         const dps_log = if (stats.decode_ms > 0.0) @as(f64, @floatFromInt(stats.completion_tokens)) * 1000.0 / stats.decode_ms else 0.0;
+        const new_prompt_toks = prompt_toks.len - resume_pos;
         std.debug.print(
-            "[kintsugi-zig] {s} stream={} | prompt={d} ({d:.1} ms) | gen={d} ({d:.1} ms, {d:.2} tok/s) | spec={d}/{d} ({d} steps)\n",
+            "[kintsugi-zig] {s} stream={} | prompt={d} (cached={d}, new={d}, {d:.1} ms) | gen={d} ({d:.1} ms, {d:.2} tok/s) | spec={d}/{d} ({d} steps)\n",
             .{
                 if (mode == .chat) "POST /v1/chat/completions" else "POST /v1/completions",
                 params.stream,
                 stats.prompt_tokens,
+                resume_pos,
+                new_prompt_toks,
                 stats.prompt_ms,
                 stats.completion_tokens,
                 stats.decode_ms,
@@ -1060,6 +1268,7 @@ pub fn run(allocator: std.mem.Allocator, cfg: ServeConfig) !void {
         .eng = &eng,
         .dflash = if (dflash_opt != null) &dflash_opt.? else null,
     };
+    defer state.deinit();
 
     const rcv_timeout: std.c.timeval = .{ .sec = 10, .usec = 0 };
 

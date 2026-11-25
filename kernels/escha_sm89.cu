@@ -504,3 +504,221 @@ extern "C" __global__ void __launch_bounds__(384, 3) escha_gemv_k3_m8_narrow_s12
     const __half* A, const uint16_t* B, const __half* rout, float* C, int m, int k, int n
 ) { escha_gemv_impl<3, 1, 2, 12, false>(A, B, rout, C, m, k, n); }
 
+// =============================================================================
+// 11. Batched Tensor Core Escha Prefill GEMM (64x32 output tile, arbitrary M via grid.y)
+//     - WNT=2 (32 cols/block, full 32-lane 128B coalesced B loads for 2-bit, 2x A reuse!)
+//     - MT=4 (64 rows/block -> reads 7.24 GB weights ONCE per 64 tokens!)
+//     - S=4 K-splits (128 threads/block, 8 KiB smem, 0 spills, ZERO inner barriers!)
+//     - Full m16n8k16 FP32-acc Tensor Core MMAs (all 16 rows active, no FOLD overhead!)
+//       with uniform active-tile skip when m < 64.
+//     Grid : (OC / 32, ceil(M / 64), 1), Block: (128, 1, 1)
+// =============================================================================
+static __device__ __forceinline__ void mma_ab_f32(
+    const FragB& a01, const FragB& a23, const FragB& b, float4& c
+) {
+    const uint32_t* a0 = reinterpret_cast<const uint32_t*>(&a01);
+    const uint32_t* a1 = reinterpret_cast<const uint32_t*>(&a23);
+    const uint32_t* bb = reinterpret_cast<const uint32_t*>(&b);
+    asm(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c.x), "+f"(c.y), "+f"(c.z), "+f"(c.w)
+        : "r"(a0[0]), "r"(a0[1]), "r"(a1[0]), "r"(a1[1]),
+          "r"(bb[0]), "r"(bb[1])
+    );
+}
+
+template <int bits, int WNT, int S, int MT>
+static __device__ __forceinline__ void escha_gemm_impl(
+    const __half* __restrict__ A,
+    const uint16_t* __restrict__ B,
+    const __half* __restrict__ rout,
+    float* __restrict__ C,
+    int size_m,
+    int size_k,
+    int size_n
+) {
+    (void)rout;
+    constexpr int PF = 2;
+    constexpr int THREADS = 32 * S;
+    constexpr int COLS = WNT * 16; // 32
+    constexpr int TWORDS = 8 * bits;
+    constexpr bool TWO_PER_LOAD = (bits == 2);
+    constexpr int LOADS = TWO_PER_LOAD ? (WNT / 2) : WNT;
+    constexpr int LSTRIDE = TWO_PER_LOAD ? (2 * TWORDS) : TWORDS;
+
+    const int ksp = threadIdx.x >> 5; // 0..S-1
+    const int lane = threadIdx.x & 31;
+
+    const int m_base = blockIdx.y * (MT * 16);
+    const int ntiles = size_n >> 4;
+    const int kslices = size_k >> 4;
+
+    const int chunk = CEIL_DIVIDE(kslices, S);
+    const int ks0 = ksp * chunk;
+    const int myn = max(0, min(chunk, kslices - ks0));
+
+    const uint32_t* B32 = reinterpret_cast<const uint32_t*>(B);
+    const size_t slice_stride = (size_t)ntiles * TWORDS;
+    const half2* A2 = reinterpret_cast<const half2*>(A);
+    const half2 hzero = __half2half2(__ushort_as_half(0));
+    const size_t a_stride = (size_t)(size_k >> 1);
+
+    const int r0 = lane >> 2; // 0..7
+    const int r1 = r0 + 8;    // 8..15
+
+    int x_src_a = 0, x_src_b = 0, x_s2 = 0;
+    if constexpr (bits == 2) {
+        const int i1 = lane >> 1;
+        x_src_b = i1;
+        x_src_a = (i1 + 15) & 15;
+    } else {
+        const int t_offset = lane << 3;
+        const int b1 = (t_offset + 257) * 3;
+        const int b2 = b1 + 21;
+        const int i0 = (b1 - 16) / 32;
+        const int i2 = (b2 - 1) / 32;
+        x_s2 = (i2 + 1) * 32 - b2;
+        x_src_a = i0 % 24;
+        x_src_b = i2 % 24;
+    }
+
+    const uint32_t* bp = B32 + (size_t)ks0 * slice_stride + (size_t)blockIdx.x * WNT * TWORDS + lane;
+
+    auto ld_b = [&](int i, int l) -> uint32_t {
+        if constexpr (LSTRIDE < 32) {
+            return (lane < LSTRIDE) ? __ldcs(bp + (size_t)i * slice_stride + l * LSTRIDE) : 0u;
+        } else {
+            return __ldcs(bp + (size_t)i * slice_stride + l * LSTRIDE);
+        }
+    };
+
+    uint32_t pf[PF][LOADS];
+    #pragma unroll
+    for (int d = 0; d < PF; ++d) {
+        if (d < myn) {
+            #pragma unroll
+            for (int l = 0; l < LOADS; ++l) pf[d][l] = ld_b(d, l);
+        }
+    }
+
+    float4 acc[MT][WNT][2];
+    #pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+        #pragma unroll
+        for (int t = 0; t < WNT; ++t) {
+            acc[mt][t][0] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            acc[mt][t][1] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    }
+
+    for (int ib = 0; ib < myn; ib += PF) {
+        #pragma unroll
+        for (int d = 0; d < PF; ++d) {
+            const int i = ib + d;
+            if (i >= myn) break;
+
+            uint32_t bw[LOADS];
+            #pragma unroll
+            for (int l = 0; l < LOADS; ++l) bw[l] = pf[d][l];
+
+            if (i + PF < myn) {
+                #pragma unroll
+                for (int l = 0; l < LOADS; ++l) pf[d][l] = ld_b(i + PF, l);
+            }
+
+            // Decode WNT weight tiles ONCE and reuse across all active MT*16 rows!
+            FragB wf[WNT][2];
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t) {
+                if constexpr (bits == 2) {
+                    const uint32_t w = bw[t >> 1];
+                    const int base = (t & 1) << 4;
+                    const uint32_t bwv = __shfl_sync(0xffffffffu, w, base + x_src_b);
+                    const uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
+                    dq8_regs_2bits_mcg(awv, bwv, lane << 3, wf[t][0], wf[t][1]);
+                } else {
+                    const uint32_t awv = __shfl_sync(0xffffffffu, bw[t], x_src_a);
+                    const uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
+                    dq8_regs_3bits_mcg(awv, bwv, x_s2, wf[t][0], wf[t][1]);
+                }
+            }
+
+            const size_t a_col = (size_t)(ks0 + i) * 8 + (lane & 3);
+            #pragma unroll
+            for (int mt = 0; mt < MT; ++mt) {
+                const int tile_row0 = m_base + mt * 16;
+                if (tile_row0 >= size_m) break;
+                const int row0 = tile_row0 + r0;
+                const int row1 = tile_row0 + r1;
+                FragB a01, a23;
+                if (row0 < size_m) {
+                    const size_t off0 = (size_t)row0 * a_stride + a_col;
+                    a01[0] = A2[off0];
+                    a23[0] = A2[off0 + 4];
+                } else {
+                    a01[0] = hzero;
+                    a23[0] = hzero;
+                }
+                if (row1 < size_m) {
+                    const size_t off1 = (size_t)row1 * a_stride + a_col;
+                    a01[1] = A2[off1];
+                    a23[1] = A2[off1 + 4];
+                } else {
+                    a01[1] = hzero;
+                    a23[1] = hzero;
+                }
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t) {
+                    mma_ab_f32(a01, a23, wf[t][0], acc[mt][t][0]);
+                    mma_ab_f32(a01, a23, wf[t][1], acc[mt][t][1]);
+                }
+            }
+        }
+    }
+
+    // Reduce S K-splits one 16x32 tile at a time (only S * 16 * 32 * 4 = 8 KiB smem!)
+    __shared__ __align__(16) float sh_red[S][16][COLS];
+    const int c0 = 2 * (lane & 3);
+    const size_t col_base = (size_t)blockIdx.x * COLS;
+
+    #pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+        const int tile_row0 = m_base + mt * 16;
+        if (tile_row0 >= size_m) break;
+
+        #pragma unroll
+        for (int t = 0; t < WNT; ++t) {
+            #pragma unroll
+            for (int f = 0; f < 2; ++f) {
+                const int col = t * 16 + f * 8 + c0;
+                sh_red[ksp][r0][col + 0] = acc[mt][t][f].x;
+                sh_red[ksp][r0][col + 1] = acc[mt][t][f].y;
+                sh_red[ksp][r1][col + 0] = acc[mt][t][f].z;
+                sh_red[ksp][r1][col + 1] = acc[mt][t][f].w;
+            }
+        }
+        __syncthreads();
+
+        const int rows_here = min(16, size_m - tile_row0);
+        for (int idx = threadIdx.x; idx < rows_here * COLS; idx += THREADS) {
+            const int r = idx / COLS;
+            const int c = idx % COLS;
+            float sum = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < S; ++j) sum += sh_red[j][r][c];
+            C[(size_t)(tile_row0 + r) * size_n + col_base + c] = sum;
+        }
+        if (mt + 1 < MT) __syncthreads();
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128, 4) escha_gemm_k2_m64(
+    const __half* A, const uint16_t* B, const __half* rout, float* C, int m, int k, int n
+) { escha_gemm_impl<2, 2, 4, 4>(A, B, rout, C, m, k, n); }
+
+extern "C" __global__ void __launch_bounds__(128, 4) escha_gemm_k3_m64(
+    const __half* A, const uint16_t* B, const __half* rout, float* C, int m, int k, int n
+) { escha_gemm_impl<3, 2, 4, 4>(A, B, rout, C, m, k, n); }
+
+

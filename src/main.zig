@@ -453,8 +453,7 @@ fn runVerifyE2E(allocator: std.mem.Allocator, model_path: []const u8) !void {
         const tp0 = nowMs();
         const pf = try eng.prefill(enc);
         const tp1 = nowMs();
-        const last_idx = (enc.len - 1) % engine_mod.MAX_M;
-        var cur_tok = pf.tokens[last_idx];
+        var cur_tok = pf.tokens[0];
 
         var gen_m1: [32]u32 = undefined;
         gen_m1[0] = cur_tok;
@@ -491,7 +490,7 @@ fn runVerifyE2E(allocator: std.mem.Allocator, model_path: []const u8) !void {
         // 2. Verify M=8 speculative verify (read-only GDN) + partial commitSpeculative(5) matches M=1!
         try eng.reset();
         const pf2 = try eng.prefill(enc);
-        const t0_id = pf2.tokens[last_idx];
+        const t0_id = pf2.tokens[0];
         // Feed 8 tokens: [t0, gen_m1[1], gen_m1[2], gen_m1[3], gen_m1[4], WRONG, WRONG, WRONG]
         const spec_in = [8]u32{ t0_id, gen_m1[1], gen_m1[2], gen_m1[3], gen_m1[4], 100, 101, 102 };
         const tv0 = nowMs();
@@ -583,8 +582,7 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         try eng.prefill(prompt_toks);
     const tp1 = nowMs();
 
-    const last_idx = (prompt_toks.len - 1) % engine_mod.MAX_M;
-    var cur = engine_mod.sampleFromCandidates(&pf.cands[last_idx], temp, 64, 0.95, &rng);
+    var cur = engine_mod.sampleFromCandidates(&pf.cands[0], temp, 64, 0.95, &rng);
     var gen: std.ArrayListUnmanaged(u32) = .empty;
     defer gen.deinit(allocator);
 
@@ -762,7 +760,7 @@ fn runBenchSpec(allocator: std.mem.Allocator, model_path: []const u8, drafter_pa
         eng.capture_enabled = false;
         const pf1 = try eng.prefill(ptoks);
         var ref_toks: [32]u32 = undefined;
-        var cur1 = pf1.tokens[(ptoks.len - 1) % engine_mod.MAX_M];
+        var cur1 = pf1.tokens[0];
         for (0..32) |k| {
             ref_toks[k] = cur1;
             if (k + 1 < 32) {
@@ -776,7 +774,7 @@ fn runBenchSpec(allocator: std.mem.Allocator, model_path: []const u8, drafter_pa
         const pfs = try df.prefill(&eng, ptoks);
         var spec_toks: std.ArrayListUnmanaged(u32) = .empty;
         defer spec_toks.deinit(allocator);
-        var curs = pfs.tokens[(ptoks.len - 1) % engine_mod.MAX_M];
+        var curs = pfs.tokens[0];
         try spec_toks.append(allocator, curs);
 
         var steps: usize = 0;
@@ -854,7 +852,7 @@ fn runBenchSpec(allocator: std.mem.Allocator, model_path: []const u8, drafter_pa
 
     var gen: std.ArrayListUnmanaged(u32) = .empty;
     defer gen.deinit(allocator);
-    var bcur = bpf.tokens[(b_ptoks.len - 1) % engine_mod.MAX_M];
+    var bcur = bpf.tokens[0];
     try gen.append(allocator, bcur);
 
     var n_steps: usize = 0;

@@ -32,6 +32,7 @@ pub const CONV_DYN_DIM: usize = 1280; // (5120 / 16) * 2 * 2
 pub const BLOCK_SIZE: usize = 8;
 pub const N_DRAFT: usize = BLOCK_SIZE - 1; // 7
 pub const SWA_WINDOW: usize = 2048;
+pub const KV_RING_BYTES: usize = N_LAYERS * 2 * SWA_WINDOW * N_KV_HEADS * HEAD_DIM * 2; // 40 MiB
 pub const SELECTOR_RANK: usize = 256;
 pub const SELECTOR_TOP_K: usize = 16;
 pub const ROPE_FREQ_BASE: f32 = 10_000_000.0;
@@ -398,9 +399,27 @@ pub const DFlashEngine = struct {
         }
     }
 
-    fn launchEncodeAndInjectBody(self: *const DFlashEngine, target: *const engine_mod.Engine, n_tokens: u32) !void {
+    /// Snapshot the 5-layer FP16 SWA-2048 KV ring buffer to Host RAM (40 MiB).
+    pub fn saveKvRingToHost(self: *const DFlashEngine, dst: []u8) !void {
+        std.debug.assert(dst.len == KV_RING_BYTES);
+        try self.ctx.copyDtoHAsync(dst, self.d_kv_ring);
+        try self.ctx.sync();
+    }
+
+    /// Restore the 5-layer FP16 SWA-2048 KV ring buffer from Host RAM (40 MiB).
+    pub fn loadKvRingFromHost(self: *DFlashEngine, src: []const u8) !void {
+        std.debug.assert(src.len == KV_RING_BYTES);
+        try self.ctx.copyHtoDAsync(self.d_kv_ring, src);
+    }
+
+    fn launchEncodeAndInjectBodyFrom(
+        self: *const DFlashEngine,
+        target: *const engine_mod.Engine,
+        d_cap_src: cuda.CUdeviceptr,
+        n_tokens: u32,
+    ) !void {
         // 1. Encoder: fc(25600 -> 5120) + enc.output_norm
-        try self.launchQuantQ8_1(target, target.d_cap_buf, D_ENC_IN, n_tokens);
+        try self.launchQuantQ8_1(target, d_cap_src, D_ENC_IN, n_tokens);
         try self.launchQ4Gemv(target, self.fc_weight, self.d_residual, n_tokens, D_ENC_IN, D_MODEL);
 
         var p_x = self.d_residual;
@@ -447,29 +466,67 @@ pub const DFlashEngine = struct {
             try exec.launch(self.ctx.stream);
         } else {
             try self.ctx.beginCapture();
-            try self.launchEncodeAndInjectBody(target, n_tokens);
+            try self.launchEncodeAndInjectBodyFrom(target, target.d_cap_buf, n_tokens);
             const exec = try self.ctx.endCaptureExec();
             self.g_inject[idx] = exec;
             try exec.launch(self.ctx.stream);
         }
     }
 
-    /// Prefill prompt on target engine with DFlash2 capture + KV injection for every chunk!
-    /// Returns the StepOutput for the final chunk (last token prediction at index `last_chunk_len - 1`).
-    pub fn prefill(self: *DFlashEngine, target: *engine_mod.Engine, prompt_tokens: []const u32) !engine_mod.StepOutput {
-        std.debug.assert(prompt_tokens.len > 0);
-        target.capture_enabled = true;
+    /// Encode and inject an arbitrary prefill chunk (`1..PREFILL_M`) from `target.d_cap_buf`
+    /// in slices of BLOCK_SIZE (8).
+    pub fn encodeAndInjectChunk(self: *DFlashEngine, target: *const engine_mod.Engine, n_tokens: u32, pos_base: u32) !void {
+        var sub: u32 = 0;
+        while (sub < n_tokens) {
+            const take: u32 = @min(@as(u32, BLOCK_SIZE), n_tokens - sub);
+            if (sub == 0) {
+                try self.encodeAndInject(target, take, pos_base);
+            } else {
+                self.h_meta_pos = @intCast(pos_base + sub);
+                try self.ctx.copyHtoDAsync(self.d_meta_pos, std.mem.asBytes(&self.h_meta_pos));
+                const d_src = target.d_cap_buf + @as(usize, sub) * D_ENC_IN * 4;
+                try self.launchEncodeAndInjectBodyFrom(target, d_src, take);
+            }
+            sub += take;
+        }
+    }
+
+    /// Batched prefill of `tokens` (`PREFILL_M=64` chunks) starting from `target.pos`.
+    /// Skips DFlash2 capture & KV injection for early tokens strictly outside the final
+    /// `SWA_WINDOW` (2048) tokens of this segment (they would be overwritten in the ring anyway!).
+    /// When `need_logits == true`, returns the final token's prediction at index 0.
+    pub fn prefillRange(
+        self: *DFlashEngine,
+        target: *engine_mod.Engine,
+        tokens: []const u32,
+        need_logits: bool,
+    ) !engine_mod.StepOutput {
+        std.debug.assert(tokens.len > 0);
+        errdefer target.capture_enabled = true;
         var offset: usize = 0;
-        while (offset < prompt_tokens.len) {
-            const chunk: u32 = @intCast(@min(BLOCK_SIZE, prompt_tokens.len - offset));
-            const is_last = (offset + chunk == prompt_tokens.len);
+        while (offset < tokens.len) {
+            const chunk: u32 = @intCast(@min(engine_mod.PREFILL_M, tokens.len - offset));
+            const is_last = (offset + chunk == tokens.len);
+            const in_swa_tail = (offset + chunk + SWA_WINDOW > tokens.len);
+            target.capture_enabled = in_swa_tail;
             const pos_before = target.pos;
-            const res = try target.forward(prompt_tokens[offset .. offset + chunk], true, is_last);
-            try self.encodeAndInject(target, chunk, pos_before);
-            if (is_last) return res;
+            const res = try target.forward(tokens[offset .. offset + chunk], true, need_logits and is_last);
+            if (in_swa_tail) {
+                try self.encodeAndInjectChunk(target, chunk, pos_before);
+            }
+            if (is_last) {
+                target.capture_enabled = true;
+                return res;
+            }
             offset += chunk;
         }
         unreachable;
+    }
+
+    /// Prefill prompt on target engine with DFlash2 capture + KV injection for the SWA-2048 tail!
+    /// Returns the StepOutput with the final token's prediction at index 0 (`tokens[0]` / `cands[0]`).
+    pub fn prefill(self: *DFlashEngine, target: *engine_mod.Engine, prompt_tokens: []const u32) !engine_mod.StepOutput {
+        return self.prefillRange(target, prompt_tokens, true);
     }
 
     fn launchDraftBody(self: *const DFlashEngine, target: *const engine_mod.Engine) !void {

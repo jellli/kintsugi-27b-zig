@@ -173,6 +173,9 @@ extern "C" __global__ void __launch_bounds__(256, 4) gdn_alpha_beta_f16_f32(
 ) {
     const bool is_beta = (blockIdx.x >= GDN_HV);
     const int h = is_beta ? (blockIdx.x - GDN_HV) : blockIdx.x;
+    const int t_base = blockIdx.y * 8;
+    if (t_base >= n_tokens) return;
+    const int t_cnt = (n_tokens - t_base < 8) ? (n_tokens - t_base) : 8;
     const __half* w_row = (is_beta ? w_beta : w_alpha) + (size_t)h * d_model;
 
     const int tid = threadIdx.x;
@@ -191,23 +194,23 @@ extern "C" __global__ void __launch_bounds__(256, 4) gdn_alpha_beta_f16_f32(
         const float w1 = __high2float(wh.x);
         const float w2 = __low2float(wh.y);
         const float w3 = __high2float(wh.y);
-        for (int t = 0; t < n_tokens; ++t) {
-            const float4 xv = ((const float4*)(x + (size_t)t * d_model))[i];
+        for (int t = 0; t < t_cnt; ++t) {
+            const float4 xv = ((const float4*)(x + (size_t)(t_base + t) * d_model))[i];
             acc[t] += xv.x * w0 + xv.y * w1 + xv.z * w2 + xv.w * w3;
         }
     }
 
     __shared__ float sh_red[8][8]; // [t][warp]
-    for (int t = 0; t < n_tokens; ++t) {
+    for (int t = 0; t < t_cnt; ++t) {
         float s = warp_sum_32(acc[t]);
         if (lane == 0) sh_red[t][warp] = s;
     }
     __syncthreads();
 
-    if (warp == 0 && lane < n_tokens) {
-        const int t = lane;
-        float tot = sh_red[t][0] + sh_red[t][1] + sh_red[t][2] + sh_red[t][3]
-                  + sh_red[t][4] + sh_red[t][5] + sh_red[t][6] + sh_red[t][7];
+    if (warp == 0 && lane < t_cnt) {
+        const int t = t_base + lane;
+        float tot = sh_red[lane][0] + sh_red[lane][1] + sh_red[lane][2] + sh_red[lane][3]
+                  + sh_red[lane][4] + sh_red[lane][5] + sh_red[lane][6] + sh_red[lane][7];
         if (is_beta) {
             beta_sig[(size_t)t * GDN_HV + h] = 1.0f / (1.0f + expf(-tot));
         } else {

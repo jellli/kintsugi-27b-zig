@@ -17,11 +17,14 @@ const attn_sm89_cubin align(8) = @embedFile("attn_sm89.cubin");
 const lmhead_sm89_cubin align(8) = @embedFile("lmhead_sm89.cubin");
 
 pub const MAX_M: usize = 8;
+pub const PREFILL_M: usize = 64;
 pub const TOPK_K: usize = 64;
 pub const TOPK_BLOCKS: usize = 64;
 pub const MAX_SPLITS: usize = 8;
 pub const Q4_HEAD_BYTES: usize = 144; // 256 / 32 * 18
 pub const GDN_QKV_DIM: usize = 10240;
+pub const GDN_STATE_BYTES: usize = 48 * 48 * 128 * 128 * 4; // 144 MiB
+pub const GDN_CONV_BYTES: usize = 48 * 3 * GDN_QKV_DIM * 4; // 5.625 MiB
 
 pub const Kernels = struct {
     mod_core: cuda.Module,
@@ -43,6 +46,8 @@ pub const Kernels = struct {
     fn_escha_k2_m8: cuda.CUfunction,
     fn_escha_k3_m8: cuda.CUfunction,
     fn_escha_k3_m8_w1s16: cuda.CUfunction,
+    fn_escha_k2_m64: cuda.CUfunction,
+    fn_escha_k3_m64: cuda.CUfunction,
     fn_escha_had_out: cuda.CUfunction,
 
     // GDN
@@ -99,6 +104,8 @@ pub const Kernels = struct {
             .fn_escha_k2_m8 = try mod_escha.getFunction("escha_gemv_k2_m8_narrow_s16"),
             .fn_escha_k3_m8 = try mod_escha.getFunction("escha_gemv_k3_m8_narrow_s16"),
             .fn_escha_k3_m8_w1s16 = try mod_escha.getFunction("escha_gemv_k3_m8_narrow_w1s16"),
+            .fn_escha_k2_m64 = try mod_escha.getFunction("escha_gemm_k2_m64"),
+            .fn_escha_k3_m64 = try mod_escha.getFunction("escha_gemm_k3_m64"),
             .fn_escha_had_out = try mod_escha.getFunction("escha_had_out_f32"),
 
             .fn_gdn_conv = try mod_gdn.getFunction("gdn_conv1d_silu_l2norm_f32"),
@@ -240,22 +247,22 @@ pub const Engine = struct {
         const d_gdn_save_beta = try cuda.Context.alloc(48 * MAX_M * 48 * 4);
         errdefer cuda.Context.free(d_gdn_save_beta);
 
-        // 3. Static scratch arena
+        // 3. Static scratch arena (activation buffers sized for PREFILL_M=64; LM head stays MAX_M=8)
         var sc_off: usize = 0;
-        const off_residual = bump(&sc_off, MAX_M * Spec.d_model * 4);
-        const off_delta = bump(&sc_off, MAX_M * Spec.d_model * 4);
-        const off_xnorm = bump(&sc_off, MAX_M * Spec.d_model * 4);
-        const off_xh0 = bump(&sc_off, MAX_M * Spec.d_ff * 2);
-        const off_xh1 = bump(&sc_off, MAX_M * Spec.d_model * 2);
-        const off_xh2 = bump(&sc_off, MAX_M * Spec.d_model * 2);
-        const off_buf_a = bump(&sc_off, MAX_M * Spec.d_ff * 4);
-        const off_buf_b = bump(&sc_off, MAX_M * Spec.d_ff * 4);
-        const off_buf_c = bump(&sc_off, MAX_M * 6144 * 4);
-        const off_gdn_q = bump(&sc_off, MAX_M * 2048 * 4);
-        const off_gdn_k = bump(&sc_off, MAX_M * 2048 * 4);
-        const off_gdn_v = bump(&sc_off, MAX_M * 6144 * 4);
-        const off_gdn_g = bump(&sc_off, MAX_M * 48 * 4);
-        const off_gdn_beta = bump(&sc_off, MAX_M * 48 * 4);
+        const off_residual = bump(&sc_off, PREFILL_M * Spec.d_model * 4);
+        const off_delta = bump(&sc_off, PREFILL_M * Spec.d_model * 4);
+        const off_xnorm = bump(&sc_off, PREFILL_M * Spec.d_model * 4);
+        const off_xh0 = bump(&sc_off, PREFILL_M * Spec.d_ff * 2);
+        const off_xh1 = bump(&sc_off, PREFILL_M * Spec.d_model * 2);
+        const off_xh2 = bump(&sc_off, PREFILL_M * Spec.d_model * 2);
+        const off_buf_a = bump(&sc_off, PREFILL_M * Spec.d_ff * 4);
+        const off_buf_b = bump(&sc_off, PREFILL_M * Spec.d_ff * 4);
+        const off_buf_c = bump(&sc_off, PREFILL_M * 6144 * 4);
+        const off_gdn_q = bump(&sc_off, PREFILL_M * 2048 * 4);
+        const off_gdn_k = bump(&sc_off, PREFILL_M * 2048 * 4);
+        const off_gdn_v = bump(&sc_off, PREFILL_M * 6144 * 4);
+        const off_gdn_g = bump(&sc_off, PREFILL_M * 48 * 4);
+        const off_gdn_beta = bump(&sc_off, PREFILL_M * 48 * 4);
         const off_part_o = bump(&sc_off, MAX_M * Spec.n_heads * MAX_SPLITS * Spec.head_dim * 4);
         const off_part_m = bump(&sc_off, MAX_M * Spec.n_heads * MAX_SPLITS * 4);
         const off_part_l = bump(&sc_off, MAX_M * Spec.n_heads * MAX_SPLITS * 4);
@@ -265,7 +272,7 @@ pub const Engine = struct {
         const off_tk_pidx = bump(&sc_off, MAX_M * TOPK_BLOCKS * TOPK_K * 4);
         const off_tk_oval = bump(&sc_off, MAX_M * TOPK_K * 4);
         const off_tk_oidx = bump(&sc_off, MAX_M * TOPK_K * 4);
-        const off_cap_buf = bump(&sc_off, MAX_M * 5 * Spec.d_model * 4);
+        const off_cap_buf = bump(&sc_off, PREFILL_M * 5 * Spec.d_model * 4);
         const off_meta_pos = bump(&sc_off, 16);
 
         const d_scratch = try cuda.Context.alloc(sc_off);
@@ -286,7 +293,7 @@ pub const Engine = struct {
         const d_kv_v = try cuda.Context.alloc(kv_half_total);
         errdefer cuda.Context.free(d_kv_v);
 
-        const h_emb_buf = try allocator.alloc(f32, MAX_M * Spec.d_model);
+        const h_emb_buf = try allocator.alloc(f32, PREFILL_M * Spec.d_model);
         errdefer allocator.free(h_emb_buf);
         const h_out_norm = try allocator.alloc(f32, MAX_M * Spec.d_model);
         errdefer allocator.free(h_out_norm);
@@ -371,9 +378,27 @@ pub const Engine = struct {
 
     pub fn reset(self: *Engine) !void {
         self.pos = 0;
-        try self.ctx.memsetZeroAsync(self.d_gdn_state, 48 * 48 * 128 * 128 * 4);
-        try self.ctx.memsetZeroAsync(self.d_gdn_conv, 48 * 3 * GDN_QKV_DIM * 4);
+        try self.ctx.memsetZeroAsync(self.d_gdn_state, GDN_STATE_BYTES);
+        try self.ctx.memsetZeroAsync(self.d_gdn_conv, GDN_CONV_BYTES);
         try self.ctx.sync();
+    }
+
+    /// Snapshot all 48 GDN recurrent + conv1d states to Host RAM (~150 MiB, ~8-12 ms D2H).
+    pub fn saveGdnStateToHost(self: *const Engine, dst_state: []u8, dst_conv: []u8) !void {
+        std.debug.assert(dst_state.len == GDN_STATE_BYTES);
+        std.debug.assert(dst_conv.len == GDN_CONV_BYTES);
+        try self.ctx.copyDtoHAsync(dst_state, self.d_gdn_state);
+        try self.ctx.copyDtoHAsync(dst_conv, self.d_gdn_conv);
+        try self.ctx.sync();
+    }
+
+    /// Restore all 48 GDN recurrent + conv1d states from Host RAM and set `self.pos`.
+    pub fn loadGdnStateFromHost(self: *Engine, src_state: []const u8, src_conv: []const u8, pos: u32) !void {
+        std.debug.assert(src_state.len == GDN_STATE_BYTES);
+        std.debug.assert(src_conv.len == GDN_CONV_BYTES);
+        try self.ctx.copyHtoDAsync(self.d_gdn_state, src_state);
+        try self.ctx.copyHtoDAsync(self.d_gdn_conv, src_conv);
+        self.pos = pos;
     }
 
     fn launchEscha(
@@ -383,11 +408,6 @@ pub const Engine = struct {
         d_out: cuda.CUdeviceptr,
         m: u32,
     ) !void {
-        const fn_gemv = if (m == 1)
-            (if (proj.k_bits == 2) self.ks.fn_escha_k2_m1 else self.ks.fn_escha_k3_m1)
-        else
-            (if (proj.k_bits == 2) self.ks.fn_escha_k2_m8 else self.ks.fn_escha_k3_m8);
-
         var p_a = d_xh;
         var p_b = proj.code;
         var p_rout = proj.rout;
@@ -404,8 +424,19 @@ pub const Engine = struct {
             @ptrCast(&p_k),
             @ptrCast(&p_n),
         };
-        const gx: u32 = proj.oc / 32;
-        try cuda.launch(fn_gemv, .{ gx, 1, 1 }, .{ 512, 1, 1 }, 0, self.ctx.stream, &params);
+        if (m > MAX_M) {
+            const fn_gemm = if (proj.k_bits == 2) self.ks.fn_escha_k2_m64 else self.ks.fn_escha_k3_m64;
+            const gx_gemm: u32 = proj.oc / 32;
+            const gy: u32 = (m + 63) / 64;
+            try cuda.launch(fn_gemm, .{ gx_gemm, gy, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &params);
+        } else {
+            const gx: u32 = proj.oc / 32;
+            const fn_gemv = if (m == 1)
+                (if (proj.k_bits == 2) self.ks.fn_escha_k2_m1 else self.ks.fn_escha_k3_m1)
+            else
+                (if (proj.k_bits == 2) self.ks.fn_escha_k2_m8 else self.ks.fn_escha_k3_m8);
+            try cuda.launch(fn_gemv, .{ gx, 1, 1 }, .{ 512, 1, 1 }, 0, self.ctx.stream, &params);
+        }
 
         // In-place 128-pt output Hadamard + escha_rout scaling (~1.5 us)
         var p_oc: c_int = @intCast(proj.oc);
@@ -421,11 +452,12 @@ pub const Engine = struct {
         try cuda.launch(self.ks.fn_escha_had_out, .{ n_blks, 1, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_had);
     }
 
-    /// Run a forward pass on `tokens[0..m]` (`1 <= m <= 8`) starting at `self.pos`.
-    /// - If `commit_immediately == true`: advances GDN recurrent & conv state in-place for all `m` tokens and sets `self.pos += m`.
-    /// - If `commit_immediately == false` (speculative verify): keeps GDN state untouched at `self.pos`, saves per-layer GDN step
-    ///   inputs so caller can call `commitSpeculative(n_commit)` once acceptance length is known!
-    /// - If `compute_logits == false`: skips LM head (fast prefill for intermediate prompt chunks!).
+    /// Run a forward pass on `tokens[0..m]` starting at `self.pos`.
+    /// - If `commit_immediately == true`: `1 <= m <= PREFILL_M` (64). Advances GDN recurrent & conv state in-place
+    ///   for all `m` tokens and sets `self.pos += m`. When `compute_logits == true`, runs LM head ONLY on the final
+    ///   token `m - 1` and places its prediction in `out.tokens[0]` / `out.cands[0]`.
+    /// - If `commit_immediately == false` (speculative verify): `1 <= m <= MAX_M` (8). Keeps GDN state untouched at
+    ///   `self.pos`, saves per-layer GDN step inputs for `commitSpeculative(n_commit)`, and computes logits for all `m` tokens.
     pub fn forward(
         self: *Engine,
         tokens: []const u32,
@@ -433,10 +465,10 @@ pub const Engine = struct {
         compute_logits: bool,
     ) !StepOutput {
         const m: u32 = @intCast(tokens.len);
-        std.debug.assert(m >= 1 and m <= MAX_M);
+        std.debug.assert(m >= 1 and m <= (if (commit_immediately) PREFILL_M else MAX_M));
         if (self.pos + m > self.max_kv_cells) return error.ContextFull;
 
-        // 1. Embed tokens on CPU from host mmap Q8_0 -> H2D (only 20-160 KiB!) + upload pos
+        // 1. Embed tokens on CPU from host mmap Q8_0 -> H2D + upload pos
         for (tokens, 0..) |tok, r| {
             self.model.embedToken(tok, self.h_emb_buf[r * Spec.d_model ..][0..Spec.d_model]);
         }
@@ -474,7 +506,12 @@ pub const Engine = struct {
         }
 
         // 3. Stage-2 Exact Q8_0 rescore of Top-64 candidates on CPU (zero VRAM!)
-        try self.finishStage2LmHeadCpu(self.d_xnorm, m, &out);
+        if (commit_immediately) {
+            const d_last = self.d_xnorm + @as(usize, m - 1) * Spec.d_model * 4;
+            try self.finishStage2LmHeadCpu(d_last, 1, &out);
+        } else {
+            try self.finishStage2LmHeadCpu(self.d_xnorm, m, &out);
+        }
         return out;
     }
 
@@ -493,8 +530,16 @@ pub const Engine = struct {
         var p_dpos = self.d_meta_pos;
         var p_fb: f32 = Spec.rope_theta;
 
-        const n_splits: u32 = if (attn_bucket == 2) 7 else if (attn_bucket == 1) 4 else 1;
-        const use_gqa6 = (attn_bucket >= 1);
+        // Keep m * n_splits <= MAX_M * MAX_SPLITS (64) so d_part_o/m/l never overflow!
+        const n_splits: u32 = if (m <= MAX_M)
+            (if (attn_bucket == 2) 7 else if (attn_bucket == 1) 4 else 1)
+        else if (m <= 16)
+            (if (attn_bucket >= 1) 4 else 1)
+        else if (m <= 32)
+            (if (attn_bucket >= 1) 2 else 1)
+        else
+            1;
+        const use_gqa6 = (attn_bucket >= 1) or (m > MAX_M);
 
         // Execute all 64 layers!
         for (0..Spec.n_layers) |l| {
@@ -562,7 +607,7 @@ pub const Engine = struct {
                     };
                     try cuda.launch(self.ks.fn_gdn_conv, .{ 80, 1, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &p_conv);
 
-                    // 2D. GDN alpha + beta FP16 GEMV + exp/sigmoid gates
+                    // 2D. GDN alpha + beta FP16 GEMV + exp/sigmoid gates (tiled along y for m > 8)
                     const d_g_out = if (commit_immediately) self.d_gdn_g else self.d_gdn_save_g + g_idx * MAX_M * 48 * 4;
                     const d_beta_out = if (commit_immediately) self.d_gdn_beta else self.d_gdn_save_beta + g_idx * MAX_M * 48 * 4;
                     var p_aw = gl.ssm_alpha;
@@ -576,7 +621,7 @@ pub const Engine = struct {
                         @ptrCast(&p_dtb), @ptrCast(&p_sa), @ptrCast(&p_go),
                         @ptrCast(&p_bo), @ptrCast(&p_m), @ptrCast(&p_dim),
                     };
-                    try cuda.launch(self.ks.fn_gdn_ab, .{ 96, 1, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_ab);
+                    try cuda.launch(self.ks.fn_gdn_ab, .{ 96, (m + 7) / 8, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_ab);
 
                     // 2E. GDN register-resident recurrence (commit in-place if commit_immediately, else read-only verify)
                     const d_st = self.d_gdn_state + g_idx * 48 * 128 * 128 * 4;
@@ -734,7 +779,12 @@ pub const Engine = struct {
 
         // 4. Stage-1 GPU LM Head + Exact Top-64 (captured inside CUDA Graph when verifying!)
         if (compute_logits) {
-            try self.launchStage1LmHeadGpu(self.d_xnorm, m);
+            if (commit_immediately) {
+                const d_last = self.d_xnorm + @as(usize, m - 1) * Spec.d_model * 4;
+                try self.launchStage1LmHeadGpu(d_last, 1);
+            } else {
+                try self.launchStage1LmHeadGpu(self.d_xnorm, m);
+            }
         }
     }
 
@@ -926,19 +976,25 @@ pub const Engine = struct {
         try self.finishStage2LmHeadCpu(d_hidden, m, out);
     }
 
-    /// Fast prefill of arbitrary prompt length in chunks of MAX_M (8).
-    /// Returns the StepOutput for the final chunk (last token's logits/next token are at index `last_chunk_len - 1`).
-    pub fn prefill(self: *Engine, prompt_tokens: []const u32) !StepOutput {
-        std.debug.assert(prompt_tokens.len > 0);
+    /// Fast batched prefill of `tokens` starting from current `self.pos` in chunks of PREFILL_M (64).
+    /// When `need_logits == true`, returns the final token's prediction at `out.tokens[0]` / `out.cands[0]`.
+    pub fn prefillRange(self: *Engine, tokens: []const u32, need_logits: bool) !StepOutput {
+        std.debug.assert(tokens.len > 0);
         var offset: usize = 0;
-        while (offset < prompt_tokens.len) {
-            const chunk = @min(MAX_M, prompt_tokens.len - offset);
-            const is_last = (offset + chunk == prompt_tokens.len);
-            const res = try self.forward(prompt_tokens[offset .. offset + chunk], true, is_last);
+        while (offset < tokens.len) {
+            const chunk = @min(PREFILL_M, tokens.len - offset);
+            const is_last = (offset + chunk == tokens.len);
+            const res = try self.forward(tokens[offset .. offset + chunk], true, need_logits and is_last);
             if (is_last) return res;
             offset += chunk;
         }
         unreachable;
+    }
+
+    /// Fast prefill of arbitrary prompt length in chunks of PREFILL_M (64).
+    /// Returns the StepOutput with the final token's prediction at index 0 (`tokens[0]` / `cands[0]`).
+    pub fn prefill(self: *Engine, prompt_tokens: []const u32) !StepOutput {
+        return self.prefillRange(prompt_tokens, true);
     }
 };
 
