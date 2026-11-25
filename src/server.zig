@@ -364,14 +364,21 @@ fn jsonUsize(v: std.json.Value) ?usize {
     };
 }
 
+fn parseMaxTokens(v: std.json.Value) ?usize {
+    return switch (v) {
+        .integer => |i| if (i < 0) std.math.maxInt(usize) else @intCast(i),
+        else => null,
+    };
+}
+
 fn parseGenParams(obj: std.json.ObjectMap) GenParams {
     var p: GenParams = .{};
     if (obj.get("max_completion_tokens")) |v| {
-        if (jsonUsize(v)) |n| p.max_tokens = n;
+        if (parseMaxTokens(v)) |n| p.max_tokens = n;
     } else if (obj.get("max_tokens")) |v| {
-        if (jsonUsize(v)) |n| p.max_tokens = n;
+        if (parseMaxTokens(v)) |n| p.max_tokens = n;
     } else if (obj.get("n_predict")) |v| {
-        if (jsonUsize(v)) |n| p.max_tokens = n;
+        if (parseMaxTokens(v)) |n| p.max_tokens = n;
     }
     if (obj.get("temperature")) |v| {
         if (jsonFloat(v)) |f| p.temperature = f;
@@ -714,7 +721,7 @@ const ServerState = struct {
         fd: std.c.fd_t,
         mode: Mode,
         prompt: []const u8,
-        params: GenParams,
+        params_in: GenParams,
     ) !void {
         const prompt_toks = try self.tok.encode(self.allocator, prompt);
         defer self.allocator.free(prompt_toks);
@@ -723,9 +730,30 @@ const ServerState = struct {
             try sendHttpJson(fd, self.allocator, "400 Bad Request", "{\"error\":{\"message\":\"prompt must not be empty\"}}");
             return;
         }
-        if (prompt_toks.len + params.max_tokens + engine_mod.MAX_M > self.eng.max_kv_cells) {
-            try sendHttpJson(fd, self.allocator, "400 Bad Request", "{\"error\":{\"message\":\"prompt + max_tokens exceeds VRAM KV pool\"}}");
+        const kv_reserve: usize = engine_mod.MAX_M;
+        if (prompt_toks.len + kv_reserve >= self.eng.max_kv_cells) {
+            std.debug.print(
+                "[kintsugi-zig] 400 prompt too long: prompt={d}, kv_pool={d}\n",
+                .{ prompt_toks.len, self.eng.max_kv_cells },
+            );
+            const msg = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"error\":{{\"message\":\"prompt ({d} tokens) exceeds VRAM KV pool ({d} cells)\"}}}}",
+                .{ prompt_toks.len, self.eng.max_kv_cells },
+            );
+            defer self.allocator.free(msg);
+            try sendHttpJson(fd, self.allocator, "400 Bad Request", msg);
             return;
+        }
+
+        var params = params_in;
+        const max_avail: usize = self.eng.max_kv_cells - prompt_toks.len - kv_reserve;
+        if (params.max_tokens > max_avail) {
+            std.debug.print(
+                "[kintsugi-zig] clamping max_tokens {d} -> {d} (prompt={d}, kv_pool={d})\n",
+                .{ params.max_tokens, max_avail, prompt_toks.len, self.eng.max_kv_cells },
+            );
+            params.max_tokens = max_avail;
         }
 
         var id_buf: [64]u8 = undefined;
