@@ -136,10 +136,13 @@ pub const DFlashEngine = struct {
     h_mask_embed: []f32, // [5120] pre-dequantized once!
     h_sel_gate: []f32,   // [7, 256]
     h_meta_pos: i32 = 0,
+    h_meta_pos_pair: [2]i32 = .{ 0, 0 },
 
     // Cached static CUDA Graphs
     g_draft: ?cuda.GraphExec = null,
-    g_inject: [BLOCK_SIZE]?cuda.GraphExec = .{ null, null, null, null, null, null, null, null },
+    g_inject: [BLOCK_SIZE]?cuda.GraphExec = @splat(null),
+    g_commit_inject: [BLOCK_SIZE]?cuda.GraphExec = @splat(null),
+    g_commit_inject_draft: [BLOCK_SIZE]?cuda.GraphExec = @splat(null),
 
     pub fn load(
         allocator: std.mem.Allocator,
@@ -351,6 +354,12 @@ pub const DFlashEngine = struct {
         for (&self.g_inject) |*g| {
             if (g.*) |*exec| exec.deinit();
         }
+        for (&self.g_commit_inject) |*g| {
+            if (g.*) |*exec| exec.deinit();
+        }
+        for (&self.g_commit_inject_draft) |*g| {
+            if (g.*) |*exec| exec.deinit();
+        }
         self.allocator.free(self.h_sel_gate);
         self.allocator.free(self.h_mask_embed);
         self.allocator.free(self.h_emb_buf);
@@ -418,11 +427,11 @@ pub const DFlashEngine = struct {
         d_cap_src: cuda.CUdeviceptr,
         n_tokens: u32,
     ) !void {
-        // 1. Encoder: fc(25600 -> 5120) + enc.output_norm
+        // 1. Encoder: fc(25600 -> 5120) + enc.output_norm (uses d_delta so d_residual stays intact for fused draft!)
         try self.launchQuantQ8_1(target, d_cap_src, D_ENC_IN, n_tokens);
-        try self.launchQ4Gemv(target, self.fc_weight, self.d_residual, n_tokens, D_ENC_IN, D_MODEL);
+        try self.launchQ4Gemv(target, self.fc_weight, self.d_delta, n_tokens, D_ENC_IN, D_MODEL);
 
-        var p_x = self.d_residual;
+        var p_x = self.d_delta;
         var p_w = self.enc_output_norm;
         var p_o = self.d_norm;
         var p_dim: c_int = D_MODEL;
@@ -471,6 +480,29 @@ pub const DFlashEngine = struct {
             self.g_inject[idx] = exec;
             try exec.launch(self.ctx.stream);
         }
+    }
+
+    /// Fused single-CUDA-Graph target GDN commit + DFlash2 KV encode & inject (`1..8` tokens).
+    /// Eliminates inter-graph host/driver launch overhead and advances `target.pos += n_commit`.
+    pub fn commitAndInject(self: *DFlashEngine, target: *engine_mod.Engine, n_commit: u32) !void {
+        std.debug.assert(n_commit >= 1 and n_commit <= BLOCK_SIZE);
+        self.h_meta_pos = @intCast(target.pos);
+        try self.ctx.copyHtoDAsync(self.d_meta_pos, std.mem.asBytes(&self.h_meta_pos));
+
+        const idx: usize = n_commit - 1;
+        if (self.g_commit_inject[idx]) |exec| {
+            try exec.launch(self.ctx.stream);
+        } else {
+            try self.ctx.beginCapture();
+            try self.ctx.forkAux();
+            try target.launchCommitBodyOnStream(n_commit, self.ctx.aux_stream);
+            try self.launchEncodeAndInjectBodyFrom(target, target.d_cap_buf, n_commit);
+            try self.ctx.joinAux();
+            const exec = try self.ctx.endCaptureExec();
+            self.g_commit_inject[idx] = exec;
+            try exec.launch(self.ctx.stream);
+        }
+        target.pos += n_commit;
     }
 
     /// Encode and inject an arbitrary prefill chunk (`1..PREFILL_M`) from `target.d_cap_buf`
@@ -529,12 +561,12 @@ pub const DFlashEngine = struct {
         return self.prefillRange(target, prompt_tokens, true);
     }
 
-    fn launchDraftBody(self: *const DFlashEngine, target: *const engine_mod.Engine) !void {
+    fn launchDraftBodyWithPos(self: *const DFlashEngine, target: *const engine_mod.Engine, d_pos: cuda.CUdeviceptr) !void {
         const m: u32 = BLOCK_SIZE;
         var p_dim: c_int = D_MODEL;
         var p_eps: f32 = RMS_EPS;
         var p_fb: f32 = ROPE_FREQ_BASE;
-        var p_dpos = self.d_meta_pos;
+        var p_dpos = d_pos;
         var p_m: c_int = @intCast(m);
         var p_qh: c_int = N_Q_HEADS;
         var p_kvh: c_int = N_KV_HEADS;
@@ -725,12 +757,78 @@ pub const DFlashEngine = struct {
             try exec.launch(self.ctx.stream);
         } else {
             try self.ctx.beginCapture();
-            try self.launchDraftBody(target);
+            try self.launchDraftBodyWithPos(target, self.d_meta_pos);
             const exec = try self.ctx.endCaptureExec();
             self.g_draft = exec;
             try exec.launch(self.ctx.stream);
         }
 
+        return self.finishDraftSelectorCpu(target, id_last, p_min, sampling, draft_out, dists_out);
+    }
+
+    /// Fused single-CUDA-Graph `target.commit(n_commit)` + `dflash.inject(n_commit)` + `dflash.draft(id_last)`!
+    /// Eliminates 2 inter-graph CUDA driver launches per speculative decode step and advances `target.pos += n_commit`.
+    pub fn commitInjectAndDraftSampled(
+        self: *DFlashEngine,
+        target: *engine_mod.Engine,
+        n_commit: u32,
+        id_last: u32,
+        p_min: f32,
+        sampling: ?DraftSampling,
+        draft_out: *[N_DRAFT]u32,
+        dists_out: ?*[N_DRAFT]engine_mod.CandidateDist,
+    ) !u32 {
+        std.debug.assert(n_commit >= 1 and n_commit <= BLOCK_SIZE);
+        const pos_before = target.pos;
+        const pos_after = pos_before + n_commit;
+
+        // 1. Upload next draft anchor embedding + [pos_before, pos_after] pair async
+        //    (Safe before inject because launchEncodeAndInjectBodyFrom uses d_delta, not d_residual!)
+        target.model.embedToken(id_last, self.h_emb_buf[0..D_MODEL]);
+        try self.ctx.copyHtoDAsync(self.d_residual, std.mem.sliceAsBytes(self.h_emb_buf));
+        self.h_meta_pos_pair = .{ @intCast(pos_before), @intCast(pos_after) };
+        try self.ctx.copyHtoDAsync(self.d_meta_pos, std.mem.sliceAsBytes(&self.h_meta_pos_pair));
+
+        // 2. Launch single fused CUDA Graph: GDN Commit -> DFlash2 KV Inject -> DFlash2 Draft + Target Stage-1 LM Head!
+        const idx: usize = n_commit - 1;
+        if (self.g_commit_inject_draft[idx]) |exec| {
+            try exec.launch(self.ctx.stream);
+        } else {
+            try self.ctx.beginCapture();
+            try self.ctx.forkAux();
+            try target.launchCommitBodyOnStream(n_commit, self.ctx.aux_stream);
+            try self.launchEncodeAndInjectBodyFrom(target, target.d_cap_buf, n_commit);
+            try self.launchDraftBodyWithPos(target, self.d_meta_pos + 4);
+            try self.ctx.joinAux();
+            const exec = try self.ctx.endCaptureExec();
+            self.g_commit_inject_draft[idx] = exec;
+            try exec.launch(self.ctx.stream);
+        }
+        target.pos = pos_after;
+
+        return self.finishDraftSelectorCpu(target, id_last, p_min, sampling, draft_out, dists_out);
+    }
+
+    pub fn commitInjectAndDraft(
+        self: *DFlashEngine,
+        target: *engine_mod.Engine,
+        n_commit: u32,
+        id_last: u32,
+        p_min: f32,
+        draft_out: *[N_DRAFT]u32,
+    ) !u32 {
+        return self.commitInjectAndDraftSampled(target, n_commit, id_last, p_min, null, draft_out, null);
+    }
+
+    fn finishDraftSelectorCpu(
+        self: *DFlashEngine,
+        target: *engine_mod.Engine,
+        id_last: u32,
+        p_min: f32,
+        sampling: ?DraftSampling,
+        draft_out: *[N_DRAFT]u32,
+        dists_out: ?*[N_DRAFT]engine_mod.CandidateDist,
+    ) !u32 {
         // 3. Single D2H + sync for selector gate + Stage-2 exact Q8_0 rescore on CPU
         const d_draft_hidden = self.d_norm + D_MODEL * 4;
         try self.ctx.copyDtoHAsync(std.mem.sliceAsBytes(self.h_sel_gate), self.d_sel_gate);

@@ -2345,18 +2345,31 @@ const ServerState = struct {
                         .min_p = params.min_p,
                         .rng = &rng,
                     };
+                    var pending_commit: u32 = 0;
                     while (!stopped and stats.completion_tokens < params.max_tokens) {
                         var draft_toks: [dflash_mod.N_DRAFT]u32 = undefined;
                         var draft_dists: [dflash_mod.N_DRAFT]engine_mod.CandidateDist = undefined;
-                        const n_draft = try df.draftSampled(
-                            self.eng,
-                            cur,
-                            self.eng.pos,
-                            0.0,
-                            draft_sampling,
-                            &draft_toks,
-                            if (greedy) null else &draft_dists,
-                        );
+                        const n_draft = if (pending_commit > 0)
+                            try df.commitInjectAndDraftSampled(
+                                self.eng,
+                                pending_commit,
+                                cur,
+                                0.0,
+                                draft_sampling,
+                                &draft_toks,
+                                if (greedy) null else &draft_dists,
+                            )
+                        else
+                            try df.draftSampled(
+                                self.eng,
+                                cur,
+                                self.eng.pos,
+                                0.0,
+                                draft_sampling,
+                                &draft_toks,
+                                if (greedy) null else &draft_dists,
+                            );
+                        pending_commit = 0;
                         stats.draft_n += n_draft;
 
                         var batch: [dflash_mod.BLOCK_SIZE]u32 = undefined;
@@ -2426,11 +2439,12 @@ const ServerState = struct {
                         if (stopped) break;
 
                         const n_commit = n_acc + 1;
-                        const pos_before = self.eng.pos;
-                        try self.eng.commitSpeculative(n_commit);
-                        try df.encodeAndInject(self.eng, n_commit, pos_before);
                         try self.active_tokens.appendSlice(self.allocator, batch[0..n_commit]);
+                        pending_commit = n_commit;
                         cur = next_tok;
+                    }
+                    if (pending_commit > 0) {
+                        try df.commitAndInject(self.eng, pending_commit);
                     }
                 } else {
                     while (!stopped and stats.completion_tokens < params.max_tokens) {

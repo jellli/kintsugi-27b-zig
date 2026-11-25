@@ -884,7 +884,11 @@ pub const Engine = struct {
         try cuda.launch(self.ks.fn_capture, .{ m, 20, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &params);
     }
 
-    fn launchCommitBody(self: *const Engine, n_commit: u32) !void {
+    pub fn launchCommitBody(self: *const Engine, n_commit: u32) !void {
+        return self.launchCommitBodyOnStream(n_commit, self.ctx.stream);
+    }
+
+    pub fn launchCommitBodyOnStream(self: *const Engine, n_commit: u32, stream: cuda.CUstream) !void {
         var p_nc: c_int = @intCast(n_commit);
         var p_null: cuda.CUdeviceptr = 0;
 
@@ -898,7 +902,7 @@ pub const Engine = struct {
                     var p_qb = gl.attn_qkv.bias;
                     var p_cs = d_conv;
                     var p_cc = [_]?*anyopaque{ @ptrCast(&p_qkv), @ptrCast(&p_qb), @ptrCast(&p_cs), @ptrCast(&p_nc) };
-                    try cuda.launch(self.ks.fn_gdn_commit_conv, .{ 80, 1, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &p_cc);
+                    try cuda.launch(self.ks.fn_gdn_commit_conv, .{ 80, 1, 1 }, .{ 128, 1, 1 }, 0, stream, &p_cc);
 
                     var p_k = self.d_gdn_save_k + g_idx * MAX_M * 2048 * 4;
                     var p_v = self.d_gdn_save_v + g_idx * MAX_M * 6144 * 4;
@@ -911,7 +915,7 @@ pub const Engine = struct {
                         @ptrCast(&p_st),   @ptrCast(&p_null), @ptrCast(&p_nc),
                         @ptrCast(&p_nc),
                     };
-                    try cuda.launch(self.ks.fn_gdn_rec, .{ 48, 8, 1 }, .{ 32, 4, 1 }, 0, self.ctx.stream, &p_rec);
+                    try cuda.launch(self.ks.fn_gdn_rec, .{ 48, 8, 1 }, .{ 32, 4, 1 }, 0, stream, &p_rec);
                 },
                 .full_attn => {},
             }

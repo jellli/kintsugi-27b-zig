@@ -608,18 +608,31 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             try tok.decodeTokenTo(cur, &piece_buf, allocator);
             std.debug.print("{s}", .{piece_buf.items});
 
+            var pending_commit: u32 = 0;
             while (gen.items.len < max_tokens) {
                 var draft_toks: [dflash_mod.N_DRAFT]u32 = undefined;
                 var draft_dists: [dflash_mod.N_DRAFT]engine_mod.CandidateDist = undefined;
-                const n_draft = try df.draftSampled(
-                    &eng,
-                    cur,
-                    eng.pos,
-                    0.0,
-                    draft_sampling,
-                    &draft_toks,
-                    if (greedy) null else &draft_dists,
-                );
+                const n_draft = if (pending_commit > 0)
+                    try df.commitInjectAndDraftSampled(
+                        &eng,
+                        pending_commit,
+                        cur,
+                        0.0,
+                        draft_sampling,
+                        &draft_toks,
+                        if (greedy) null else &draft_dists,
+                    )
+                else
+                    try df.draftSampled(
+                        &eng,
+                        cur,
+                        eng.pos,
+                        0.0,
+                        draft_sampling,
+                        &draft_toks,
+                        if (greedy) null else &draft_dists,
+                    );
+                pending_commit = 0;
                 total_drafted += n_draft;
 
                 var batch: [dflash_mod.BLOCK_SIZE]u32 = undefined;
@@ -681,10 +694,7 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 }
                 if (stopped) break;
 
-                const n_commit = n_acc + 1;
-                const pos_before = eng.pos;
-                try eng.commitSpeculative(n_commit);
-                try df.encodeAndInject(&eng, n_commit, pos_before);
+                pending_commit = n_acc + 1;
                 cur = next_tok;
             }
         }
@@ -799,9 +809,14 @@ fn runBenchSpec(allocator: std.mem.Allocator, model_path: []const u8, drafter_pa
         var steps: usize = 0;
         var acc_sum: usize = 0;
         var dft_sum: usize = 0;
+        var pending_c: u32 = 0;
         while (spec_toks.items.len < 32) {
             var dt: [dflash_mod.N_DRAFT]u32 = undefined;
-            const nd = try df.draft(&eng, curs, eng.pos, 0.0, &dt);
+            const nd = if (pending_c > 0)
+                try df.commitInjectAndDraft(&eng, pending_c, curs, 0.0, &dt)
+            else
+                try df.draft(&eng, curs, eng.pos, 0.0, &dt);
+            pending_c = 0;
             dft_sum += nd;
             var batch: [dflash_mod.BLOCK_SIZE]u32 = undefined;
             batch[0] = curs;
@@ -829,9 +844,7 @@ fn runBenchSpec(allocator: std.mem.Allocator, model_path: []const u8, drafter_pa
                 next_t = bonus;
             }
             if (spec_toks.items.len >= 32) break;
-            const pb = eng.pos;
-            try eng.commitSpeculative(na + 1);
-            try df.encodeAndInject(&eng, na + 1, pb);
+            pending_c = na + 1;
             curs = next_t;
         }
 
@@ -878,11 +891,16 @@ fn runBenchSpec(allocator: std.mem.Allocator, model_path: []const u8, drafter_pa
     var tot_drafted: usize = 0;
     var tot_accepted: usize = 0;
     var ms_verify: f64 = 0;
+    var b_pending_c: u32 = 0;
 
     const td0 = nowMs();
     while (gen.items.len < 256) {
         var dt: [dflash_mod.N_DRAFT]u32 = undefined;
-        const nd = try df.draft(&eng, bcur, eng.pos, 0.0, &dt);
+        const nd = if (b_pending_c > 0)
+            try df.commitInjectAndDraft(&eng, b_pending_c, bcur, 0.0, &dt)
+        else
+            try df.draft(&eng, bcur, eng.pos, 0.0, &dt);
+        b_pending_c = 0;
         const t1 = nowMs();
         tot_drafted += nd;
 
@@ -925,9 +943,7 @@ fn runBenchSpec(allocator: std.mem.Allocator, model_path: []const u8, drafter_pa
         }
         if (hit_eos or gen.items.len >= 256) break;
 
-        const pb = eng.pos;
-        try eng.commitSpeculative(na + 1);
-        try df.encodeAndInject(&eng, na + 1, pb);
+        b_pending_c = na + 1;
         bcur = next_t;
     }
     const td1 = nowMs();
@@ -979,8 +995,16 @@ fn runBenchSpec(allocator: std.mem.Allocator, model_path: []const u8, drafter_pa
         var t_df_lm: f64 = 0;
         var t_commit: f64 = 0;
         var t_inject: f64 = 0;
+        var t_fused: f64 = 0;
         var tmp_out: engine_mod.StepOutput = .{};
         var tmp_dt: [dflash_mod.N_DRAFT]u32 = undefined;
+
+        // Warmup fused graph for n_commit=5 so Part 3 measures steady-state replay
+        {
+            const sp = eng.pos;
+            _ = try df.commitInjectAndDraft(&eng, 5, 100, 0.0, &tmp_dt);
+            eng.pos = sp;
+        }
 
         for (0..prof_iters) |_| {
             try ctx.sync();
@@ -1009,6 +1033,10 @@ fn runBenchSpec(allocator: std.mem.Allocator, model_path: []const u8, drafter_pa
             const a7 = nowMs();
             eng.pos = saved_pos;
 
+            _ = try df.commitInjectAndDraft(&eng, 5, 100, 0.0, &tmp_dt);
+            const a8 = nowMs();
+            eng.pos = saved_pos;
+
             t_trunk += (a1 - a0);
             t_lm_all += (a2 - a1);
             t_lm_gpu += (a3 - a2);
@@ -1016,6 +1044,7 @@ fn runBenchSpec(allocator: std.mem.Allocator, model_path: []const u8, drafter_pa
             t_df_lm += (a5 - a4);
             t_commit += (a6 - a5);
             t_inject += (a7 - a6);
+            t_fused += (a8 - a7);
         }
         const pf: f64 = @floatFromInt(prof_iters);
         std.debug.print(
@@ -1025,6 +1054,7 @@ fn runBenchSpec(allocator: std.mem.Allocator, model_path: []const u8, drafter_pa
             \\  Target LM Head Total : {d:.2} ms (GPU Q4_0+Top64: {d:.2} ms | CPU Q8_0 rescore: {d:.2} ms)
             \\  DFlash2 Total Draft  : {d:.2} ms (5L Trunk+Sel: {d:.2} ms | LM Head (M=7): {d:.2} ms)
             \\  GDN Commit (5 tok)   : {d:.2} ms | DFlash2 Inject (5 tok): {d:.2} ms
+            \\  Fused Commit+Inj+Dft : {d:.2} ms (vs separate {d:.2} ms)
             \\
         , .{
             prof_iters,
@@ -1037,6 +1067,8 @@ fn runBenchSpec(allocator: std.mem.Allocator, model_path: []const u8, drafter_pa
             t_df_lm / pf,
             t_commit / pf,
             t_inject / pf,
+            t_fused / pf,
+            (t_commit + t_inject + t_df_all) / pf,
         });
     }
 }

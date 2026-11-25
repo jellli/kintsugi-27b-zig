@@ -103,6 +103,7 @@ extern "c" fn cuMemHostGetDevicePointer_v2(pdptr: *CUdeviceptr, p: *anyopaque, F
 extern "c" fn cuStreamCreate(phStream: *CUstream, Flags: c_uint) CUresult;
 extern "c" fn cuStreamDestroy_v2(hStream: CUstream) CUresult;
 extern "c" fn cuStreamSynchronize(hStream: CUstream) CUresult;
+extern "c" fn cuStreamWaitEvent(hStream: CUstream, hEvent: CUevent, Flags: c_uint) CUresult;
 extern "c" fn cuStreamBeginCapture_v2(hStream: CUstream, mode: c_int) CUresult;
 extern "c" fn cuStreamEndCapture(hStream: CUstream, phGraph: *CUgraph) CUresult;
 extern "c" fn cuGraphInstantiateWithFlags(phGraphExec: *CUgraphExec, hGraph: CUgraph, flags: u64) CUresult;
@@ -174,6 +175,9 @@ pub const Context = struct {
     dev: CUdevice,
     ctx: CUcontext,
     stream: CUstream,
+    aux_stream: CUstream,
+    ev_fork: CUevent,
+    ev_join: CUevent,
 
     pub fn init(ordinal: c_int) CudaError!Context {
         try check(cuInit(0));
@@ -184,14 +188,44 @@ pub const Context = struct {
         try check(cuDeviceGet(&dev, ordinal));
         var ctx: CUcontext = null;
         try check(cuCtxCreate_v2(&ctx, 0, dev));
+        errdefer _ = cuCtxDestroy_v2(ctx);
         var stream: CUstream = null;
         try check(cuStreamCreate(&stream, 0));
-        return .{ .dev = dev, .ctx = ctx, .stream = stream };
+        errdefer _ = cuStreamDestroy_v2(stream);
+        var aux_stream: CUstream = null;
+        try check(cuStreamCreate(&aux_stream, 0));
+        errdefer _ = cuStreamDestroy_v2(aux_stream);
+        var ev_fork: CUevent = null;
+        try check(cuEventCreate(&ev_fork, 0x02)); // CU_EVENT_DISABLE_TIMING
+        errdefer _ = cuEventDestroy_v2(ev_fork);
+        var ev_join: CUevent = null;
+        try check(cuEventCreate(&ev_join, 0x02));
+        return .{
+            .dev = dev,
+            .ctx = ctx,
+            .stream = stream,
+            .aux_stream = aux_stream,
+            .ev_fork = ev_fork,
+            .ev_join = ev_join,
+        };
     }
 
     pub fn deinit(self: *Context) void {
+        _ = cuEventDestroy_v2(self.ev_join);
+        _ = cuEventDestroy_v2(self.ev_fork);
+        _ = cuStreamDestroy_v2(self.aux_stream);
         _ = cuStreamDestroy_v2(self.stream);
         _ = cuCtxDestroy_v2(self.ctx);
+    }
+
+    pub fn forkAux(self: *const Context) CudaError!void {
+        try check(cuEventRecord(self.ev_fork, self.stream));
+        try check(cuStreamWaitEvent(self.aux_stream, self.ev_fork, 0));
+    }
+
+    pub fn joinAux(self: *const Context) CudaError!void {
+        try check(cuEventRecord(self.ev_join, self.aux_stream));
+        try check(cuStreamWaitEvent(self.stream, self.ev_join, 0));
     }
 
     pub fn queryInfo(self: *const Context) CudaError!DeviceInfo {
