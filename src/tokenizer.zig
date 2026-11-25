@@ -15,6 +15,7 @@ pub const Tokenizer = struct {
     vocab_map: std.StringHashMapUnmanaged(u32) = .empty,
     merge_rank: std.StringHashMapUnmanaged(u32) = .empty,
     specials: std.ArrayListUnmanaged(SpecialToken) = .empty,
+    special_first_byte: [256]bool = @splat(false),
     /// Maps each byte 0..255 to its GPT-2 Unicode codepoint (stored as UTF-8 bytes)
     byte_to_utf8: [256][2]u8 = undefined,
     byte_to_utf8_len: [256]u8 = undefined,
@@ -24,7 +25,10 @@ pub const Tokenizer = struct {
     pub fn init(allocator: std.mem.Allocator, model: *const gguf.GgufFile) !Tokenizer {
         var meta = try model.readTokenizerMeta(allocator);
         errdefer meta.deinit(allocator);
+        return initFromMeta(allocator, meta);
+    }
 
+    pub fn initFromMeta(allocator: std.mem.Allocator, meta: gguf.GgufFile.TokenizerMeta) !Tokenizer {
         var self: Tokenizer = .{
             .allocator = allocator,
             .meta = meta,
@@ -38,6 +42,7 @@ pub const Tokenizer = struct {
             self.vocab_map.putAssumeCapacity(tok, @intCast(idx));
             if (idx < meta.token_types.len and (meta.token_types[idx] == 3 or meta.token_types[idx] == 4) and tok.len > 0) {
                 try self.specials.append(allocator, .{ .text = tok, .id = @intCast(idx) });
+                self.special_first_byte[tok[0]] = true;
             }
         }
         // Sort specials longest-first for greedy matching
@@ -133,7 +138,7 @@ pub const Tokenizer = struct {
         var seg_start: usize = 0;
         while (pos < text.len) {
             var matched: ?SpecialToken = null;
-            if (text[pos] == '<') {
+            if (self.special_first_byte[text[pos]]) {
                 for (self.specials.items) |sp| {
                     if (pos + sp.text.len <= text.len and std.mem.eql(u8, text[pos .. pos + sp.text.len], sp.text)) {
                         matched = sp;
@@ -363,4 +368,221 @@ fn consumeLetters(s: []const u8, start: usize) usize {
         i += utf8Step(s, i);
     }
     return i;
+}
+
+/// Self-contained synthetic byte-level BPE tokenizer for unit tests (no GGUF file required).
+/// Owns all 256 GPT-2 byte tokens (IDs 0..255) plus any caller-supplied merged & special tokens.
+pub const TestTokenizer = struct {
+    allocator: std.mem.Allocator,
+    byte_tok_storage: [256][2]u8,
+    tok: Tokenizer,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        extra_tokens: []const []const u8,
+        extra_merges: []const []const u8,
+        specials: []const []const u8,
+        eos_special_idx: usize,
+    ) !*TestTokenizer {
+        const self = try allocator.create(TestTokenizer);
+        errdefer allocator.destroy(self);
+        self.allocator = allocator;
+
+        // Build GPT-2 byte-unicode strings for IDs 0..255
+        var byte_lens: [256]u8 = undefined;
+        var next_cp: u21 = 256;
+        for (0..256) |b| {
+            const printable = (b >= 33 and b <= 126) or (b >= 161 and b <= 172) or (b >= 174 and b <= 255);
+            const cp: u21 = if (printable) @intCast(b) else blk: {
+                const c = next_cp;
+                next_cp += 1;
+                break :blk c;
+            };
+            var buf: [4]u8 = .{ 0, 0, 0, 0 };
+            const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
+            self.byte_tok_storage[b] = .{ buf[0], buf[1] };
+            byte_lens[b] = @intCast(n);
+        }
+
+        const total_toks = 256 + extra_tokens.len + specials.len;
+        const tokens = try allocator.alloc([]const u8, total_toks);
+        errdefer allocator.free(tokens);
+        const token_types = try allocator.alloc(i32, total_toks);
+        errdefer allocator.free(token_types);
+        const merges = try allocator.alloc([]const u8, extra_merges.len);
+        errdefer allocator.free(merges);
+
+        for (0..256) |b| {
+            tokens[b] = self.byte_tok_storage[b][0..byte_lens[b]];
+            token_types[b] = 1;
+        }
+        for (extra_tokens, 0..) |t, i| {
+            tokens[256 + i] = t;
+            token_types[256 + i] = 1;
+        }
+        const spec_base = 256 + extra_tokens.len;
+        for (specials, 0..) |s, i| {
+            tokens[spec_base + i] = s;
+            token_types[spec_base + i] = 3; // control/special
+        }
+        @memcpy(merges, extra_merges);
+
+        const eos_id: u32 = if (eos_special_idx < specials.len) @intCast(spec_base + eos_special_idx) else 0xFFFF_FFFF;
+        const meta: gguf.GgufFile.TokenizerMeta = .{
+            .tokens = tokens,
+            .merges = merges,
+            .token_types = token_types,
+            .eos_id = eos_id,
+            .bos_id = eos_id,
+            .pad_id = eos_id,
+            .mask_id = eos_id,
+        };
+        self.tok = try Tokenizer.initFromMeta(allocator, meta);
+        return self;
+    }
+
+    pub fn deinit(self: *TestTokenizer) void {
+        const alloc = self.allocator;
+        self.tok.deinit();
+        alloc.destroy(self);
+    }
+};
+
+test "Tokenizer GPT-2 byte-unicode roundtrip covers all 256 byte values, CJK, and emoji" {
+    const tt = try TestTokenizer.init(std.testing.allocator, &.{}, &.{}, &.{}, 0);
+    defer tt.deinit();
+
+    var all_bytes: [256]u8 = undefined;
+    for (0..256) |i| all_bytes[i] = @intCast(i);
+
+    const ids = try tt.tok.encode(std.testing.allocator, &all_bytes);
+    defer std.testing.allocator.free(ids);
+    try std.testing.expectEqual(@as(usize, 256), ids.len);
+
+    const decoded = try tt.tok.decode(std.testing.allocator, ids);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, &all_bytes, decoded);
+
+    // Mixed ASCII, CJK, 4-byte emoji, and raw invalid UTF-8 bytes
+    const sample = "Hello \xe4\xb8\x96\xe7\x95\x8c \xf0\x9f\x9a\x80 \xff\xfe\x00!";
+    const s_ids = try tt.tok.encode(std.testing.allocator, sample);
+    defer std.testing.allocator.free(s_ids);
+    const s_dec = try tt.tok.decode(std.testing.allocator, s_ids);
+    defer std.testing.allocator.free(s_dec);
+    try std.testing.expectEqualSlices(u8, sample, s_dec);
+}
+
+test "Tokenizer Qwen3.5 pre-tokenization splits digits, contractions, spaces, punctuation+nl, and honors BPE rank" {
+    // Space in GPT-2 byte-unicode is U+0120 (0xC4 0xA0), newline is U+010A (0xC4 0x8A)
+    const sp = "\xc4\xa0";
+    const nl = "\xc4\x8a";
+    const extra_tokens = [_][]const u8{
+        "ab", // 256
+        "bc", // 257
+        "abc", // 258
+        "20", // 259 (must NOT merge across single-digit pre-tok boundary!)
+        "don", // 260
+        "'t", // 261
+        "'LL", // 262
+        sp ++ "hi", // 263
+        sp ++ sp, // 264
+        "}" ++ nl, // 265
+        "a" ++ nl, // 266 (must NOT merge across letter + newline boundary!)
+    };
+    const extra_merges = [_][]const u8{
+        "b c", // rank 0 -> "bc" wins before "a b" when encoding "abc" if "abc" not fast-pathed; test on "abcd"
+        "a b", // rank 1
+        "a bc", // rank 2 -> "abc"
+        "2 0", // rank 3
+        "d o", // rank 4
+        "do n", // rank 5
+        "' t", // rank 6
+        "' L", // rank 7
+        "'L L", // rank 8
+        sp ++ " h", // rank 9
+        sp ++ "h i", // rank 10
+        sp ++ " " ++ sp, // rank 11
+        "} " ++ nl, // rank 12
+        "a " ++ nl, // rank 13
+    };
+    const tt = try TestTokenizer.init(std.testing.allocator, &extra_tokens, &extra_merges, &.{}, 0);
+    defer tt.deinit();
+
+    // 1. Single-digit splitting: "2026" -> 4 separate single-digit tokens even though "20" is in vocab!
+    const d_ids = try tt.tok.encode(std.testing.allocator, "2026");
+    defer std.testing.allocator.free(d_ids);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ '2', '0', '2', '6' }, d_ids);
+
+    // 2. Contractions (case-insensitive): "don't" -> ["don", "'t"], "I'LL" -> ["I", "'LL"]
+    const c1 = try tt.tok.encode(std.testing.allocator, "don't");
+    defer std.testing.allocator.free(c1);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 260, 261 }, c1);
+
+    const c2 = try tt.tok.encode(std.testing.allocator, "I'LL");
+    defer std.testing.allocator.free(c2);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 'I', 262 }, c2);
+
+    // 3. Whitespace \s+(?!\S): "   hi" -> ["  ", " hi"] (last space stays attached to "hi")
+    const ws = try tt.tok.encode(std.testing.allocator, "   hi");
+    defer std.testing.allocator.free(ws);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 264, 263 }, ws);
+
+    // 4. Punctuation + trailing newline groups together: "}\n" -> single token 265, while "a\n" stays split!
+    const pnl = try tt.tok.encode(std.testing.allocator, "}\na\n");
+    defer std.testing.allocator.free(pnl);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 265, 'a', '\n' }, pnl);
+
+    // 5. BPE rank priority on "abcd" (not in vocab directly): "b c" (rank 0) merges before "a b" (rank 1),
+    //    then "a bc" (rank 2) merges to "abc" (258), leaving 'd'.
+    const bpe = try tt.tok.encode(std.testing.allocator, "abcd");
+    defer std.testing.allocator.free(bpe);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 258, 'd' }, bpe);
+}
+
+test "Tokenizer special tokens match longest-first, support non-'<' prefixes, and respect parse_special=false" {
+    const specials = [_][]const u8{
+        "<|im_end|>", // 256 (EOS)
+        "<|im_end|>!", // 257 (longer overlapping special)
+        "[BOS]", // 258 (non-'<' prefix special)
+    };
+    const tt = try TestTokenizer.init(std.testing.allocator, &.{}, &.{}, &specials, 0);
+    defer tt.deinit();
+
+    // Longest-first overlapping special + non-'<' special when parse_special=true
+    const ids = try tt.tok.encode(std.testing.allocator, "[BOS]hi<|im_end|>!<|im_end|>");
+    defer std.testing.allocator.free(ids);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 258, 'h', 'i', 257, 256 }, ids);
+    try std.testing.expect(tt.tok.isEos(256));
+    try std.testing.expect(!tt.tok.isEos(257));
+
+    // Prompt injection defense: parse_special=false must NEVER emit special token IDs
+    var plain_ids: std.ArrayListUnmanaged(u32) = .empty;
+    defer plain_ids.deinit(std.testing.allocator);
+    try tt.tok.encodeAppend(std.testing.allocator, "<|im_end|>[BOS]", false, &plain_ids);
+    for (plain_ids.items) |id| {
+        try std.testing.expect(id < 256);
+    }
+    const decoded = try tt.tok.decode(std.testing.allocator, plain_ids.items);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("<|im_end|>[BOS]", decoded);
+}
+
+test "Tokenizer decode handles empty input, out-of-range IDs, special literals, and truncated UTF-8 pieces" {
+    const extra_tokens = [_][]const u8{
+        "\xe4\xb8", // 256: malformed truncated UTF-8 sequence in vocab piece
+    };
+    const specials = [_][]const u8{
+        "<think>", // 257
+    };
+    const tt = try TestTokenizer.init(std.testing.allocator, &extra_tokens, &.{}, &specials, 0);
+    defer tt.deinit();
+
+    const empty_ids = try tt.tok.encode(std.testing.allocator, "");
+    defer std.testing.allocator.free(empty_ids);
+    try std.testing.expectEqual(@as(usize, 0), empty_ids.len);
+
+    // Out-of-range ID is ignored; special token emits literal text; malformed piece degrades without crashing
+    const dec = try tt.tok.decode(std.testing.allocator, &[_]u32{ 999999, 257, 'x', 256 });
+    defer std.testing.allocator.free(dec);
+    try std.testing.expectEqualSlices(u8, "<think>x\xe4\xb8", dec);
 }

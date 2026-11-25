@@ -102,6 +102,7 @@ pub const TensorInfo = struct {
     pub fn checkedByteSize(self: *const TensorInfo) !u64 {
         const bs = self.ggml_type.blockSize();
         const ts = self.ggml_type.typeSize();
+        if (ts == 0) return error.InvalidGguf;
         const ne = try self.checkedNElements();
         if (ne % bs != 0) return error.InvalidGguf;
         return std.math.mul(u64, ne / bs, ts) catch return error.InvalidGguf;
@@ -433,4 +434,259 @@ test "gguf bounds and overflow checks reject malformed data" {
         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x3f, // len = huge
     };
     try std.testing.expectError(error.UnexpectedEof, skipValue(&bad_arr, &cur, 9, 0));
+
+    // Unknown GgmlType and non-block-aligned Q4_0 and dim overflow rejected
+    const bad_type: TensorInfo = .{
+        .name = "x",
+        .n_dims = 1,
+        .dims = .{ 32, 1, 1, 1 },
+        .ggml_type = @enumFromInt(999),
+        .offset = 0,
+    };
+    try std.testing.expectError(error.InvalidGguf, bad_type.checkedByteSize());
+
+    const unaligned_q4: TensorInfo = .{
+        .name = "x",
+        .n_dims = 1,
+        .dims = .{ 17, 1, 1, 1 },
+        .ggml_type = .q4_0,
+        .offset = 0,
+    };
+    try std.testing.expectError(error.InvalidGguf, unaligned_q4.checkedByteSize());
+
+    const overflow_dims: TensorInfo = .{
+        .name = "x",
+        .n_dims = 2,
+        .dims = .{ 1 << 40, 1 << 40, 1, 1 },
+        .ggml_type = .f32,
+        .offset = 0,
+    };
+    try std.testing.expectError(error.InvalidGguf, overflow_dims.checkedNElements());
+
+    // Deeply nested array recursion (depth > MAX_SKIP_DEPTH) rejected cleanly without stack overflow
+    var deep: std.ArrayListUnmanaged(u8) = .empty;
+    defer deep.deinit(std.testing.allocator);
+    for (0..MAX_SKIP_DEPTH + 2) |_| {
+        // elem_type = 9 (array), len = 1
+        try deep.appendSlice(std.testing.allocator, &[_]u8{ 9, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0 });
+    }
+    try deep.appendSlice(std.testing.allocator, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    cur = 0;
+    try std.testing.expectError(error.InvalidGguf, skipValue(deep.items, &cur, 9, 0));
+}
+
+const TestGgufWriter = struct {
+    allocator: std.mem.Allocator,
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn deinit(self: *TestGgufWriter) void {
+        self.buf.deinit(self.allocator);
+    }
+    fn putInt(self: *TestGgufWriter, comptime T: type, v: T) !void {
+        var b: [@sizeOf(T)]u8 = undefined;
+        std.mem.writeInt(T, &b, v, .little);
+        try self.buf.appendSlice(self.allocator, &b);
+    }
+    fn putStr(self: *TestGgufWriter, s: []const u8) !void {
+        try self.putInt(u64, s.len);
+        try self.buf.appendSlice(self.allocator, s);
+    }
+    fn writeTempAndOpen(self: *const TestGgufWriter, name_z: [*:0]const u8, allocator: std.mem.Allocator) !GgufFile {
+        const O_WRONLY_CREAT_TRUNC: c_int = 0o1101;
+        const fd = posix.open(name_z, O_WRONLY_CREAT_TRUNC, @as(c_uint, 0o600));
+        if (fd < 0) return error.OpenFailed;
+        var off: usize = 0;
+        while (off < self.buf.items.len) {
+            const n = std.c.write(fd, self.buf.items.ptr + off, self.buf.items.len - off);
+            if (n <= 0) {
+                _ = posix.close(fd);
+                return error.WriteFailed;
+            }
+            off += @intCast(n);
+        }
+        _ = posix.close(fd);
+        return GgufFile.open(allocator, name_z);
+    }
+};
+
+test "GgufFile.open parses valid synthetic v3 file, metadata, tokenizer meta, dflash layers, and tensor bytes" {
+    var w: TestGgufWriter = .{ .allocator = std.testing.allocator };
+    defer w.deinit();
+
+    // Header: magic, version=3, n_tensors=1, n_kv=8
+    try w.buf.appendSlice(std.testing.allocator, "GGUF");
+    try w.putInt(u32, 3);
+    try w.putInt(u64, 1);
+    try w.putInt(u64, 8);
+
+    // KV 1: general.alignment = 64
+    try w.putStr("general.alignment");
+    try w.putInt(u32, 4);
+    try w.putInt(u32, 64);
+
+    // KV 2: general.architecture = "qwen3"
+    try w.putStr("general.architecture");
+    try w.putInt(u32, 8);
+    try w.putStr("qwen3");
+
+    // KV 3: skipped f64 scalar (vtype 12)
+    try w.putStr("misc.scale");
+    try w.putInt(u32, 12);
+    try w.putInt(u64, 0x3ff0_0000_0000_0000);
+
+    // KV 4: tokenizer.ggml.tokens = ["a", "<|im_end|>"]
+    try w.putStr("tokenizer.ggml.tokens");
+    try w.putInt(u32, 9);
+    try w.putInt(u32, 8);
+    try w.putInt(u64, 2);
+    try w.putStr("a");
+    try w.putStr("<|im_end|>");
+
+    // KV 5: tokenizer.ggml.merges = ["a b"]
+    try w.putStr("tokenizer.ggml.merges");
+    try w.putInt(u32, 9);
+    try w.putInt(u32, 8);
+    try w.putInt(u64, 1);
+    try w.putStr("a b");
+
+    // KV 6: tokenizer.ggml.token_type = [1, 3]
+    try w.putStr("tokenizer.ggml.token_type");
+    try w.putInt(u32, 9);
+    try w.putInt(u32, 5);
+    try w.putInt(u64, 2);
+    try w.putInt(i32, 1);
+    try w.putInt(i32, 3);
+
+    // KV 7: tokenizer.ggml.eos_token_id = 1
+    try w.putStr("tokenizer.ggml.eos_token_id");
+    try w.putInt(u32, 4);
+    try w.putInt(u32, 1);
+
+    // KV 8: dflash.target_layers = [4, 16, 32] (i32)
+    try w.putStr("dflash.target_layers");
+    try w.putInt(u32, 9);
+    try w.putInt(u32, 5);
+    try w.putInt(u64, 3);
+    try w.putInt(i32, 4);
+    try w.putInt(i32, 16);
+    try w.putInt(i32, 32);
+
+    // Tensor 0: "w.weight", 1D [4], F32 (16 bytes), offset 0
+    try w.putStr("w.weight");
+    try w.putInt(u32, 1);
+    try w.putInt(u64, 4);
+    try w.putInt(u32, 0); // f32
+    try w.putInt(u64, 0);
+
+    // Pad to 64-byte alignment + append 16 bytes of tensor payload
+    while (w.buf.items.len % 64 != 0) try w.buf.append(std.testing.allocator, 0);
+    const payload = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    try w.buf.appendSlice(std.testing.allocator, &payload);
+
+    const path_z = "/tmp/kintsugi_test_valid.gguf";
+    defer _ = std.c.unlink(path_z);
+
+    var gf = try w.writeTempAndOpen(path_z, std.testing.allocator);
+    defer gf.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 3), gf.version);
+    try std.testing.expectEqual(@as(u64, 64), gf.alignment);
+    try std.testing.expectEqualStrings("qwen3", gf.architecture);
+
+    const ti = gf.find("w.weight").?;
+    try std.testing.expectEqualSlices(u8, &payload, gf.tensorBytes(ti));
+    try std.testing.expect(gf.find("missing") == null);
+
+    var tmeta = try gf.readTokenizerMeta(std.testing.allocator);
+    defer tmeta.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), tmeta.tokens.len);
+    try std.testing.expectEqualStrings("a", tmeta.tokens[0]);
+    try std.testing.expectEqualStrings("<|im_end|>", tmeta.tokens[1]);
+    try std.testing.expectEqual(@as(usize, 1), tmeta.merges.len);
+    try std.testing.expectEqual(@as(u32, 1), tmeta.eos_id);
+
+    var layers: [5]u32 = undefined;
+    const n_layers = try gf.readDflashTargetLayers(&layers);
+    try std.testing.expectEqual(@as(usize, 3), n_layers);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 4, 16, 32 }, layers[0..3]);
+}
+
+test "GgufFile.open and readDflashTargetLayers reject bad magic, version, dims, EOF tensor, and negative layers" {
+    const path_z = "/tmp/kintsugi_test_bad.gguf";
+    defer _ = std.c.unlink(path_z);
+
+    // 1. Bad magic
+    {
+        var w: TestGgufWriter = .{ .allocator = std.testing.allocator };
+        defer w.deinit();
+        const pad: [24]u8 = @splat(0);
+        try w.buf.appendSlice(std.testing.allocator, "NOPE");
+        try w.buf.appendSlice(std.testing.allocator, &pad);
+        try std.testing.expectError(error.InvalidMagic, w.writeTempAndOpen(path_z, std.testing.allocator));
+    }
+
+    // 2. Unsupported version 4
+    {
+        var w: TestGgufWriter = .{ .allocator = std.testing.allocator };
+        defer w.deinit();
+        try w.buf.appendSlice(std.testing.allocator, "GGUF");
+        try w.putInt(u32, 4);
+        try w.putInt(u64, 0);
+        try w.putInt(u64, 0);
+        try std.testing.expectError(error.UnsupportedVersion, w.writeTempAndOpen(path_z, std.testing.allocator));
+    }
+
+    // 3. Tensor with n_dims > 4
+    {
+        var w: TestGgufWriter = .{ .allocator = std.testing.allocator };
+        defer w.deinit();
+        try w.buf.appendSlice(std.testing.allocator, "GGUF");
+        try w.putInt(u32, 3);
+        try w.putInt(u64, 1);
+        try w.putInt(u64, 0);
+        try w.putStr("bad");
+        try w.putInt(u32, 5);
+        try std.testing.expectError(error.TooManyDims, w.writeTempAndOpen(path_z, std.testing.allocator));
+    }
+
+    // 4. Tensor byte range extending past EOF
+    {
+        var w: TestGgufWriter = .{ .allocator = std.testing.allocator };
+        defer w.deinit();
+        try w.buf.appendSlice(std.testing.allocator, "GGUF");
+        try w.putInt(u32, 3);
+        try w.putInt(u64, 1);
+        try w.putInt(u64, 0);
+        try w.putStr("trunc");
+        try w.putInt(u32, 1);
+        try w.putInt(u64, 64); // 256 bytes needed
+        try w.putInt(u32, 0); // f32
+        try w.putInt(u64, 0);
+        while (w.buf.items.len % 32 != 0) try w.buf.append(std.testing.allocator, 0);
+        const partial_data: [16]u8 = @splat(0);
+        try w.buf.appendSlice(std.testing.allocator, &partial_data); // only 16 bytes present
+        try std.testing.expectError(error.UnexpectedEof, w.writeTempAndOpen(path_z, std.testing.allocator));
+    }
+
+    // 5. Negative i32 in dflash.target_layers rejected cleanly
+    {
+        var w: TestGgufWriter = .{ .allocator = std.testing.allocator };
+        defer w.deinit();
+        try w.buf.appendSlice(std.testing.allocator, "GGUF");
+        try w.putInt(u32, 3);
+        try w.putInt(u64, 0);
+        try w.putInt(u64, 1);
+        try w.putStr("dflash.target_layers");
+        try w.putInt(u32, 9);
+        try w.putInt(u32, 5);
+        try w.putInt(u64, 2);
+        try w.putInt(i32, 4);
+        try w.putInt(i32, -1);
+        while (w.buf.items.len % 32 != 0) try w.buf.append(std.testing.allocator, 0);
+
+        var gf = try w.writeTempAndOpen(path_z, std.testing.allocator);
+        defer gf.deinit(std.testing.allocator);
+        var layers: [5]u32 = undefined;
+        try std.testing.expectError(error.InvalidTargetLayers, gf.readDflashTargetLayers(&layers));
+    }
 }

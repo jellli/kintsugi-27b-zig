@@ -1072,6 +1072,7 @@ test {
     _ = gguf;
     _ = escha_ref;
     _ = tokenizer_mod;
+    _ = engine_mod;
     _ = dflash_mod;
     _ = server_mod;
 }

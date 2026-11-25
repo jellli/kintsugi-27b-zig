@@ -1006,28 +1006,26 @@ fn bump(off: *usize, bytes: usize) usize {
 
 /// Top-k + top-p + temperature sampler on the exact Stage-2 Top-64 candidates!
 pub fn sampleFromCandidates(cands: *const CandidateList, temp: f32, top_k: u32, top_p: f32, rng: *std.Random.DefaultPrng) u32 {
-    if (temp <= 0.0 or top_k == 1) {
-        var best_idx: usize = 0;
-        var best_v: f32 = cands.logits[0];
-        for (1..TOPK_K) |i| {
-            if (cands.logits[i] > best_v) {
-                best_v = cands.logits[i];
-                best_idx = i;
-            }
-        }
-        return @intCast(@max(0, cands.ids[best_idx]));
-    }
-
     const Entry = struct { id: u32, val: f32 };
     var entries: [TOPK_K]Entry = undefined;
     var n: usize = 0;
     for (0..TOPK_K) |i| {
-        if (cands.ids[i] >= 0) {
+        if (cands.ids[i] >= 0 and !std.math.isNan(cands.logits[i])) {
             entries[n] = .{ .id = @intCast(cands.ids[i]), .val = cands.logits[i] };
             n += 1;
         }
     }
     if (n == 0) return 0;
+
+    // Greedy fast path (also handles non-finite temp, top_k == 1, or non-positive top_p)
+    const greedy = !std.math.isFinite(temp) or temp <= 0.0 or top_k == 1 or (!std.math.isNan(top_p) and top_p <= 0.0);
+    if (greedy) {
+        var best = entries[0];
+        for (entries[1..n]) |e| {
+            if (e.val > best.val) best = e;
+        }
+        return best.id;
+    }
 
     std.mem.sort(Entry, entries[0..n], {}, struct {
         fn gt(_: void, a: Entry, b: Entry) bool {
@@ -1035,23 +1033,29 @@ pub fn sampleFromCandidates(cands: *const CandidateList, temp: f32, top_k: u32, 
         }
     }.gt);
 
+    const max_v = entries[0].val;
+    if (!std.math.isFinite(max_v)) return entries[0].id;
+
     const k_lim = if (top_k > 0 and top_k < n) @as(usize, top_k) else n;
     const inv_t: f32 = 1.0 / temp;
-    const max_v = entries[0].val;
     var probs: [TOPK_K]f32 = undefined;
     var sum: f32 = 0.0;
     for (0..k_lim) |i| {
-        const p = @exp((entries[i].val - max_v) * inv_t);
+        const diff = entries[i].val - max_v;
+        const p = if (std.math.isFinite(diff)) @exp(diff * inv_t) else 0.0;
         probs[i] = p;
         sum += p;
     }
+    if (!(sum > 0.0) or !std.math.isFinite(sum)) return entries[0].id;
+
+    const eff_top_p: f32 = if (std.math.isNan(top_p) or top_p > 1.0) 1.0 else top_p;
     const inv_sum = 1.0 / sum;
     var cum: f32 = 0.0;
     var cut: usize = k_lim;
     for (0..k_lim) |i| {
         probs[i] *= inv_sum;
         cum += probs[i];
-        if (cum >= top_p) {
+        if (cum >= eff_top_p) {
             cut = i + 1;
             break;
         }
@@ -1063,4 +1067,85 @@ pub fn sampleFromCandidates(cands: *const CandidateList, temp: f32, top_k: u32, 
         if (r <= acc) return entries[i].id;
     }
     return entries[cut - 1].id;
+}
+
+test "sampleFromCandidates greedy ignores invalid slots, NaN, and handles non-finite temp" {
+    var cands: CandidateList = .{
+        .logits = @splat(-std.math.inf(f32)),
+        .ids = @splat(-1),
+    };
+    // Slot 0 invalid with huge logit, slot 1 NaN, slot 2 valid (1.5), slot 3 valid (4.2)
+    cands.ids[0] = -1;
+    cands.logits[0] = 999.0;
+    cands.ids[1] = 10;
+    cands.logits[1] = std.math.nan(f32);
+    cands.ids[2] = 20;
+    cands.logits[2] = 1.5;
+    cands.ids[3] = 30;
+    cands.logits[3] = 4.2;
+
+    var rng = std.Random.DefaultPrng.init(42);
+    try std.testing.expectEqual(@as(u32, 30), sampleFromCandidates(&cands, 0.0, 64, 0.95, &rng));
+    try std.testing.expectEqual(@as(u32, 30), sampleFromCandidates(&cands, -1.0, 64, 0.95, &rng));
+    try std.testing.expectEqual(@as(u32, 30), sampleFromCandidates(&cands, 0.8, 1, 0.95, &rng));
+    try std.testing.expectEqual(@as(u32, 30), sampleFromCandidates(&cands, 0.8, 64, 0.0, &rng));
+    try std.testing.expectEqual(@as(u32, 30), sampleFromCandidates(&cands, std.math.nan(f32), 64, 0.95, &rng));
+    try std.testing.expectEqual(@as(u32, 30), sampleFromCandidates(&cands, std.math.inf(f32), 64, 0.95, &rng));
+
+    // +Inf logit must fall back cleanly to that candidate instead of NaN softmax
+    cands.ids[4] = 40;
+    cands.logits[4] = std.math.inf(f32);
+    try std.testing.expectEqual(@as(u32, 40), sampleFromCandidates(&cands, 0.7, 64, 0.95, &rng));
+
+    // All invalid / NaN returns 0 safely
+    var empty: CandidateList = .{
+        .logits = @splat(std.math.nan(f32)),
+        .ids = @splat(-1),
+    };
+    try std.testing.expectEqual(@as(u32, 0), sampleFromCandidates(&empty, 0.7, 64, 0.95, &rng));
+}
+
+test "sampleFromCandidates respects top_k, top_p, top_k=0, and seed determinism" {
+    var cands: CandidateList = .{
+        .logits = @splat(-std.math.inf(f32)),
+        .ids = @splat(-1),
+    };
+    // Unsorted order on purpose
+    cands.ids[0] = 100;
+    cands.logits[0] = 1.0;
+    cands.ids[1] = 200;
+    cands.logits[1] = 10.0; // rank 1 (~0.731 at temp=1 with rank 2 = 9.0)
+    cands.ids[2] = 300;
+    cands.logits[2] = 9.0; // rank 2 (~0.269)
+    cands.ids[3] = 400;
+    cands.logits[3] = 8.9; // rank 3
+
+    // top_k = 2 must ONLY draw from {200, 300}
+    var rng1 = std.Random.DefaultPrng.init(12345);
+    var rng2 = std.Random.DefaultPrng.init(12345);
+    var seen_200 = false;
+    var seen_300 = false;
+    for (0..100) |_| {
+        const a = sampleFromCandidates(&cands, 1.0, 2, 1.0, &rng1);
+        const b = sampleFromCandidates(&cands, 1.0, 2, 1.0, &rng2);
+        try std.testing.expectEqual(a, b); // deterministic under same seed
+        try std.testing.expect(a == 200 or a == 300);
+        if (a == 200) seen_200 = true;
+        if (a == 300) seen_300 = true;
+    }
+    try std.testing.expect(seen_200 and seen_300);
+
+    // top_k = 0 means no top-k cap (all valid candidates eligible); tight top_p = 0.5 forces top-1 (200)
+    for (0..50) |_| {
+        const tok = sampleFromCandidates(&cands, 1.0, 0, 0.5, &rng1);
+        try std.testing.expectEqual(@as(u32, 200), tok);
+    }
+
+    // With high temperature and top_k=0, top_p=1.0, even rank-4 (100) is reachable
+    var seen_400 = false;
+    for (0..100) |_| {
+        const tok = sampleFromCandidates(&cands, 2.0, 0, 1.0, &rng1);
+        if (tok == 400) seen_400 = true;
+    }
+    try std.testing.expect(seen_400);
 }

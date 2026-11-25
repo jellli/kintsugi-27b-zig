@@ -118,3 +118,18 @@ test "Qwen3.8-27B layer topology and KV byte math" {
     // 262,144 * 18,432 = 4,831,838,208 B (4608 MiB)
     try std.testing.expectEqual(@as(u64, 4_831_838_208), @as(u64, ModelSpec.max_ctx) * ModelSpec.kv_bytes_per_token);
 }
+
+test "VramPlan.compute handles tight/underflow budgets safely and aligns KV cells to 4096 pages" {
+    const std = @import("std");
+    // Underflow case: free_bytes < safety margin must saturate cleanly to 0 KV cells
+    const tiny = VramPlan.compute(12 << 30, 100 << 20, 8 << 30, 200 << 20, 50 << 20, 512);
+    try std.testing.expectEqual(@as(u64, 0), tiny.available_for_kv_bytes);
+    try std.testing.expectEqual(@as(u64, 0), tiny.max_vram_kv_cells);
+    try std.testing.expectEqual(tiny.full_256k_kv_bytes, tiny.host_spill_bytes);
+
+    // Realistic 12 GiB card with ~2.5 GiB left for KV
+    const plan = VramPlan.compute(12 << 30, 11_500 << 20, 8_100 << 20, 200 << 20, 50 << 20, 256);
+    try std.testing.expect(plan.max_vram_kv_cells > 0);
+    try std.testing.expectEqual(@as(u64, 0), plan.max_vram_kv_cells % 4096);
+    try std.testing.expect(plan.max_vram_kv_cells * ModelSpec.kv_bytes_per_token <= plan.available_for_kv_bytes);
+}
