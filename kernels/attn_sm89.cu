@@ -714,3 +714,440 @@ extern "C" __global__ void __launch_bounds__(144, 4) attn_compact_branch_b_kv(
     const uint32_t* src = reinterpret_cast<const uint32_t*>(base + (size_t)(pos_base + 5 + k) * tok_bytes);
     dst[tid] = src[tid];
 }
+
+// =============================================================================
+// 7. Native sm_89 Tensor Core (m16n8k16) GQA6x8 Split-K Q4_0 FlashAttention
+//    Unifies high-throughput M=8 speculative decode AND long-context prefill!
+//
+//    1 Block = 1 KV head x 6 GQA Q-heads x 8 tokens = 48 queries (3 x m16 tiles).
+//    - Block : (192, 1, 1) = 6 warps = 3 Q-tiles x 2 D-halves (128 dims/warp)
+//    - Grid  : (4, ceil(n_tokens / 8), n_splits)
+//    - Q stays 100% in registers (32 regs/thread, pre-scaled by ATTN_SCALE = 1/16)
+//    - O stays 100% in registers (64 regs/thread = 16 m16n8 tiles covering 128 dims)
+//    - Shared memory: sh_k[16][264] + sh_v[16][264] + sh_s[2][3][2][32] = 22.5 KiB
+//      (0% bank conflicts for ldmatrix.x4 and ldmatrix.x4.trans, 2 blocks/SM = 12 warps/SM)
+//    - Reads 76K Q4_0 KV ONCE for all M=8 draft tokens (2x less DRAM than GQA6x4!)
+//      and executes QK^T + PV on FP16 Tensor Cores (158+ TFLOPS) with 0 register spills.
+// =============================================================================
+#define FA_MMA_BC 16
+#define FA_MMA_LD 264 // 256 + 8 halfs: 16B aligned & 100% bank-conflict-free for ldmatrix
+
+static __device__ __forceinline__ void mma_m16n8k16_f32_f16(
+    float4& d,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1
+) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+        : "+f"(d.x), "+f"(d.y), "+f"(d.z), "+f"(d.w)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1)
+    );
+}
+
+static __device__ __forceinline__ void ldmatrix_x4(
+    uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3,
+    const void* smem_ptr
+) {
+    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+        : "r"(addr)
+    );
+}
+
+static __device__ __forceinline__ void ldmatrix_x4_trans(
+    uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3,
+    const void* smem_ptr
+) {
+    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+        : "r"(addr)
+    );
+}
+
+static __device__ __forceinline__ void cp_async_16(void* smem_ptr, const void* glob_ptr) {
+    const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(glob_ptr));
+}
+
+static __device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+static __device__ __forceinline__ void cp_async_wait_all() {
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+}
+
+static __device__ __forceinline__ void dequant_q4_0_8_h4(
+    const uint8_t* head_ptr,
+    int blk,
+    int sub,
+    half4& out_lo,
+    half4& out_hi
+) {
+    const uint16_t* b16 = reinterpret_cast<const uint16_t*>(head_ptr + blk * Q4_0_BLOCK_BYTES);
+    const uint16_t d_bits = b16[0];
+    const half2 d_h2 = __half2half2(__ushort_as_half(d_bits));
+    const uint32_t q01 = b16[1 + sub * 2];
+    const uint32_t q23 = b16[2 + sub * 2];
+
+    // IEEE FP16 bit-hack: 0x6400 | n == 1024.0h + n (exact for n in 0..15).
+    // Subtracting 0x6408 (1032.0h) yields exact (n - 8) in FP16 with zero overflow risk for any scale d.
+    const uint32_t bias_u32 = 0x64086408u;
+    const half2 bias_h2 = *reinterpret_cast<const half2*>(&bias_u32);
+
+    const uint32_t lo01_u = ((q01 & 0x000fu) | ((q01 & 0x0f00u) << 8)) | 0x64006400u;
+    const uint32_t lo23_u = ((q23 & 0x000fu) | ((q23 & 0x0f00u) << 8)) | 0x64006400u;
+    const uint32_t hi01_u = (((q01 >> 4) & 0x000fu) | ((q01 & 0xf000u) << 4)) | 0x64006400u;
+    const uint32_t hi23_u = (((q23 >> 4) & 0x000fu) | ((q23 & 0xf000u) << 4)) | 0x64006400u;
+
+    out_lo.x = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&lo01_u), bias_h2), d_h2);
+    out_lo.y = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&lo23_u), bias_h2), d_h2);
+    out_hi.x = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&hi01_u), bias_h2), d_h2);
+    out_hi.y = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&hi23_u), bias_h2), d_h2);
+}
+
+static __device__ __forceinline__ uint32_t pack_h2_scaled(float a, float b) {
+    const half2 h = __floats2half2_rn(a * ATTN_SCALE, b * ATTN_SCALE);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+static __device__ __forceinline__ uint32_t pack_h2(float a, float b) {
+    const half2 h = __floats2half2_rn(a, b);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+template <bool IS_TREE, int Q_TOKENS>
+static __device__ __forceinline__ void attn_mma_q4_0_gqa6_sm89_impl(
+    const float* __restrict__ q_rot,        // [n_tokens, 24, 256]
+    const uint8_t* __restrict__ k_cache_q4, // [max_cells, 4, 144]
+    const uint8_t* __restrict__ v_cache_q4, // [max_cells, 4, 144]
+    float* __restrict__ part_o,             // [n_tokens, 24, n_splits, 256]
+    float* __restrict__ part_m,             // [n_tokens, 24, n_splits]
+    float* __restrict__ part_l,             // [n_tokens, 24, n_splits]
+    int pos_base,
+    int n_tokens,
+    int n_splits
+) {
+    constexpr int N_QTILES = (Q_TOKENS / 8) * 3; // 3 for Q_TOKENS=8 (192 thr), 6 for Q_TOKENS=16 (384 thr)
+    constexpr int N_WARPS = N_QTILES * 2;
+    constexpr int N_THREADS = N_WARPS * 32;
+
+    const int hkv = blockIdx.x;               // 0..3
+    const int t_base = blockIdx.y * Q_TOKENS; // 0, Q_TOKENS, ...
+    const int sp = blockIdx.z;                // 0..n_splits-1
+    const int tid = threadIdx.x;              // 0..N_THREADS-1
+    const int warp = tid >> 5;                // 0..N_WARPS-1
+    const int lane = tid & 31;                // 0..31
+
+    const int q_tile = warp >> 1;             // 0..N_QTILES-1
+    const int d_half = warp & 1;              // 0 (dims 0..127) or 1 (dims 128..255)
+    const int d_base = d_half * 128;
+
+    const int g = lane >> 2;                  // 0..7 (token offset inside 8-token sub-block)
+    const int tid_g = lane & 3;               // 0..3 (pair index inside 8-col MMA tile)
+
+    const int t_sub = (Q_TOKENS == 8) ? 0 : ((q_tile >= 3) ? 8 : 0);
+    const int h_sub = (Q_TOKENS == 8) ? q_tile : ((q_tile >= 3) ? (q_tile - 3) : q_tile);
+
+    // Mapping: row_lo = (hq_lo, t), row_hi = (hq_hi, t) — BOTH share the exact same token index `t`!
+    const int t = t_base + t_sub + g;
+    const bool t_valid = (t < n_tokens);
+    const int hq_lo = hkv * 6 + h_sub * 2;
+    const int hq_hi = hq_lo + 1;
+
+    // 1. Load Q into registers directly in m16n8k16 A-fragment layout (pre-scaled by 1/16)
+    uint32_t qa[8][4];
+    if (t_valid) {
+        const float* q_ptr_lo = q_rot + ((size_t)t * ATTN_HQ + hq_lo) * ATTN_D + d_base;
+        const float* q_ptr_hi = q_rot + ((size_t)t * ATTN_HQ + hq_hi) * ATTN_D + d_base;
+        #pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            const int d0 = ks * 16 + tid_g * 2;
+            qa[ks][0] = pack_h2_scaled(q_ptr_lo[d0 + 0], q_ptr_lo[d0 + 1]);
+            qa[ks][1] = pack_h2_scaled(q_ptr_hi[d0 + 0], q_ptr_hi[d0 + 1]);
+            qa[ks][2] = pack_h2_scaled(q_ptr_lo[d0 + 8], q_ptr_lo[d0 + 9]);
+            qa[ks][3] = pack_h2_scaled(q_ptr_hi[d0 + 8], q_ptr_hi[d0 + 9]);
+        }
+    } else {
+        #pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            qa[ks][0] = 0u; qa[ks][1] = 0u; qa[ks][2] = 0u; qa[ks][3] = 0u;
+        }
+    }
+
+    // 2. Initialize O accumulators (16 m16n8 tiles = 128 dims) and online softmax state
+    float4 o[16];
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) {
+        o[dt] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    float m_lo = -1.0e30f, l_lo = 0.0f;
+    float m_hi = -1.0e30f, l_hi = 0.0f;
+
+    const int max_t_in_blk = (t_base + Q_TOKENS < n_tokens) ? (t_base + Q_TOKENS) : n_tokens;
+    const int max_seq_len = pos_base + max_t_in_blk;
+    const int chunk = (max_seq_len + n_splits - 1) / n_splits;
+    const int p_start = sp * chunk;
+    const int p_end = (p_start + chunk < max_seq_len) ? (p_start + chunk) : max_seq_len;
+
+    const int causal_limit = pos_base + t;
+    const size_t kv_stride = (size_t)ATTN_HKV * Q4_0_HEAD_BYTES;
+    const uint8_t* k_base = k_cache_q4 + (size_t)hkv * Q4_0_HEAD_BYTES;
+    const uint8_t* v_base = v_cache_q4 + (size_t)hkv * Q4_0_HEAD_BYTES;
+
+    // Shared memory: 31.5 KiB (Q_TOKENS=8, 2 blks/SM) or 37.5 KiB (Q_TOKENS=16, 1 blk/SM)
+    __shared__ __align__(16) __half sh_k[FA_MMA_BC][FA_MMA_LD];
+    __shared__ __align__(16) __half sh_v[FA_MMA_BC][FA_MMA_LD];
+    __shared__ __align__(16) float4 sh_s[2][N_QTILES][2][32]; // [d_half][q_tile][0=s0,1=s1][lane]
+    __shared__ __align__(16) uint8_t sh_q4[2][32][Q4_0_HEAD_BYTES]; // 2-stage cp.async raw Q4_0 ring (9 KiB)
+
+    const int blk = lane >> 2;         // 0..7 (Q4_0 block index)
+    const int sub = lane & 3;          // 0..3 (sub-chunk of 4 low + 4 high elems)
+    const int idx_lo = blk * 32 + sub * 4;
+    const int idx_hi = idx_lo + 16;
+
+    // Precompute ldmatrix lane offsets (constant across all tiles)
+    const int mat = lane >> 3;         // 0..3
+    const int r_in_mat = lane & 7;     // 0..7
+    const int k_ld_row = ((mat >> 1) * 8) + r_in_mat;
+    const int k_ld_col_off = (mat & 1) * 8;
+    const int v_ld_row = ((mat & 1) * 8) + r_in_mat;
+    const int v_ld_col_off = (mat >> 1) * 8;
+
+    // Precompute 16B cp.async chunk assignments (32 items x 9 chunks = 288 chunks)
+    const int cp_item0 = tid / 9;
+    const int cp_off0 = (tid - cp_item0 * 9) * 16;
+    const bool cp_isv0 = (cp_item0 >= 16);
+    const int cp_ploc0 = cp_isv0 ? (cp_item0 - 16) : cp_item0;
+
+    const int tid1 = tid + N_THREADS;
+    const int cp_item1 = (tid1 < 288) ? (tid1 / 9) : 0;
+    const int cp_off1 = (tid1 < 288) ? ((tid1 - cp_item1 * 9) * 16) : 0;
+    const bool cp_isv1 = (cp_item1 >= 16);
+    const int cp_ploc1 = cp_isv1 ? (cp_item1 - 16) : cp_item1;
+
+    auto issue_q4_tile = [&](int p_t, int t_len, int stage) {
+        if (tid < 288 && cp_ploc0 < t_len) {
+            const uint8_t* src = (cp_isv0 ? v_base : k_base) + (size_t)(p_t + cp_ploc0) * kv_stride + cp_off0;
+            cp_async_16(&sh_q4[stage][cp_item0][cp_off0], src);
+        }
+        if (tid1 < 288 && cp_ploc1 < t_len) {
+            const uint8_t* src = (cp_isv1 ? v_base : k_base) + (size_t)(p_t + cp_ploc1) * kv_stride + cp_off1;
+            cp_async_16(&sh_q4[stage][cp_item1][cp_off1], src);
+        }
+        cp_async_commit();
+    };
+
+    const half4 h4_zero = { __floats2half2_rn(0.0f, 0.0f), __floats2half2_rn(0.0f, 0.0f) };
+    const int n_tiles = (p_end > p_start) ? ((p_end - p_start + FA_MMA_BC - 1) / FA_MMA_BC) : 0;
+
+    if (n_tiles > 0) {
+        const int t_len0 = (p_start + FA_MMA_BC < p_end) ? FA_MMA_BC : (p_end - p_start);
+        issue_q4_tile(p_start, t_len0, 0);
+        cp_async_wait_all();
+        __syncthreads();
+    }
+
+    for (int ti = 0; ti < n_tiles; ++ti) {
+        const int p_tile = p_start + ti * FA_MMA_BC;
+        const int tile_len = (p_tile + FA_MMA_BC < p_end) ? FA_MMA_BC : (p_end - p_tile);
+        const int cur = ti & 1;
+        const int nxt = cur ^ 1;
+
+        // Stage A: Dequantize 16 K + 16 V heads from shared sh_q4[cur] -> sh_k / sh_v (zero DRAM stalls!)
+        #pragma unroll
+        for (int item = warp; item < 32; item += N_WARPS) {
+            const bool is_v = (item >= 16);
+            const int p_loc = is_v ? (item - 16) : item;
+            half4 hlo, hhi;
+            if (p_loc < tile_len) {
+                dequant_q4_0_8_h4(sh_q4[cur][item], blk, sub, hlo, hhi);
+            } else {
+                hlo = h4_zero;
+                hhi = h4_zero;
+            }
+            __half* dst_row = is_v ? sh_v[p_loc] : sh_k[p_loc];
+            *reinterpret_cast<half4*>(dst_row + idx_lo) = hlo;
+            *reinterpret_cast<half4*>(dst_row + idx_hi) = hhi;
+        }
+        __syncthreads();
+
+        // Prefetch NEXT tile's raw Q4_0 K+V asynchronously while Tensor Cores run QK^T + Softmax + PV!
+        if (ti + 1 < n_tiles) {
+            const int p_next = p_tile + FA_MMA_BC;
+            const int next_len = (p_next + FA_MMA_BC < p_end) ? FA_MMA_BC : (p_end - p_next);
+            issue_q4_tile(p_next, next_len, nxt);
+        }
+
+        // Stage B: Compute partial S_half = Q_half @ K_half^T via 16 FP16 Tensor Core MMAs
+        float4 s0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 s1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        #pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            uint32_t kb0, kb1, kb2, kb3;
+            ldmatrix_x4(kb0, kb1, kb2, kb3, &sh_k[k_ld_row][d_base + ks * 16 + k_ld_col_off]);
+            mma_m16n8k16_f32_f16(s0, qa[ks][0], qa[ks][1], qa[ks][2], qa[ks][3], kb0, kb1);
+            mma_m16n8k16_f32_f16(s1, qa[ks][0], qa[ks][1], qa[ks][2], qa[ks][3], kb2, kb3);
+        }
+
+        // Exchange S_lo <-> S_hi across the two D-half warps (128B coalesced, zero bank conflict)
+        sh_s[d_half][q_tile][0][lane] = s0;
+        sh_s[d_half][q_tile][1][lane] = s1;
+        __syncthreads();
+
+        const int other = d_half ^ 1;
+        const float4 os0 = sh_s[other][q_tile][0][lane];
+        const float4 os1 = sh_s[other][q_tile][1][lane];
+        s0.x += os0.x; s0.y += os0.y; s0.z += os0.z; s0.w += os0.w;
+        s1.x += os1.x; s1.y += os1.y; s1.z += os1.z; s1.w += os1.w;
+
+        // Stage C: Causal / Tree Mask + Register-Resident Online Softmax (only 2 warp shuffles!)
+        const int c0 = 2 * tid_g;
+        const int c1 = c0 + 1;
+        const int c2 = 8 + c0;
+        const int c3 = c2 + 1;
+
+        auto col_valid = [&](int c) -> bool {
+            if (!t_valid || c >= tile_len) return false;
+            const int p_cur = p_tile + c;
+            if (p_cur > causal_limit) return false;
+            if constexpr (IS_TREE) {
+                if (t >= 5 && p_cur > pos_base && p_cur < pos_base + 5) return false;
+            }
+            return true;
+        };
+
+        const bool v0 = col_valid(c0);
+        const bool v1 = col_valid(c1);
+        const bool v2 = col_valid(c2);
+        const bool v3 = col_valid(c3);
+
+        if (!v0) { s0.x = -1.0e30f; s0.z = -1.0e30f; }
+        if (!v1) { s0.y = -1.0e30f; s0.w = -1.0e30f; }
+        if (!v2) { s1.x = -1.0e30f; s1.z = -1.0e30f; }
+        if (!v3) { s1.y = -1.0e30f; s1.w = -1.0e30f; }
+
+        // Row-wise max across the 4 threads holding the same row (lane ^ 1, lane ^ 2)
+        float m_blk_lo = fmaxf(fmaxf(s0.x, s0.y), fmaxf(s1.x, s1.y));
+        m_blk_lo = fmaxf(m_blk_lo, __shfl_xor_sync(0xffffffffu, m_blk_lo, 1));
+        m_blk_lo = fmaxf(m_blk_lo, __shfl_xor_sync(0xffffffffu, m_blk_lo, 2));
+
+        float m_blk_hi = fmaxf(fmaxf(s0.z, s0.w), fmaxf(s1.z, s1.w));
+        m_blk_hi = fmaxf(m_blk_hi, __shfl_xor_sync(0xffffffffu, m_blk_hi, 1));
+        m_blk_hi = fmaxf(m_blk_hi, __shfl_xor_sync(0xffffffffu, m_blk_hi, 2));
+
+        uint32_t pa0 = 0u, pa1 = 0u, pa2 = 0u, pa3 = 0u;
+        float alpha_lo = 1.0f, alpha_hi = 1.0f;
+        const bool has_lo = (m_blk_lo > -1.0e29f);
+        const bool has_hi = (m_blk_hi > -1.0e29f);
+
+        float l_blk_lo = 0.0f;
+        float m_new_lo = m_lo;
+        if (has_lo) {
+            m_new_lo = fmaxf(m_lo, m_blk_lo);
+            alpha_lo = (m_lo > -1.0e29f) ? ((m_new_lo == m_lo) ? 1.0f : __expf(m_lo - m_new_lo)) : 0.0f;
+            const float p0 = v0 ? __expf(s0.x - m_new_lo) : 0.0f;
+            const float p1 = v1 ? __expf(s0.y - m_new_lo) : 0.0f;
+            const float p2 = v2 ? __expf(s1.x - m_new_lo) : 0.0f;
+            const float p3 = v3 ? __expf(s1.y - m_new_lo) : 0.0f;
+            l_blk_lo = (p0 + p1) + (p2 + p3);
+            pa0 = pack_h2(p0, p1);
+            pa2 = pack_h2(p2, p3);
+        }
+        l_blk_lo += __shfl_xor_sync(0xffffffffu, l_blk_lo, 1);
+        l_blk_lo += __shfl_xor_sync(0xffffffffu, l_blk_lo, 2);
+        if (has_lo) {
+            l_lo = l_lo * alpha_lo + l_blk_lo;
+            m_lo = m_new_lo;
+        }
+
+        float l_blk_hi = 0.0f;
+        float m_new_hi = m_hi;
+        if (has_hi) {
+            m_new_hi = fmaxf(m_hi, m_blk_hi);
+            alpha_hi = (m_hi > -1.0e29f) ? ((m_new_hi == m_hi) ? 1.0f : __expf(m_hi - m_new_hi)) : 0.0f;
+            const float p0 = v0 ? __expf(s0.z - m_new_hi) : 0.0f;
+            const float p1 = v1 ? __expf(s0.w - m_new_hi) : 0.0f;
+            const float p2 = v2 ? __expf(s1.z - m_new_hi) : 0.0f;
+            const float p3 = v3 ? __expf(s1.w - m_new_hi) : 0.0f;
+            l_blk_hi = (p0 + p1) + (p2 + p3);
+            pa1 = pack_h2(p0, p1);
+            pa3 = pack_h2(p2, p3);
+        }
+        l_blk_hi += __shfl_xor_sync(0xffffffffu, l_blk_hi, 1);
+        l_blk_hi += __shfl_xor_sync(0xffffffffu, l_blk_hi, 2);
+        if (has_hi) {
+            l_hi = l_hi * alpha_hi + l_blk_hi;
+            m_hi = m_new_hi;
+        }
+
+        // Skip 64 FMULs on the ~99% of tiles where running max did not increase!
+        if (alpha_lo != 1.0f) {
+            #pragma unroll
+            for (int dt = 0; dt < 16; ++dt) {
+                o[dt].x *= alpha_lo;
+                o[dt].y *= alpha_lo;
+            }
+        }
+        if (alpha_hi != 1.0f) {
+            #pragma unroll
+            for (int dt = 0; dt < 16; ++dt) {
+                o[dt].z *= alpha_hi;
+                o[dt].w *= alpha_hi;
+            }
+        }
+
+        // Execute O += P @ V_half via 16 FP16 Tensor Core MMAs
+        #pragma unroll
+        for (int dp = 0; dp < 8; ++dp) {
+            uint32_t vb0, vb1, vb2, vb3;
+            ldmatrix_x4_trans(vb0, vb1, vb2, vb3, &sh_v[v_ld_row][d_base + dp * 16 + v_ld_col_off]);
+            mma_m16n8k16_f32_f16(o[2 * dp + 0], pa0, pa1, pa2, pa3, vb0, vb1);
+            mma_m16n8k16_f32_f16(o[2 * dp + 1], pa0, pa1, pa2, pa3, vb2, vb3);
+        }
+        if (ti + 1 < n_tiles) {
+            cp_async_wait_all();
+        }
+        __syncthreads();
+    }
+
+    // 3. Store partial (m, l, o) to Split-K buffers
+    if (t_valid) {
+        const size_t meta_lo = ((size_t)t * ATTN_HQ + hq_lo) * n_splits + sp;
+        const size_t meta_hi = ((size_t)t * ATTN_HQ + hq_hi) * n_splits + sp;
+        if (d_half == 0 && tid_g == 0) {
+            part_m[meta_lo] = m_lo;
+            part_l[meta_lo] = l_lo;
+            part_m[meta_hi] = m_hi;
+            part_l[meta_hi] = l_hi;
+        }
+        float* dst_lo = part_o + meta_lo * ATTN_D + d_base;
+        float* dst_hi = part_o + meta_hi * ATTN_D + d_base;
+        #pragma unroll
+        for (int dt = 0; dt < 16; ++dt) {
+            const int off = dt * 8 + tid_g * 2;
+            *reinterpret_cast<float2*>(dst_lo + off) = make_float2(o[dt].x, o[dt].y);
+            *reinterpret_cast<float2*>(dst_hi + off) = make_float2(o[dt].z, o[dt].w);
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(192, 2) attn_mma_q4_0_gqa6x8_sm89(
+    const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
+    float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, int pos_base, int n_tokens, int n_splits
+) { attn_mma_q4_0_gqa6_sm89_impl<false, 8>(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, pos_base, n_tokens, n_splits); }
+
+extern "C" __global__ void __launch_bounds__(192, 2) attn_mma_q4_0_gqa6x8_sm89_dpos(
+    const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
+    float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, const int* __restrict__ pos_ptr, int n_tokens, int n_splits
+) { attn_mma_q4_0_gqa6_sm89_impl<false, 8>(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, *pos_ptr, n_tokens, n_splits); }
+
+extern "C" __global__ void __launch_bounds__(192, 2) attn_mma_q4_0_gqa6x8_sm89_dpos_tree(
+    const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
+    float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, const int* __restrict__ pos_ptr, int n_tokens, int n_splits
+) { attn_mma_q4_0_gqa6_sm89_impl<true, 8>(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, *pos_ptr, n_tokens, n_splits); }

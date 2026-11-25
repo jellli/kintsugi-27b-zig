@@ -522,7 +522,7 @@ fn runAttnSuite(
     const M: usize = 8;
     const pos_base: usize = seq_len - M; // 2040..2047
     const n_splits_naive: usize = 4;
-    const n_splits_gqa6: usize = 7; // Grid (4, 2, 7) = 56 blocks = 1 single wave on 60 SMs!
+    const n_splits_gqa6: usize = 15; // Grid (4, 1, 15) = 60 blocks = exact 1.0 block/SM on 60 SMs!
     const HQ: usize = 24;
     const HKV: usize = 4;
     const D: usize = 256;
@@ -537,7 +537,7 @@ fn runAttnSuite(
     const fn_q = try mod.getFunction("attn_q_norm_mrope_split_f32");
     const fn_kv = try mod.getFunction("attn_k_norm_mrope_kv_q4_0_store");
     const fn_fa_naive = try mod.getFunction("attn_decode_q4_0_splitk_sm89");
-    const fn_fa_gqa6 = try mod.getFunction("attn_decode_q4_0_gqa6_sm89");
+    const fn_fa_gqa6 = try mod.getFunction("attn_mma_q4_0_gqa6x8_sm89");
     const fn_red = try mod.getFunction("attn_splitk_reduce_gate_had128_f16");
 
     const q_bias_b = model.tensorBytes(model.find("blk.3.attn_q.bias").?);
@@ -723,8 +723,8 @@ fn runAttnSuite(
         @ptrCast(@constCast(&d_xh)),
         @ptrCast(&p_ns_gqa6),
     };
-    const gqa6_ty: u32 = @intCast((M + 3) / 4);
-    try cuda.launch(fn_fa_gqa6, .{ HKV, gqa6_ty, n_splits_gqa6 }, .{ 768, 1, 1 }, 0, ctx.stream, &p_fa_gqa6);
+    const gqa6_ty: u32 = @intCast((M + 7) / 8);
+    try cuda.launch(fn_fa_gqa6, .{ HKV, gqa6_ty, n_splits_gqa6 }, .{ 192, 1, 1 }, 0, ctx.stream, &p_fa_gqa6);
     try cuda.launch(fn_red, .{ 48, M, 1 }, .{ 32, 1, 1 }, 0, ctx.stream, &p_red_gqa6);
     try ctx.sync();
 
@@ -873,7 +873,7 @@ fn runAttnSuite(
     std.debug.print("  [Verify FA naive]      rows=0,3,4,7 worst_rms_rel={e:.2} min_cos={d:.7} [PASS]\n", .{
         worst_naive_rms, min_naive_cos,
     });
-    std.debug.print("  [Verify FA GQA6x4]     rows=0,3,4,7 worst_rms_rel={e:.2} min_cos={d:.7} [{s}]\n", .{
+    std.debug.print("  [Verify FA MMA6x8]     rows=0,3,4,7 worst_rms_rel={e:.2} min_cos={d:.7} [{s}]\n", .{
         worst_gqa6_rms, min_gqa6_cos, if (st_qr.rms_rel <= 1e-5 and worst_gqa6_rms <= 3e-3 and min_gqa6_cos >= 0.99999) "PASS" else "FAIL",
     });
     if (st_qr.rms_rel > 1e-5 or worst_naive_rms > 3e-3 or worst_gqa6_rms > 3e-3 or min_gqa6_cos < 0.99999) {
@@ -903,10 +903,10 @@ fn runAttnSuite(
     for (0..iters) |_| try cuda.launch(fn_fa_naive, .{ HQ, M, n_splits_naive }, .{ 32, 1, 1 }, 0, ctx.stream, &p_fa_naive);
     const t_fa_naive_us = (@as(f64, try timer.endMs(ctx.stream)) * 1000.0) / iters;
 
-    for (0..20) |_| try cuda.launch(fn_fa_gqa6, .{ HKV, gqa6_ty, n_splits_gqa6 }, .{ 768, 1, 1 }, 0, ctx.stream, &p_fa_gqa6);
+    for (0..20) |_| try cuda.launch(fn_fa_gqa6, .{ HKV, gqa6_ty, n_splits_gqa6 }, .{ 192, 1, 1 }, 0, ctx.stream, &p_fa_gqa6);
     try ctx.sync();
     try timer.begin(ctx.stream);
-    for (0..iters) |_| try cuda.launch(fn_fa_gqa6, .{ HKV, gqa6_ty, n_splits_gqa6 }, .{ 768, 1, 1 }, 0, ctx.stream, &p_fa_gqa6);
+    for (0..iters) |_| try cuda.launch(fn_fa_gqa6, .{ HKV, gqa6_ty, n_splits_gqa6 }, .{ 192, 1, 1 }, 0, ctx.stream, &p_fa_gqa6);
     const t_fa_gqa6_us = (@as(f64, try timer.endMs(ctx.stream)) * 1000.0) / iters;
 
     for (0..20) |_| try cuda.launch(fn_red, .{ 48, M, 1 }, .{ 32, 1, 1 }, 0, ctx.stream, &p_red_gqa6);
@@ -917,11 +917,11 @@ fn runAttnSuite(
 
     const layer_us = t_q_us + t_kv_us + t_fa_gqa6_us + t_red_us;
     std.debug.print(
-        "  [Bench A/B FA seq=2K]  naive_1warp={d:.2} us -> tiled_GQA6x4={d:.2} us ({d:.2}x speedup!)\n",
+        "  [Bench A/B FA seq=2K]  naive_1warp={d:.2} us -> MMA_GQA6x8={d:.2} us ({d:.2}x speedup!)\n",
         .{ t_fa_naive_us, t_fa_gqa6_us, t_fa_naive_us / t_fa_gqa6_us },
     );
     std.debug.print(
-        "  [Bench M=8, seq=2K]    q_prep={d:.2} us | kv_q4={d:.2} us | fa_gqa6={d:.2} us | red+gate+had={d:.2} us => {d:.2} us/layer ({d:.2} ms x16)\n",
+        "  [Bench M=8, seq=2K]    q_prep={d:.2} us | kv_q4={d:.2} us | fa_mma6x8={d:.2} us | red+gate+had={d:.2} us => {d:.2} us/layer ({d:.2} ms x16)\n",
         .{ t_q_us, t_kv_us, t_fa_gqa6_us, t_red_us, layer_us, (layer_us * 16.0) / 1000.0 },
     );
 }

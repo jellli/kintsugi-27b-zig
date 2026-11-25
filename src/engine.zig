@@ -17,7 +17,7 @@ const attn_sm89_cubin align(8) = @embedFile("attn_sm89.cubin");
 const lmhead_sm89_cubin align(8) = @embedFile("lmhead_sm89.cubin");
 
 pub const MAX_M: usize = 8;
-pub const PREFILL_M: usize = 128;
+pub const PREFILL_M: usize = 120; // 15*8 -> 4*15*2=120 blocks (exact 1.0 full wave on 60 SMs for MMA6x8!)
 pub const TOPK_K: usize = 64;
 pub const TOPK_BLOCKS: usize = 64;
 pub const MAX_SPLITS: usize = 30;
@@ -133,8 +133,8 @@ pub const Kernels = struct {
             .fn_attn_kv_tree = try mod_attn.getFunction("attn_k_norm_mrope_kv_q4_0_store_dpos_tree"),
             .fn_attn_fa_naive = try mod_attn.getFunction("attn_decode_q4_0_splitk_sm89_dpos"),
             .fn_attn_fa_naive_tree = try mod_attn.getFunction("attn_decode_q4_0_splitk_sm89_dpos_tree"),
-            .fn_attn_fa_gqa6 = try mod_attn.getFunction("attn_decode_q4_0_gqa6_sm89_dpos"),
-            .fn_attn_fa_gqa6_tree = try mod_attn.getFunction("attn_decode_q4_0_gqa6_sm89_dpos_tree"),
+            .fn_attn_fa_gqa6 = try mod_attn.getFunction("attn_mma_q4_0_gqa6x8_sm89_dpos"),
+            .fn_attn_fa_gqa6_tree = try mod_attn.getFunction("attn_mma_q4_0_gqa6x8_sm89_dpos_tree"),
             .fn_attn_red = try mod_attn.getFunction("attn_splitk_reduce_gate_had128_f16"),
             .fn_attn_compact_b = try mod_attn.getFunction("attn_compact_branch_b_kv"),
 
@@ -611,14 +611,14 @@ pub const Engine = struct {
         var p_fb: f32 = Spec.rope_theta;
 
         // Keep m * n_splits <= MAX_PART_SLOTS (256) so d_part_o/m/l never overflow!
-        // For m=8 decode: 4*2*n_splits blocks -> n_splits=15 (120 blks = 2.0 waves), n_splits=30 (240 blks = 4.0 waves on 60 SMs).
-        // For m=64 prefill: n_splits=4 (256 blks) removes the 64-on-60-SM wave-tail stall!
+        // MMA6x8 launches (4, ceil(m/8), n_splits) at 2 blocks/SM (120 blocks/wave on 60 SMs):
+        // - m=1..8 decode: n_splits=15 (60 blks = 1 blk/SM at 1K..4K), n_splits=30 (120 blks = 2 blks/SM at 4K+).
+        // - m=120 prefill: n_splits=2 (4*15*2 = 120 blks = exact 1.0 full wave, zero wave-tail stall!).
         const n_splits: u32 = if (m <= MAX_M)
             switch (attn_bucket) {
                 0 => 1,
                 1 => 4,
-                2 => 7,
-                3 => 15,
+                2 => 15,
                 else => 30,
             }
         else if (m <= 16)
@@ -638,7 +638,7 @@ pub const Engine = struct {
             switch (attn_bucket) {
                 0 => 1,
                 1 => 2,
-                else => 4,
+                else => 3,
             }
         else
             switch (attn_bucket) {
@@ -846,7 +846,7 @@ pub const Engine = struct {
                     const fn_kv = if (is_tree) self.ks.fn_attn_kv_tree else self.ks.fn_attn_kv;
                     try cuda.launch(fn_kv, .{ Spec.n_kv_heads, m, 2 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_kv);
 
-                    // 2E. Split-K Q4_0 FlashAttention (adaptive: GQA6x4 tiled for seq >= 256, 1-warp for short seq!)
+                    // 2E. Split-K Q4_0 FlashAttention (adaptive: sm_89 Tensor Core MMA6x8 for seq >= 256 / prefill, 1-warp for short seq)
                     var p_po = self.d_part_o;
                     var p_pm = self.d_part_m;
                     var p_pl = self.d_part_l;
@@ -858,9 +858,9 @@ pub const Engine = struct {
                             @ptrCast(&p_po),   @ptrCast(&p_pm),  @ptrCast(&p_pl),
                             @ptrCast(&p_dpos), @ptrCast(&p_m),   @ptrCast(&p_ns),
                         };
-                        const gqa6_ty: u32 = (m + 3) / 4;
+                        const gqa6_ty: u32 = (m + 7) / 8;
                         const fn_gqa6 = if (is_tree) self.ks.fn_attn_fa_gqa6_tree else self.ks.fn_attn_fa_gqa6;
-                        try cuda.launch(fn_gqa6, .{ Spec.n_kv_heads, gqa6_ty, n_splits }, .{ 768, 1, 1 }, 0, self.ctx.stream, &p_fa);
+                        try cuda.launch(fn_gqa6, .{ Spec.n_kv_heads, gqa6_ty, n_splits }, .{ 192, 1, 1 }, 0, self.ctx.stream, &p_fa);
                     } else {
                         var p_fa = [_]?*anyopaque{
                             @ptrCast(&p_qrot), @ptrCast(&p_kcp), @ptrCast(&p_vcp),
