@@ -17,7 +17,7 @@ const attn_sm89_cubin align(8) = @embedFile("attn_sm89.cubin");
 const lmhead_sm89_cubin align(8) = @embedFile("lmhead_sm89.cubin");
 
 pub const MAX_M: usize = 8;
-pub const PREFILL_M: usize = 120; // 15*8 -> 4*15*2=120 blocks (exact 1.0 full wave on 60 SMs for MMA6x8!)
+pub const PREFILL_M: usize = 240; // 30*8 -> 4*30*1=120 blocks (exact 1.0 full wave on 60 SMs with n_splits=1!)
 pub const TOPK_K: usize = 64;
 pub const TOPK_BLOCKS: usize = 64;
 pub const MAX_SPLITS: usize = 30;
@@ -50,6 +50,11 @@ pub const Kernels = struct {
     fn_escha_k3_m8_w1s16: cuda.CUfunction,
     fn_escha_k2_m64: cuda.CUfunction,
     fn_escha_k3_m64: cuda.CUfunction,
+    fn_escha_quant_i8: cuda.CUfunction,
+    fn_escha_k2_i8_m128: cuda.CUfunction,
+    fn_escha_k3_i8_m128: cuda.CUfunction,
+    fn_escha_k2_i8_m256: cuda.CUfunction,
+    fn_escha_k3_i8_m256: cuda.CUfunction,
     fn_escha_had_out: cuda.CUfunction,
 
     // GDN
@@ -116,6 +121,11 @@ pub const Kernels = struct {
             .fn_escha_k3_m8_w1s16 = try mod_escha.getFunction("escha_gemv_k3_m8_narrow_w1s16"),
             .fn_escha_k2_m64 = try mod_escha.getFunction("escha_gemm_k2_m64"),
             .fn_escha_k3_m64 = try mod_escha.getFunction("escha_gemm_k3_m64"),
+            .fn_escha_quant_i8 = try mod_escha.getFunction("escha_quant_f16_to_i8"),
+            .fn_escha_k2_i8_m128 = try mod_escha.getFunction("escha_gemm_k2_i8_m128n64"),
+            .fn_escha_k3_i8_m128 = try mod_escha.getFunction("escha_gemm_k3_i8_m128n64"),
+            .fn_escha_k2_i8_m256 = try mod_escha.getFunction("escha_gemm_k2_i8_m256n64"),
+            .fn_escha_k3_i8_m256 = try mod_escha.getFunction("escha_gemm_k3_i8_m256n64"),
             .fn_escha_had_out = try mod_escha.getFunction("escha_had_out_f32"),
 
             .fn_gdn_conv = try mod_gdn.getFunction("gdn_conv1d_silu_l2norm_f32"),
@@ -217,11 +227,13 @@ pub const Engine = struct {
     d_topk_pidx: cuda.CUdeviceptr, // [8, 64 * 64] i32
     d_topk_oval: cuda.CUdeviceptr, // [8, 64] f32
     d_topk_oidx: cuda.CUdeviceptr, // [8, 64] i32
-    d_cap_buf: cuda.CUdeviceptr,   // [8, 5 * 5120] f32 (DFlash2 captured target hidden states!)
+    d_cap_buf: cuda.CUdeviceptr,   // [PREFILL_M, 5 * 5120] f32 (DFlash2 captured target hidden states!)
+    d_escha_i8: cuda.CUdeviceptr,  // [PREFILL_M, 17408] i8 (INT8 Tensor Core prefill activations)
+    d_escha_scale: cuda.CUdeviceptr, // [PREFILL_M] f32 (per-row INT8 quantization scales)
     d_meta_pos: cuda.CUdeviceptr,  // [1] i32 (device-side pos for static CUDA Graph capture!)
 
     // Host staging buffers
-    h_emb_buf: []f32,     // [8 * 5120]
+    h_emb_buf: []f32,     // [PREFILL_M * 5120]
     h_out_norm: []f32,    // [8 * 5120]
     h_cand_ids: []i32,    // [8 * 64]
     h_cand_vals: []f32,   // [8 * 64]
@@ -266,32 +278,47 @@ pub const Engine = struct {
         const d_gdn_save_beta = try cuda.Context.alloc(48 * MAX_M * 48 * 4);
         errdefer cuda.Context.free(d_gdn_save_beta);
 
-        // 3. Static scratch arena (activation buffers sized for PREFILL_M=64; LM head stays MAX_M=8)
+        // 3. Static scratch arena (activation buffers sized for PREFILL_M; LM head stays MAX_M=8)
+        //    Non-overlapping sub-arena aliasing saves 31.3 MiB so 114,688 KV cells fit at PREFILL_M=240:
+        //    - d_xh1/d_xh2 (5120+5120 f16) live in upper d_xh0[5120..15360) (<= 17408 = d_ff),
+        //      because d_xh0 only uses [0..17408) during ffn_down when d_xh1/d_xh2 are dead.
+        //    - d_gdn_q/k/v (2048+2048+6144=10240 f32) live in upper d_buf_b[6144..16384) (<= 17408 = d_ff),
+        //      because d_buf_b only uses [0..6144) during GDN (attn_gate) & FullAttn (q_rot).
+        //    - d_escha_i8 + d_escha_scale (4.0 MiB) alias d_part_o (6.0 MiB), which is ONLY live
+        //      between FullAttn FA and Split-K reduce (never during any launchEscha call).
+        //    - d_logits (MAX_M*n_vocab f32 = 7.6 MiB) aliases d_buf_a (15.9 MiB), only used after layer 63.
+        comptime {
+            std.debug.assert(3 * Spec.d_model <= Spec.d_ff);
+            std.debug.assert(6144 + 2048 + 2048 + 6144 <= Spec.d_ff);
+            std.debug.assert(PREFILL_M * Spec.d_ff + 256 + PREFILL_M * 4 <= MAX_PART_SLOTS * Spec.n_heads * Spec.head_dim * 4);
+            std.debug.assert(MAX_M * Spec.n_vocab * 4 <= PREFILL_M * Spec.d_ff * 4);
+        }
         var sc_off: usize = 0;
         const off_residual = bump(&sc_off, PREFILL_M * Spec.d_model * 4);
         const off_delta = bump(&sc_off, PREFILL_M * Spec.d_model * 4);
         const off_xnorm = bump(&sc_off, PREFILL_M * Spec.d_model * 4);
         const off_xh0 = bump(&sc_off, PREFILL_M * Spec.d_ff * 2);
-        const off_xh1 = bump(&sc_off, PREFILL_M * Spec.d_model * 2);
-        const off_xh2 = bump(&sc_off, PREFILL_M * Spec.d_model * 2);
+        const off_xh1 = off_xh0 + PREFILL_M * Spec.d_model * 2;
+        const off_xh2 = off_xh0 + PREFILL_M * (2 * Spec.d_model) * 2;
         const off_buf_a = bump(&sc_off, PREFILL_M * Spec.d_ff * 4);
         const off_buf_b = bump(&sc_off, PREFILL_M * Spec.d_ff * 4);
-        const off_buf_c = bump(&sc_off, PREFILL_M * 6144 * 4);
-        const off_gdn_q = bump(&sc_off, PREFILL_M * 2048 * 4);
-        const off_gdn_k = bump(&sc_off, PREFILL_M * 2048 * 4);
-        const off_gdn_v = bump(&sc_off, PREFILL_M * 6144 * 4);
+        const off_gdn_q = off_buf_b + PREFILL_M * 6144 * 4;
+        const off_gdn_k = off_buf_b + PREFILL_M * 8192 * 4;
+        const off_gdn_v = off_buf_b + PREFILL_M * 10240 * 4;
         const off_gdn_g = bump(&sc_off, PREFILL_M * 48 * 4);
         const off_gdn_beta = bump(&sc_off, PREFILL_M * 48 * 4);
         const off_part_o = bump(&sc_off, MAX_PART_SLOTS * Spec.n_heads * Spec.head_dim * 4);
         const off_part_m = bump(&sc_off, MAX_PART_SLOTS * Spec.n_heads * 4);
         const off_part_l = bump(&sc_off, MAX_PART_SLOTS * Spec.n_heads * 4);
         const off_xq81 = bump(&sc_off, MAX_M * (Spec.d_model / 32) * 36);
-        const off_logits = bump(&sc_off, MAX_M * Spec.n_vocab * 4);
+        const off_logits = off_buf_a;
         const off_tk_pval = bump(&sc_off, MAX_M * TOPK_BLOCKS * TOPK_K * 4);
         const off_tk_pidx = bump(&sc_off, MAX_M * TOPK_BLOCKS * TOPK_K * 4);
         const off_tk_oval = bump(&sc_off, MAX_M * TOPK_K * 4);
         const off_tk_oidx = bump(&sc_off, MAX_M * TOPK_K * 4);
         const off_cap_buf = bump(&sc_off, PREFILL_M * 5 * Spec.d_model * 4);
+        const off_escha_i8 = off_part_o;
+        const off_escha_scale = off_part_o + std.mem.alignForward(usize, PREFILL_M * Spec.d_ff, 256);
         const off_meta_pos = bump(&sc_off, 16);
 
         const d_scratch = try cuda.Context.alloc(sc_off);
@@ -346,7 +373,7 @@ pub const Engine = struct {
             .d_xh2 = d_scratch + off_xh2,
             .d_buf_a = d_scratch + off_buf_a,
             .d_buf_b = d_scratch + off_buf_b,
-            .d_buf_c = d_scratch + off_buf_c,
+            .d_buf_c = d_scratch + off_gdn_v, // FullAttn gate aliases unused d_gdn_v; GDN aout uses d_buf_a
             .d_gdn_q = d_scratch + off_gdn_q,
             .d_gdn_k = d_scratch + off_gdn_k,
             .d_gdn_v = d_scratch + off_gdn_v,
@@ -362,6 +389,8 @@ pub const Engine = struct {
             .d_topk_oval = d_scratch + off_tk_oval,
             .d_topk_oidx = d_scratch + off_tk_oidx,
             .d_cap_buf = d_scratch + off_cap_buf,
+            .d_escha_i8 = d_scratch + off_escha_i8,
+            .d_escha_scale = d_scratch + off_escha_scale,
             .d_meta_pos = d_scratch + off_meta_pos,
             .h_emb_buf = h_emb_buf,
             .h_out_norm = h_out_norm,
@@ -446,7 +475,43 @@ pub const Engine = struct {
             @ptrCast(&p_k),
             @ptrCast(&p_n),
         };
-        if (m > MAX_M) {
+        if (m > 32) {
+            // Native sm_89 316-TOPS INT8 Tensor Core Escha Prefill GEMM:
+            // 1. Per-row symmetric INT8 quantization of Hadamard-rotated FP16 A -> d_escha_i8 + d_escha_scale
+            var p_i8 = self.d_escha_i8;
+            var p_sc = self.d_escha_scale;
+            var p_q = [_]?*anyopaque{
+                @ptrCast(&p_a),
+                @ptrCast(&p_i8),
+                @ptrCast(&p_sc),
+                @ptrCast(&p_k),
+            };
+            try cuda.launch(self.ks.fn_escha_quant_i8, .{ m, 1, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_q);
+
+            // 2. Hybrid tile dispatch (both bit-exact to each other, 0 B spill):
+            //    - m256n64 (BM=256, BN=64, 42 KiB swizzled): 159-184 TOPS on OC >= 6144 when m > 128
+            //    - m128n64 (BM=128, BN=64, 30 KiB, 3 blks/SM): better 60-SM balance on OC < 6144 or m <= 128
+            var p_i8_gemm = [_]?*anyopaque{
+                @ptrCast(&p_i8),
+                @ptrCast(&p_sc),
+                @ptrCast(&p_b),
+                @ptrCast(&p_rout),
+                @ptrCast(&p_c),
+                @ptrCast(&p_m),
+                @ptrCast(&p_k),
+                @ptrCast(&p_n),
+            };
+            const gx_gemm: u32 = proj.oc / 64;
+            if (m > 128 and proj.oc >= 6144) {
+                const fn_i8 = if (proj.k_bits == 2) self.ks.fn_escha_k2_i8_m256 else self.ks.fn_escha_k3_i8_m256;
+                const gy: u32 = (m + 255) / 256;
+                try cuda.launch(fn_i8, .{ gx_gemm, gy, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_i8_gemm);
+            } else {
+                const fn_i8 = if (proj.k_bits == 2) self.ks.fn_escha_k2_i8_m128 else self.ks.fn_escha_k3_i8_m128;
+                const gy: u32 = (m + 127) / 128;
+                try cuda.launch(fn_i8, .{ gx_gemm, gy, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_i8_gemm);
+            }
+        } else if (m > MAX_M) {
             const fn_gemm = if (proj.k_bits == 2) self.ks.fn_escha_k2_m64 else self.ks.fn_escha_k3_m64;
             const gx_gemm: u32 = proj.oc / 32;
             const gy: u32 = (m + 63) / 64;
@@ -613,7 +678,7 @@ pub const Engine = struct {
         // Keep m * n_splits <= MAX_PART_SLOTS (256) so d_part_o/m/l never overflow!
         // MMA6x8 launches (4, ceil(m/8), n_splits) at 2 blocks/SM (120 blocks/wave on 60 SMs):
         // - m=1..8 decode: n_splits=15 (60 blks = 1 blk/SM at 1K..4K), n_splits=30 (120 blks = 2 blks/SM at 4K+).
-        // - m=120 prefill: n_splits=2 (4*15*2 = 120 blks = exact 1.0 full wave, zero wave-tail stall!).
+        // - m=240 prefill: n_splits=1 (4*30*1 = 120 blks = exact 1.0 full wave, zero split-K reduce overhead!).
         const n_splits: u32 = if (m <= MAX_M)
             switch (attn_bucket) {
                 0 => 1,
@@ -640,11 +705,13 @@ pub const Engine = struct {
                 1 => 2,
                 else => 3,
             }
-        else
+        else if (m <= 128)
             switch (attn_bucket) {
                 0 => 1,
                 else => 2,
-            };
+            }
+        else
+            1;
         std.debug.assert(@as(usize, m) * @as(usize, n_splits) <= MAX_PART_SLOTS);
         const use_gqa6 = (attn_bucket >= 1) or (m > MAX_M);
 
@@ -743,7 +810,7 @@ pub const Engine = struct {
                     const d_st = self.d_gdn_state + g_idx * 48 * 128 * 128 * 4;
                     var p_sin = d_st;
                     var p_sout: cuda.CUdeviceptr = if (commit_immediately) d_st else 0;
-                    var p_aout = self.d_buf_c;
+                    var p_aout = self.d_buf_a; // d_buf_a is dead after 2C (d_buf_c aliases d_gdn_v!)
                     if (is_tree) {
                         var p_rec_t = [_]?*anyopaque{
                             @ptrCast(&p_qo),  @ptrCast(&p_ko),  @ptrCast(&p_vo),

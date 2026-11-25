@@ -922,7 +922,7 @@ def render_markdown(data: dict[str, Any]) -> str:
     )
     lines.append(
         f"- **`kintsugi-zig` Config**: Commit `{data.get('zig_commit', 'unknown')}` "
-        "(native `sm_89` CUBIN, Tensor Core MMA6x8 FA, `PREFILL_M=120`, 5-bucket Split-K, Parallel CUDA Graph, Adaptive PLD + Top-2 Tree Spec)"
+        "(native `sm_89` CUBIN, INT8 Tensor Core Escha + MMA6x8 FA, `PREFILL_M=240`, 5-bucket Split-K, Parallel CUDA Graph, Adaptive PLD + Top-2 Tree Spec)"
     )
     lines.append(
         f"- **Methodology**: Sequential runs on idle GPU (0 contention), SSE client-measured TTFT & "
