@@ -682,6 +682,7 @@ pub const DFlashEngine = struct {
         temp: f32 = 0.0,
         top_k: u32 = 64,
         top_p: f32 = 1.0,
+        min_p: f32 = 0.0,
         rng: *std.Random.DefaultPrng,
     };
 
@@ -739,7 +740,7 @@ pub const DFlashEngine = struct {
         // 5. Exact DFlash2 Selector autoregressive walk on CPU (~2 us, zero VRAM!)
         //    Matches llama.cpp build_dflash2_selector + common/speculative.cpp verbatim when greedy,
         //    and draws from normalized selector scores when stochastic sampling is enabled.
-        const use_stochastic = if (sampling) |s| !engine_mod.isGreedySampling(s.temp, s.top_k, s.top_p) else false;
+        const use_stochastic = if (sampling) |s| !engine_mod.isGreedySamplingEx(s.temp, s.top_k, s.top_p, s.min_p) else false;
         var pred_tok: u32 = id_last;
         var prev_vec: [SELECTOR_RANK]f32 = undefined;
         var cond_vec: [SELECTOR_RANK]f32 = undefined;
@@ -808,7 +809,7 @@ pub const DFlashEngine = struct {
 
             const chosen_id: u32 = if (use_stochastic) blk: {
                 const s = sampling.?;
-                const q_dist = engine_mod.buildDistFromLogits(&sel_ids, &scores, s.temp, s.top_k, s.top_p);
+                const q_dist = engine_mod.buildDistFromLogitsEx(&sel_ids, &scores, s.temp, s.top_k, s.top_p, s.min_p);
                 if (dists_out) |do| do[n_drafted] = q_dist;
                 break :blk q_dist.sample(s.rng);
             } else blk: {

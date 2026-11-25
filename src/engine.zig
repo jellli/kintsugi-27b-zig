@@ -1008,6 +1008,10 @@ pub fn isGreedySampling(temp: f32, top_k: u32, top_p: f32) bool {
     return !std.math.isFinite(temp) or temp <= 0.0 or top_k == 1 or (!std.math.isNan(top_p) and top_p <= 0.0);
 }
 
+pub fn isGreedySamplingEx(temp: f32, top_k: u32, top_p: f32, min_p: f32) bool {
+    return isGreedySampling(temp, top_k, top_p) or (!std.math.isNan(min_p) and min_p >= 1.0);
+}
+
 /// Normalized discrete probability distribution over up to `TOPK_K` (64) candidate tokens.
 pub const CandidateDist = struct {
     ids: [TOPK_K]u32 = @splat(0),
@@ -1042,14 +1046,42 @@ pub const CandidateDist = struct {
     }
 };
 
-/// Build the normalized post-(temperature, top_k, top_p) probability distribution from arbitrary
+/// Apply OpenAI-compatible `frequency_penalty` and `presence_penalty` to a `CandidateList`
+/// based on token occurrence counts in the current completion (`logit -= freq*count + pres`).
+pub fn applyTokenPenalties(
+    cands: *const CandidateList,
+    counts: *const std.AutoHashMapUnmanaged(u32, u32),
+    freq_penalty: f32,
+    pres_penalty: f32,
+) CandidateList {
+    var out = cands.*;
+    const has_freq = std.math.isFinite(freq_penalty) and freq_penalty != 0.0;
+    const has_pres = std.math.isFinite(pres_penalty) and pres_penalty != 0.0;
+    if ((!has_freq and !has_pres) or counts.count() == 0) return out;
+    for (0..TOPK_K) |i| {
+        const cid = out.ids[i];
+        if (cid < 0 or !std.math.isFinite(out.logits[i])) continue;
+        if (counts.get(@intCast(cid))) |cnt| {
+            if (cnt > 0) {
+                var pen: f32 = 0.0;
+                if (has_freq) pen += freq_penalty * @as(f32, @floatFromInt(cnt));
+                if (has_pres) pen += pres_penalty;
+                out.logits[i] -= pen;
+            }
+        }
+    }
+    return out;
+}
+
+/// Build the normalized post-(temperature, top_k, min_p, top_p) probability distribution from arbitrary
 /// `(ids, logits)` slices (up to `TOPK_K` valid entries).
-pub fn buildDistFromLogits(
+pub fn buildDistFromLogitsEx(
     ids_in: []const i32,
     logits_in: []const f32,
     temp: f32,
     top_k: u32,
     top_p: f32,
+    min_p: f32,
 ) CandidateDist {
     const Entry = struct { id: u32, val: f32 };
     var entries: [TOPK_K]Entry = undefined;
@@ -1063,8 +1095,8 @@ pub fn buildDistFromLogits(
     }
     if (n == 0) return .{};
 
-    // Greedy fast path (also handles non-finite temp, top_k == 1, or non-positive top_p)
-    if (isGreedySampling(temp, top_k, top_p)) {
+    // Greedy fast path (also handles non-finite temp, top_k == 1, non-positive top_p, or min_p >= 1)
+    if (isGreedySampling(temp, top_k, top_p) or (!std.math.isNan(min_p) and min_p >= 1.0)) {
         var best = entries[0];
         for (entries[1..n]) |e| {
             if (e.val > best.val) best = e;
@@ -1093,11 +1125,29 @@ pub fn buildDistFromLogits(
     }
     if (!(sum > 0.0) or !std.math.isFinite(sum)) return CandidateDist.pointMass(entries[0].id);
 
+    // Optional min_p filter (relative to top-1 probability probs[0] = 1.0 before dividing by sum)
+    var eff_k: usize = k_lim;
+    if (!std.math.isNan(min_p) and min_p > 0.0) {
+        const thresh = probs[0] * min_p;
+        var kept: usize = 1;
+        var minp_sum: f32 = probs[0];
+        for (1..k_lim) |i| {
+            if (probs[i] >= thresh) {
+                kept = i + 1;
+                minp_sum += probs[i];
+            } else {
+                break; // sorted descending
+            }
+        }
+        eff_k = kept;
+        sum = minp_sum;
+    }
+
     const eff_top_p: f32 = if (std.math.isNan(top_p) or top_p > 1.0) 1.0 else top_p;
     const inv_sum = 1.0 / sum;
     var cum: f32 = 0.0;
-    var cut: usize = k_lim;
-    for (0..k_lim) |i| {
+    var cut: usize = eff_k;
+    for (0..eff_k) |i| {
         probs[i] *= inv_sum;
         cum += probs[i];
         if (cum >= eff_top_p) {
@@ -1116,11 +1166,30 @@ pub fn buildDistFromLogits(
     return out;
 }
 
-pub fn buildCandidateDist(cands: *const CandidateList, temp: f32, top_k: u32, top_p: f32) CandidateDist {
-    return buildDistFromLogits(&cands.ids, &cands.logits, temp, top_k, top_p);
+pub fn buildDistFromLogits(
+    ids_in: []const i32,
+    logits_in: []const f32,
+    temp: f32,
+    top_k: u32,
+    top_p: f32,
+) CandidateDist {
+    return buildDistFromLogitsEx(ids_in, logits_in, temp, top_k, top_p, 0.0);
 }
 
-/// Top-k + top-p + temperature sampler on the exact Stage-2 Top-64 candidates!
+pub fn buildCandidateDistEx(cands: *const CandidateList, temp: f32, top_k: u32, top_p: f32, min_p: f32) CandidateDist {
+    return buildDistFromLogitsEx(&cands.ids, &cands.logits, temp, top_k, top_p, min_p);
+}
+
+pub fn buildCandidateDist(cands: *const CandidateList, temp: f32, top_k: u32, top_p: f32) CandidateDist {
+    return buildDistFromLogitsEx(&cands.ids, &cands.logits, temp, top_k, top_p, 0.0);
+}
+
+/// Top-k + min_p + top-p + temperature sampler on the exact Stage-2 Top-64 candidates!
+pub fn sampleFromCandidatesEx(cands: *const CandidateList, temp: f32, top_k: u32, top_p: f32, min_p: f32, rng: *std.Random.DefaultPrng) u32 {
+    const dist = buildCandidateDistEx(cands, temp, top_k, top_p, min_p);
+    return dist.sample(rng);
+}
+
 pub fn sampleFromCandidates(cands: *const CandidateList, temp: f32, top_k: u32, top_p: f32, rng: *std.Random.DefaultPrng) u32 {
     const dist = buildCandidateDist(cands, temp, top_k, top_p);
     return dist.sample(rng);
@@ -1339,4 +1408,54 @@ test "verifySpeculativeToken preserves exact target marginal distribution and op
     const pm_b = CandidateDist.pointMass(88);
     try std.testing.expectEqual(VerifyResult{ .accepted = true, .token = 77 }, verifySpeculativeToken(&pm_a, &pm_a, 77, &rng));
     try std.testing.expectEqual(VerifyResult{ .accepted = false, .token = 77 }, verifySpeculativeToken(&pm_a, &pm_b, 88, &rng));
+}
+
+test "buildDistFromLogitsEx applies min_p truncation cleanly" {
+    // Logits [10.0, 9.0, 7.0, 5.0] at temp=1.0 -> relative exp: [1.0, 0.3679, 0.0498, 0.0067]
+    const ids = [_]i32{ 1, 2, 3, 4 };
+    const logits = [_]f32{ 10.0, 9.0, 7.0, 5.0 };
+
+    // min_p = 0.10 keeps only {1, 2} (0.3679 >= 0.10 > 0.0498)
+    const d1 = buildDistFromLogitsEx(&ids, &logits, 1.0, 64, 1.0, 0.10);
+    try std.testing.expectEqual(@as(usize, 2), d1.len);
+    try std.testing.expectEqual(@as(u32, 1), d1.ids[0]);
+    try std.testing.expectEqual(@as(u32, 2), d1.ids[1]);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), d1.probs[0] + d1.probs[1], 1e-5);
+
+    // min_p = 0.01 keeps {1, 2, 3} (0.0498 >= 0.01 > 0.0067)
+    const d2 = buildDistFromLogitsEx(&ids, &logits, 1.0, 64, 1.0, 0.01);
+    try std.testing.expectEqual(@as(usize, 3), d2.len);
+
+    // min_p >= 1.0 collapses to greedy top-1
+    const d3 = buildDistFromLogitsEx(&ids, &logits, 1.0, 64, 1.0, 1.0);
+    try std.testing.expectEqual(@as(usize, 1), d3.len);
+    try std.testing.expectEqual(@as(u32, 1), d3.ids[0]);
+    try std.testing.expect(isGreedySamplingEx(1.0, 64, 1.0, 1.0));
+}
+
+test "applyTokenPenalties modifies logits by frequency and presence counts" {
+    var cands: CandidateList = .{
+        .logits = @splat(-std.math.inf(f32)),
+        .ids = @splat(-1),
+    };
+    cands.ids[0] = 10;
+    cands.logits[0] = 5.0;
+    cands.ids[1] = 20;
+    cands.logits[1] = 4.5;
+    cands.ids[2] = 30;
+    cands.logits[2] = 4.0;
+
+    var counts: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    defer counts.deinit(std.testing.allocator);
+    try counts.put(std.testing.allocator, 10, 3); // pen = 0.5*3 + 0.4 = 1.9 -> 3.1
+    try counts.put(std.testing.allocator, 20, 1); // pen = 0.5*1 + 0.4 = 0.9 -> 3.6
+
+    const pen = applyTokenPenalties(&cands, &counts, 0.5, 0.4);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.1), pen.logits[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.6), pen.logits[1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), pen.logits[2], 1e-5);
+
+    // Greedy pick after penalties switches from 10 -> 30
+    var rng = std.Random.DefaultPrng.init(1);
+    try std.testing.expectEqual(@as(u32, 30), sampleFromCandidatesEx(&pen, 0.0, 64, 1.0, 0.0, &rng));
 }

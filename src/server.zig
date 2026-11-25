@@ -32,6 +32,9 @@ const GenParams = struct {
     temperature: f32 = 0.0,
     top_k: u32 = 64,
     top_p: f32 = 0.95,
+    min_p: f32 = 0.0,
+    frequency_penalty: f32 = 0.0,
+    presence_penalty: f32 = 0.0,
     seed: u64 = 42,
     stream: bool = false,
     stops: [MAX_STOPS][]const u8 = undefined,
@@ -455,6 +458,21 @@ fn parseGenParams(obj: std.json.ObjectMap) GenParams {
     }
     if (obj.get("top_p")) |v| {
         if (jsonFloat(v)) |f| p.top_p = f;
+    }
+    if (obj.get("min_p")) |v| {
+        if (jsonFloat(v)) |f| {
+            if (std.math.isFinite(f)) p.min_p = std.math.clamp(f, 0.0, 1.0);
+        }
+    }
+    if (obj.get("frequency_penalty")) |v| {
+        if (jsonFloat(v)) |f| {
+            if (std.math.isFinite(f)) p.frequency_penalty = std.math.clamp(f, -2.0, 2.0);
+        }
+    }
+    if (obj.get("presence_penalty")) |v| {
+        if (jsonFloat(v)) |f| {
+            if (std.math.isFinite(f)) p.presence_penalty = std.math.clamp(f, -2.0, 2.0);
+        }
     }
     if (obj.get("seed")) |v| {
         if (v == .integer) p.seed = @bitCast(v.integer);
@@ -1840,7 +1858,7 @@ const ThinkFilter = struct {
     }
 };
 
-const MAX_CHECKPOINTS: usize = 4;
+const MAX_CHECKPOINTS: usize = 8;
 
 const PrefixCheckpoint = struct {
     valid: bool = false,
@@ -1874,7 +1892,7 @@ const ServerState = struct {
     boot_nonce: u32 = 0,
     req_counter: u64 = 0,
     active_tokens: std.ArrayListUnmanaged(u32) = .empty,
-    checkpoints: [MAX_CHECKPOINTS]PrefixCheckpoint = .{ .{}, .{}, .{}, .{} },
+    checkpoints: [MAX_CHECKPOINTS]PrefixCheckpoint = @splat(.{}),
     ckpt_clock: u64 = 0,
 
     fn deinit(self: *ServerState) void {
@@ -2250,6 +2268,10 @@ const ServerState = struct {
             .tool_sink = &tool_sink,
         };
 
+        const has_penalties = (params.frequency_penalty != 0.0) or (params.presence_penalty != 0.0);
+        var gen_counts: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        defer gen_counts.deinit(self.allocator);
+
         const emitToken = struct {
             fn call(
                 st_self: *ServerState,
@@ -2261,12 +2283,22 @@ const ServerState = struct {
                 t_filter: *ThinkFilter,
                 t_sink: *LiveThinkSink,
                 g_stats: *GenStats,
+                track_counts: bool,
+                counts: *std.AutoHashMapUnmanaged(u32, u32),
             ) !bool {
                 if (st_self.tok.isEos(tok_id)) {
                     g_stats.finish_reason = "stop";
                     return true;
                 }
                 g_stats.completion_tokens += 1;
+                if (track_counts) {
+                    const gop = try counts.getOrPut(st_self.allocator, tok_id);
+                    if (gop.found_existing) {
+                        gop.value_ptr.* += 1;
+                    } else {
+                        gop.value_ptr.* = 1;
+                    }
+                }
                 p_buf.clearRetainingCapacity();
                 try st_self.tok.decodeTokenTo(tok_id, p_buf, st_self.allocator);
 
@@ -2290,19 +2322,27 @@ const ServerState = struct {
             }
         }.call;
 
-        var cur = engine_mod.sampleFromCandidates(&pf.cands[0], params.temperature, params.top_k, params.top_p, &rng);
+        var cur = engine_mod.sampleFromCandidatesEx(
+            &pf.cands[0],
+            params.temperature,
+            params.top_k,
+            params.top_p,
+            params.min_p,
+            &rng,
+        );
 
         const td0 = nowMs();
         if (params.max_tokens > 0) {
-            var stopped = try emitToken(self, cur, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats);
+            var stopped = try emitToken(self, cur, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats, has_penalties, &gen_counts);
 
             if (!stopped) {
                 if (self.dflash) |df| {
-                    const greedy = engine_mod.isGreedySampling(params.temperature, params.top_k, params.top_p);
+                    const greedy = engine_mod.isGreedySamplingEx(params.temperature, params.top_k, params.top_p, params.min_p);
                     const draft_sampling: ?dflash_mod.DFlashEngine.DraftSampling = if (greedy) null else .{
                         .temp = params.temperature,
                         .top_k = params.top_k,
                         .top_p = params.top_p,
+                        .min_p = params.min_p,
                         .rng = &rng,
                     };
                     while (!stopped and stats.completion_tokens < params.max_tokens) {
@@ -2331,19 +2371,28 @@ const ServerState = struct {
                         var next_tok: u32 = 0;
 
                         for (0..n_draft) |k| {
-                            const vr: engine_mod.VerifyResult = if (greedy) .{
+                            const vr: engine_mod.VerifyResult = if (greedy and !has_penalties) .{
                                 .accepted = out.tokens[k] == draft_toks[k],
                                 .token = out.tokens[k],
                             } else blk: {
-                                const target_dist = engine_mod.buildCandidateDist(
-                                    &out.cands[k],
+                                const cands_k = if (has_penalties)
+                                    engine_mod.applyTokenPenalties(&out.cands[k], &gen_counts, params.frequency_penalty, params.presence_penalty)
+                                else
+                                    out.cands[k];
+                                if (greedy) {
+                                    const best_tok = engine_mod.sampleFromCandidatesEx(&cands_k, 0.0, 1, 0.0, 0.0, &rng);
+                                    break :blk .{ .accepted = best_tok == draft_toks[k], .token = best_tok };
+                                }
+                                const target_dist = engine_mod.buildCandidateDistEx(
+                                    &cands_k,
                                     params.temperature,
                                     params.top_k,
                                     params.top_p,
+                                    params.min_p,
                                 );
                                 break :blk engine_mod.verifySpeculativeToken(&target_dist, &draft_dists[k], draft_toks[k], &rng);
                             };
-                            stopped = try emitToken(self, vr.token, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats);
+                            stopped = try emitToken(self, vr.token, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats, has_penalties, &gen_counts);
                             if (stopped) break;
                             if (vr.accepted) {
                                 n_acc += 1;
@@ -2355,11 +2404,23 @@ const ServerState = struct {
                         stats.draft_n_accepted += n_acc;
 
                         if (!stopped and n_acc == n_draft) {
-                            const bonus = if (greedy)
+                            const bonus = if (greedy and !has_penalties)
                                 out.tokens[n_draft]
-                            else
-                                engine_mod.sampleFromCandidates(&out.cands[n_draft], params.temperature, params.top_k, params.top_p, &rng);
-                            stopped = try emitToken(self, bonus, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats);
+                            else blk: {
+                                const cands_b = if (has_penalties)
+                                    engine_mod.applyTokenPenalties(&out.cands[n_draft], &gen_counts, params.frequency_penalty, params.presence_penalty)
+                                else
+                                    out.cands[n_draft];
+                                break :blk engine_mod.sampleFromCandidatesEx(
+                                    &cands_b,
+                                    params.temperature,
+                                    params.top_k,
+                                    params.top_p,
+                                    params.min_p,
+                                    &rng,
+                                );
+                            };
+                            stopped = try emitToken(self, bonus, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats, has_penalties, &gen_counts);
                             next_tok = bonus;
                         }
                         if (stopped) break;
@@ -2375,8 +2436,19 @@ const ServerState = struct {
                     while (!stopped and stats.completion_tokens < params.max_tokens) {
                         const out = try self.eng.forward(&[_]u32{cur}, true, true);
                         try self.active_tokens.append(self.allocator, cur);
-                        cur = engine_mod.sampleFromCandidates(&out.cands[0], params.temperature, params.top_k, params.top_p, &rng);
-                        stopped = try emitToken(self, cur, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats);
+                        const cands_0 = if (has_penalties)
+                            engine_mod.applyTokenPenalties(&out.cands[0], &gen_counts, params.frequency_penalty, params.presence_penalty)
+                        else
+                            out.cands[0];
+                        cur = engine_mod.sampleFromCandidatesEx(
+                            &cands_0,
+                            params.temperature,
+                            params.top_k,
+                            params.top_p,
+                            params.min_p,
+                            &rng,
+                        );
+                        stopped = try emitToken(self, cur, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats, has_penalties, &gen_counts);
                     }
                 }
             }
@@ -3043,7 +3115,7 @@ test "parseIpv4 rejects invalid hosts and longestCommonPrefix handles edge cases
 
 test "parseGenParams handles stops, clamping, negative max_tokens, and fallbacks" {
     const payload =
-        \\{"max_tokens":-1,"temperature":0.6,"top_k":500,"top_p":0.9,"seed":7,"stream":true,"stop":["","END","A","B","C","D","E","F","G","H","I"]}
+        \\{"max_tokens":-1,"temperature":0.6,"top_k":500,"top_p":0.9,"min_p":0.05,"frequency_penalty":3.5,"presence_penalty":-2.5,"seed":7,"stream":true,"stop":["","END","A","B","C","D","E","F","G","H","I"]}
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
     defer parsed.deinit();
@@ -3052,6 +3124,9 @@ test "parseGenParams handles stops, clamping, negative max_tokens, and fallbacks
     try std.testing.expectApproxEqAbs(@as(f32, 0.6), p.temperature, 1e-6);
     try std.testing.expectEqual(@as(u32, 64), p.top_k);
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), p.top_p, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.05), p.min_p, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), p.frequency_penalty, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -2.0), p.presence_penalty, 1e-6);
     try std.testing.expectEqual(@as(u64, 7), p.seed);
     try std.testing.expect(p.stream);
     try std.testing.expectEqual(@as(usize, MAX_STOPS), p.n_stops);
