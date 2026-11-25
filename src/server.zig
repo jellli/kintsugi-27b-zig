@@ -418,49 +418,364 @@ fn parseGenParams(obj: std.json.ObjectMap) GenParams {
     return p;
 }
 
+pub const ReasoningEffort = enum {
+    none,
+    low,
+    medium,
+    xhigh,
+
+    pub fn name(self: ReasoningEffort) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .low => "low",
+            .medium => "medium",
+            .xhigh => "xhigh",
+        };
+    }
+
+    pub fn instructions(self: ReasoningEffort) []const u8 {
+        return switch (self) {
+            .xhigh => "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.",
+            .low => "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.",
+            .medium, .none => "",
+        };
+    }
+};
+
+fn parseEffortString(s: []const u8) ?ReasoningEffort {
+    if (std.ascii.eqlIgnoreCase(s, "none") or
+        std.ascii.eqlIgnoreCase(s, "off") or
+        std.ascii.eqlIgnoreCase(s, "disabled") or
+        std.ascii.eqlIgnoreCase(s, "minimal"))
+    {
+        return .none;
+    }
+    if (std.ascii.eqlIgnoreCase(s, "low")) return .low;
+    if (std.ascii.eqlIgnoreCase(s, "medium") or std.ascii.eqlIgnoreCase(s, "med")) return .medium;
+    if (std.ascii.eqlIgnoreCase(s, "high") or
+        std.ascii.eqlIgnoreCase(s, "xhigh") or
+        std.ascii.eqlIgnoreCase(s, "max"))
+    {
+        return .xhigh;
+    }
+    return null;
+}
+
+pub fn parseReasoningEffort(obj: std.json.ObjectMap) ReasoningEffort {
+    // 1. Explicit disable flags
+    if (obj.get("enable_thinking")) |tv| {
+        if (tv == .bool and !tv.bool) return .none;
+    }
+    if (obj.get("chat_template_kwargs")) |kw| {
+        if (kw == .object) {
+            if (kw.object.get("enable_thinking")) |tv| {
+                if (tv == .bool and !tv.bool) return .none;
+            }
+        }
+    }
+    if (obj.get("thinking")) |th| {
+        if (th == .bool and !th.bool) return .none;
+        if (th == .object) {
+            if (th.object.get("type")) |tt| {
+                if (tt == .string and (std.ascii.eqlIgnoreCase(tt.string, "disabled") or std.ascii.eqlIgnoreCase(tt.string, "none") or std.ascii.eqlIgnoreCase(tt.string, "off"))) {
+                    return .none;
+                }
+            }
+            if (th.object.get("enabled")) |en| {
+                if (en == .bool and !en.bool) return .none;
+            }
+        }
+    }
+    if (obj.get("reasoning")) |ro| {
+        if (ro == .bool and !ro.bool) return .none;
+        if (ro == .object) {
+            if (ro.object.get("enabled")) |en| {
+                if (en == .bool and !en.bool) return .none;
+            }
+        }
+    }
+
+    // 2. Explicit effort string: reasoning_effort / reasoning.effort / thinking.effort / chat_template_kwargs.reasoning_effort / effort
+    if (obj.get("reasoning_effort")) |rv| {
+        if (rv == .string) {
+            if (parseEffortString(rv.string)) |eff| return eff;
+        }
+    }
+    if (obj.get("reasoning")) |ro| {
+        if (ro == .object) {
+            if (ro.object.get("effort")) |rv| {
+                if (rv == .string) {
+                    if (parseEffortString(rv.string)) |eff| return eff;
+                }
+            }
+        } else if (ro == .string) {
+            if (parseEffortString(ro.string)) |eff| return eff;
+        }
+    }
+    if (obj.get("thinking")) |th| {
+        if (th == .object) {
+            if (th.object.get("effort")) |rv| {
+                if (rv == .string) {
+                    if (parseEffortString(rv.string)) |eff| return eff;
+                }
+            }
+            if (th.object.get("budget_tokens")) |bv| {
+                const budget: i64 = switch (bv) {
+                    .integer => |i| i,
+                    .float => |f| @intFromFloat(f),
+                    else => -1,
+                };
+                if (budget == 0) return .none;
+                if (budget > 0) {
+                    if (budget <= 2048) return .low;
+                    if (budget <= 8192) return .medium;
+                    return .xhigh;
+                }
+            }
+        } else if (th == .string) {
+            if (parseEffortString(th.string)) |eff| return eff;
+        }
+    }
+    if (obj.get("chat_template_kwargs")) |kw| {
+        if (kw == .object) {
+            if (kw.object.get("reasoning_effort")) |rv| {
+                if (rv == .string) {
+                    if (parseEffortString(rv.string)) |eff| return eff;
+                }
+            }
+        }
+    }
+    if (obj.get("effort")) |ev| {
+        if (ev == .string) {
+            if (parseEffortString(ev.string)) |eff| return eff;
+        }
+    }
+
+    // 3. Default matches official Kintsugi-27B GGUF chat_template (reasoning_effort|default('xhigh'))
+    return .xhigh;
+}
+
+fn appendMessageContent(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    val_opt: ?std.json.Value,
+) !void {
+    const cv = val_opt orelse return;
+    switch (cv) {
+        .string => |s| try out.appendSlice(allocator, s),
+        .array => |arr| {
+            var wrote_part = false;
+            for (arr.items) |part| {
+                if (part == .string) {
+                    if (wrote_part) try out.append(allocator, '\n');
+                    try out.appendSlice(allocator, part.string);
+                    wrote_part = true;
+                } else if (part == .object) {
+                    if (part.object.get("text")) |tv| {
+                        if (tv == .string) {
+                            if (wrote_part) try out.append(allocator, '\n');
+                            try out.appendSlice(allocator, tv.string);
+                            wrote_part = true;
+                        }
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+fn appendJsonValue(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, val: std.json.Value) !void {
+    const s = try std.json.Stringify.valueAlloc(allocator, val, .{});
+    defer allocator.free(s);
+    try out.appendSlice(allocator, s);
+}
+
 pub fn formatChatMl(
     allocator: std.mem.Allocator,
     messages: []const std.json.Value,
-    enable_thinking: bool,
+    effort: ReasoningEffort,
+    tools_opt: ?[]const std.json.Value,
 ) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
-    for (messages) |m| {
-        if (m != .object) continue;
-        const role = if (m.object.get("role")) |rv| (if (rv == .string) rv.string else "user") else "user";
-        try out.appendSlice(allocator, "<|im_start|>");
-        try out.appendSlice(allocator, role);
-        try out.append(allocator, '\n');
-        if (m.object.get("content")) |cv| {
-            switch (cv) {
-                .string => |s| try out.appendSlice(allocator, s),
-                .array => |arr| {
-                    var wrote_part = false;
-                    for (arr.items) |part| {
-                        if (part == .string) {
-                            if (wrote_part) try out.append(allocator, '\n');
-                            try out.appendSlice(allocator, part.string);
-                            wrote_part = true;
-                        } else if (part == .object) {
-                            if (part.object.get("text")) |tv| {
-                                if (tv == .string) {
-                                    if (wrote_part) try out.append(allocator, '\n');
-                                    try out.appendSlice(allocator, tv.string);
-                                    wrote_part = true;
-                                }
-                            }
-                        }
-                    }
-                },
-                else => {},
+    const reasoning_instr = effort.instructions();
+    const has_tools = if (tools_opt) |ts| ts.len > 0 else false;
+
+    // 1. System block (matching Kintsugi-27B GGUF tokenizer.chat_template)
+    var first_is_system = false;
+    var sys_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer sys_buf.deinit(allocator);
+    if (messages.len > 0 and messages[0] == .object) {
+        if (messages[0].object.get("role")) |rv| {
+            if (rv == .string and std.mem.eql(u8, rv.string, "system")) {
+                first_is_system = true;
+                try appendMessageContent(&sys_buf, allocator, messages[0].object.get("content"));
             }
+        }
+    }
+    const sys_trimmed = std.mem.trim(u8, sys_buf.items, " \t\r\n");
+
+    if (has_tools) {
+        try out.appendSlice(allocator, "<|im_start|>system\n");
+        if (reasoning_instr.len > 0) {
+            try out.appendSlice(allocator, reasoning_instr);
+            try out.appendSlice(allocator, "\n\n");
+        }
+        try out.appendSlice(allocator, "# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        for (tools_opt.?) |tool| {
+            try out.append(allocator, '\n');
+            try appendJsonValue(&out, allocator, tool);
+        }
+        try out.appendSlice(
+            allocator,
+            "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n" ++
+                "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n" ++
+                "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n" ++
+                "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n" ++
+                "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n" ++
+                "- Required parameters MUST be specified\n" ++
+                "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n" ++
+                "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n" ++
+                "</IMPORTANT>",
+        );
+        if (sys_trimmed.len > 0) {
+            try out.appendSlice(allocator, "\n\n");
+            try out.appendSlice(allocator, sys_trimmed);
+        }
+        try out.appendSlice(allocator, "<|im_end|>\n");
+    } else if (sys_trimmed.len > 0 or reasoning_instr.len > 0) {
+        try out.appendSlice(allocator, "<|im_start|>system\n");
+        if (reasoning_instr.len > 0) {
+            try out.appendSlice(allocator, reasoning_instr);
+            if (sys_trimmed.len > 0) try out.appendSlice(allocator, "\n\n");
+        }
+        if (sys_trimmed.len > 0) {
+            try out.appendSlice(allocator, sys_trimmed);
         }
         try out.appendSlice(allocator, "<|im_end|>\n");
     }
+
+    // 2. Conversation turns
+    var msg_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer msg_buf.deinit(allocator);
+    var in_tool_group = false;
+
+    for (messages, 0..) |m, idx| {
+        if (m != .object) continue;
+        const role = if (m.object.get("role")) |rv| (if (rv == .string) rv.string else "user") else "user";
+        if (idx == 0 and first_is_system) continue;
+
+        if (std.mem.eql(u8, role, "tool")) {
+            if (!in_tool_group) {
+                try out.appendSlice(allocator, "<|im_start|>user");
+                in_tool_group = true;
+            }
+            msg_buf.clearRetainingCapacity();
+            try appendMessageContent(&msg_buf, allocator, m.object.get("content"));
+            try out.appendSlice(allocator, "\n<tool_response>\n");
+            try out.appendSlice(allocator, std.mem.trim(u8, msg_buf.items, " \t\r\n"));
+            try out.appendSlice(allocator, "\n</tool_response>");
+            continue;
+        }
+
+        if (in_tool_group) {
+            try out.appendSlice(allocator, "<|im_end|>\n");
+            in_tool_group = false;
+        }
+
+        msg_buf.clearRetainingCapacity();
+        try appendMessageContent(&msg_buf, allocator, m.object.get("content"));
+        const content_trimmed = std.mem.trim(u8, msg_buf.items, " \t\r\n");
+
+        if (std.mem.eql(u8, role, "assistant")) {
+            try out.appendSlice(allocator, "<|im_start|>assistant\n");
+            const rc_raw = if (m.object.get("reasoning_content") orelse m.object.get("reasoning")) |rv|
+                (if (rv == .string) rv.string else "")
+            else
+                "";
+            const rc_trimmed = std.mem.trim(u8, rc_raw, " \t\r\n");
+
+            if (rc_trimmed.len == 0 and std.mem.startsWith(u8, content_trimmed, "<think>")) {
+                // Client already embedded <think>...</think> inline in content
+                try out.appendSlice(allocator, content_trimmed);
+            } else {
+                try out.appendSlice(allocator, "<think>\n");
+                try out.appendSlice(allocator, rc_trimmed);
+                try out.appendSlice(allocator, "\n</think>\n\n");
+                try out.appendSlice(allocator, content_trimmed);
+            }
+
+            if (m.object.get("tool_calls")) |tcv| {
+                if (tcv == .array) {
+                    for (tcv.array.items, 0..) |tc_item, tc_i| {
+                        if (tc_item != .object) continue;
+                        const fn_obj = if (tc_item.object.get("function")) |fv|
+                            (if (fv == .object) fv.object else tc_item.object)
+                        else
+                            tc_item.object;
+                        const fn_name = if (fn_obj.get("name")) |nv| (if (nv == .string) nv.string else "") else "";
+                        if (tc_i == 0) {
+                            if (content_trimmed.len > 0) try out.appendSlice(allocator, "\n\n");
+                        } else {
+                            try out.append(allocator, '\n');
+                        }
+                        try out.appendSlice(allocator, "<tool_call>\n<function=");
+                        try out.appendSlice(allocator, fn_name);
+                        try out.appendSlice(allocator, ">\n");
+                        if (fn_obj.get("arguments")) |av| {
+                            var parsed_args: ?std.json.Parsed(std.json.Value) = null;
+                            defer if (parsed_args) |*pa| pa.deinit();
+                            const args_map_opt: ?std.json.ObjectMap = switch (av) {
+                                .object => |o| o,
+                                .string => |s| blk: {
+                                    parsed_args = std.json.parseFromSlice(std.json.Value, allocator, s, .{}) catch null;
+                                    if (parsed_args) |pa| {
+                                        if (pa.value == .object) break :blk pa.value.object;
+                                    }
+                                    break :blk null;
+                                },
+                                else => null,
+                            };
+                            if (args_map_opt) |amap| {
+                                var it = amap.iterator();
+                                while (it.next()) |entry| {
+                                    try out.appendSlice(allocator, "<parameter=");
+                                    try out.appendSlice(allocator, entry.key_ptr.*);
+                                    try out.appendSlice(allocator, ">\n");
+                                    if (entry.value_ptr.* == .string) {
+                                        try out.appendSlice(allocator, entry.value_ptr.string);
+                                    } else {
+                                        try appendJsonValue(&out, allocator, entry.value_ptr.*);
+                                    }
+                                    try out.appendSlice(allocator, "\n</parameter>\n");
+                                }
+                            }
+                        }
+                        try out.appendSlice(allocator, "</function>\n</tool_call>");
+                    }
+                }
+            }
+            try out.appendSlice(allocator, "<|im_end|>\n");
+        } else {
+            try out.appendSlice(allocator, "<|im_start|>");
+            try out.appendSlice(allocator, role);
+            try out.append(allocator, '\n');
+            try out.appendSlice(allocator, content_trimmed);
+            try out.appendSlice(allocator, "<|im_end|>\n");
+        }
+    }
+    if (in_tool_group) {
+        try out.appendSlice(allocator, "<|im_end|>\n");
+    }
+
+    // 3. Generation prompt (exact GGUF chat_template!)
     try out.appendSlice(allocator, "<|im_start|>assistant\n");
-    if (!enable_thinking) {
-        try out.appendSlice(allocator, "<think>\n\n</think>\n");
+    if (effort == .none) {
+        try out.appendSlice(allocator, "<think>\n\n</think>\n\n");
+    } else {
+        try out.appendSlice(allocator, "<think>\n");
     }
     return try out.toOwnedSlice(allocator);
 }
@@ -482,6 +797,7 @@ fn sendSseChunk(
     req_id: []const u8,
     created: i64,
     text_delta: ?[]const u8,
+    is_reasoning: bool,
     send_role: bool,
     finish_reason: ?[]const u8,
     stats_opt: ?GenStats,
@@ -503,7 +819,11 @@ fn sendSseChunk(
         }
         if (text_delta) |td| {
             if (need_comma) try j.append(allocator, ',');
-            try j.appendSlice(allocator, "\"content\":\"");
+            if (is_reasoning) {
+                try j.appendSlice(allocator, "\"reasoning_content\":\"");
+            } else {
+                try j.appendSlice(allocator, "\"content\":\"");
+            }
             try appendJsonEscaped(&j, allocator, td);
             try j.append(allocator, '"');
         }
@@ -700,13 +1020,18 @@ const ServerState = struct {
         return sys_toks.len;
     }
 
-    /// If the ChatML prompt ends with `<think>\n\n</think>\n` (enable_thinking=false),
-    /// return the token length right BEFORE that suffix (at `<|im_start|>assistant\n`).
-    /// On the next turn, the assistant's reply replaces that empty think block, so checkpointing
-    /// here guarantees multi-turn history cache hits across Turn 2, Turn 3, ..., Turn N!
+    /// If the ChatML prompt ends with `<think>\n\n</think>\n\n` (effort=none) or `<think>\n` (thinking enabled),
+    /// return the token length right BEFORE `<think>` (at `<|im_start|>assistant\n`).
+    /// On the next turn, clients that strip historical `reasoning_content` send `<think>\n\n</think>\n\n`
+    /// where `\n\n` merges into a single BPE token (differing from `<think>\n` at the last token).
+    /// Checkpointing right before `<think>` guarantees multi-turn cache hits whether clients keep or strip reasoning!
     fn detectTurnBoundary(self: *ServerState, prompt: []const u8, prompt_toks: []const u32) ?usize {
-        const suffix = "<think>\n\n</think>\n";
-        if (!std.mem.endsWith(u8, prompt, suffix)) return null;
+        const suffix: []const u8 = if (std.mem.endsWith(u8, prompt, "<think>\n\n</think>\n\n"))
+            "<think>\n\n</think>\n\n"
+        else if (std.mem.endsWith(u8, prompt, "<think>\n"))
+            "<think>\n"
+        else
+            return null;
         const prefix_bytes = prompt.len - suffix.len;
         if (prefix_bytes == 0) return null;
         const pre_toks = self.tok.encode(self.allocator, prompt[0..prefix_bytes]) catch return null;
@@ -722,6 +1047,7 @@ const ServerState = struct {
         mode: Mode,
         prompt: []const u8,
         params_in: GenParams,
+        effort: ReasoningEffort,
     ) !void {
         const prompt_toks = try self.tok.encode(self.allocator, prompt);
         defer self.allocator.free(prompt_toks);
@@ -763,7 +1089,7 @@ const ServerState = struct {
         if (params.stream) {
             try sendSseHeaders(fd);
             if (mode == .chat) {
-                try sendSseChunk(self.allocator, fd, mode, req_id, created, null, true, null, null);
+                try sendSseChunk(self.allocator, fd, mode, req_id, created, null, false, true, null, null);
             }
         }
 
@@ -832,6 +1158,9 @@ const ServerState = struct {
             .finish_reason = "length",
         };
 
+        var reasoning_text: std.ArrayListUnmanaged(u8) = .empty;
+        defer reasoning_text.deinit(self.allocator);
+
         var full_text: std.ArrayListUnmanaged(u8) = .empty;
         defer full_text.deinit(self.allocator);
 
@@ -846,6 +1175,16 @@ const ServerState = struct {
             if (st.len > max_stop_len) max_stop_len = st.len;
         }
 
+        const ThinkState = struct {
+            in_thinking: bool,
+            strip_post_think_nl: bool = false,
+            reasoning: *std.ArrayListUnmanaged(u8),
+        };
+        var think_st: ThinkState = .{
+            .in_thinking = (mode == .chat and effort != .none),
+            .reasoning = &reasoning_text,
+        };
+
         const emitToken = struct {
             fn call(
                 st_self: *ServerState,
@@ -859,6 +1198,7 @@ const ServerState = struct {
                 p_buf: *std.ArrayListUnmanaged(u8),
                 full_t: *std.ArrayListUnmanaged(u8),
                 pend: *std.ArrayListUnmanaged(u8),
+                t_st: *ThinkState,
                 g_stats: *GenStats,
             ) !bool {
                 if (st_self.tok.isEos(tok_id)) {
@@ -868,14 +1208,68 @@ const ServerState = struct {
                 g_stats.completion_tokens += 1;
                 p_buf.clearRetainingCapacity();
                 try st_self.tok.decodeTokenTo(tok_id, p_buf, st_self.allocator);
-                try full_t.appendSlice(st_self.allocator, p_buf.items);
+
+                var piece: []const u8 = p_buf.items;
+
+                // Separate <think>...</think> into OpenAI/DeepSeek reasoning_content vs content
+                if (mode_c == .chat and t_st.in_thinking) {
+                    if (std.mem.eql(u8, piece, "<think>")) {
+                        // Prompt already opened <think>\n; ignore any redundant opening tag
+                        if (g_stats.completion_tokens >= p_c.max_tokens) {
+                            g_stats.finish_reason = "length";
+                            return true;
+                        }
+                        return false;
+                    }
+                    if (std.mem.indexOf(u8, piece, "</think>")) |close_idx| {
+                        const before = piece[0..close_idx];
+                        if (before.len > 0) {
+                            try t_st.reasoning.appendSlice(st_self.allocator, before);
+                            if (p_c.stream) try pend.appendSlice(st_self.allocator, before);
+                        }
+                        // Flush all remaining reasoning bytes before switching to content mode
+                        if (p_c.stream and pend.items.len > 0) {
+                            try sendSseChunk(st_self.allocator, fd_c, mode_c, req_id_c, created_c, pend.items, true, false, null, null);
+                            pend.clearRetainingCapacity();
+                        }
+                        t_st.in_thinking = false;
+                        t_st.strip_post_think_nl = true;
+
+                        const after = piece[close_idx + "</think>".len ..];
+                        const after_trimmed = std.mem.trimStart(u8, after, "\r\n");
+                        if (after_trimmed.len == 0) {
+                            if (g_stats.completion_tokens >= p_c.max_tokens) {
+                                g_stats.finish_reason = "length";
+                                return true;
+                            }
+                            return false;
+                        }
+                        t_st.strip_post_think_nl = false;
+                        piece = after_trimmed;
+                    }
+                } else if (mode_c == .chat and t_st.strip_post_think_nl) {
+                    const trimmed = std.mem.trimStart(u8, piece, "\r\n");
+                    if (trimmed.len == 0) {
+                        if (g_stats.completion_tokens >= p_c.max_tokens) {
+                            g_stats.finish_reason = "length";
+                            return true;
+                        }
+                        return false;
+                    }
+                    t_st.strip_post_think_nl = false;
+                    piece = trimmed;
+                }
+
+                const is_reason = (mode_c == .chat and t_st.in_thinking);
+                const dst_text = if (is_reason) t_st.reasoning else full_t;
+                try dst_text.appendSlice(st_self.allocator, piece);
 
                 if (p_c.stream) {
-                    try pend.appendSlice(st_self.allocator, p_buf.items);
-                    if (p_c.n_stops > 0) {
+                    try pend.appendSlice(st_self.allocator, piece);
+                    if (!is_reason and p_c.n_stops > 0) {
                         if (findStopInText(pend.items, p_c.stops[0..p_c.n_stops])) |sidx| {
                             if (sidx > 0) {
-                                try sendSseChunk(st_self.allocator, fd_c, mode_c, req_id_c, created_c, pend.items[0..sidx], false, null, null);
+                                try sendSseChunk(st_self.allocator, fd_c, mode_c, req_id_c, created_c, pend.items[0..sidx], false, false, null, null);
                             }
                             pend.clearRetainingCapacity();
                             g_stats.finish_reason = "stop";
@@ -885,7 +1279,7 @@ const ServerState = struct {
                         const safe_stop_len = if (pend.items.len > max_sl) pend.items.len - (max_sl - 1) else 0;
                         const ready = utf8ReadyPrefixLen(pend.items[0..safe_stop_len]);
                         if (ready > 0) {
-                            try sendSseChunk(st_self.allocator, fd_c, mode_c, req_id_c, created_c, pend.items[0..ready], false, null, null);
+                            try sendSseChunk(st_self.allocator, fd_c, mode_c, req_id_c, created_c, pend.items[0..ready], false, false, null, null);
                             const rem = pend.items.len - ready;
                             std.mem.copyForwards(u8, pend.items[0..rem], pend.items[ready..]);
                             pend.shrinkRetainingCapacity(rem);
@@ -893,13 +1287,13 @@ const ServerState = struct {
                     } else {
                         const ready = utf8ReadyPrefixLen(pend.items);
                         if (ready > 0) {
-                            try sendSseChunk(st_self.allocator, fd_c, mode_c, req_id_c, created_c, pend.items[0..ready], false, null, null);
+                            try sendSseChunk(st_self.allocator, fd_c, mode_c, req_id_c, created_c, pend.items[0..ready], is_reason, false, null, null);
                             const rem = pend.items.len - ready;
                             std.mem.copyForwards(u8, pend.items[0..rem], pend.items[ready..]);
                             pend.shrinkRetainingCapacity(rem);
                         }
                     }
-                } else if (p_c.n_stops > 0) {
+                } else if (!is_reason and p_c.n_stops > 0) {
                     if (findStopInText(full_t.items, p_c.stops[0..p_c.n_stops])) |sidx| {
                         full_t.shrinkRetainingCapacity(sidx);
                         g_stats.finish_reason = "stop";
@@ -919,7 +1313,7 @@ const ServerState = struct {
 
         const td0 = nowMs();
         if (params.max_tokens > 0) {
-            var stopped = try emitToken(self, cur, fd, mode, req_id, created, params, max_stop_len, &piece_buf, &full_text, &stream_pending, &stats);
+            var stopped = try emitToken(self, cur, fd, mode, req_id, created, params, max_stop_len, &piece_buf, &full_text, &stream_pending, &think_st, &stats);
 
             if (!stopped) {
                 if (self.dflash) |df| {
@@ -944,7 +1338,7 @@ const ServerState = struct {
                                 out.tokens[k]
                             else
                                 engine_mod.sampleFromCandidates(&out.cands[k], params.temperature, params.top_k, params.top_p, &rng);
-                            stopped = try emitToken(self, t_tok, fd, mode, req_id, created, params, max_stop_len, &piece_buf, &full_text, &stream_pending, &stats);
+                            stopped = try emitToken(self, t_tok, fd, mode, req_id, created, params, max_stop_len, &piece_buf, &full_text, &stream_pending, &think_st, &stats);
                             if (stopped) break;
                             if (t_tok == draft_toks[k]) {
                                 n_acc += 1;
@@ -960,7 +1354,7 @@ const ServerState = struct {
                                 out.tokens[n_draft]
                             else
                                 engine_mod.sampleFromCandidates(&out.cands[n_draft], params.temperature, params.top_k, params.top_p, &rng);
-                            stopped = try emitToken(self, bonus, fd, mode, req_id, created, params, max_stop_len, &piece_buf, &full_text, &stream_pending, &stats);
+                            stopped = try emitToken(self, bonus, fd, mode, req_id, created, params, max_stop_len, &piece_buf, &full_text, &stream_pending, &think_st, &stats);
                             next_tok = bonus;
                         }
                         if (stopped) break;
@@ -977,7 +1371,7 @@ const ServerState = struct {
                         const out = try self.eng.forward(&[_]u32{cur}, true, true);
                         try self.active_tokens.append(self.allocator, cur);
                         cur = engine_mod.sampleFromCandidates(&out.cands[0], params.temperature, params.top_k, params.top_p, &rng);
-                        stopped = try emitToken(self, cur, fd, mode, req_id, created, params, max_stop_len, &piece_buf, &full_text, &stream_pending, &stats);
+                        stopped = try emitToken(self, cur, fd, mode, req_id, created, params, max_stop_len, &piece_buf, &full_text, &stream_pending, &think_st, &stats);
                     }
                 }
             }
@@ -988,10 +1382,10 @@ const ServerState = struct {
         if (params.stream) {
             // Flush any buffered UTF-8 / stop-tail bytes before final chunk
             if (stream_pending.items.len > 0) {
-                try sendSseChunk(self.allocator, fd, mode, req_id, created, stream_pending.items, false, null, null);
+                try sendSseChunk(self.allocator, fd, mode, req_id, created, stream_pending.items, mode == .chat and think_st.in_thinking, false, null, null);
                 stream_pending.clearRetainingCapacity();
             }
-            try sendSseChunk(self.allocator, fd, mode, req_id, created, null, false, stats.finish_reason, stats);
+            try sendSseChunk(self.allocator, fd, mode, req_id, created, null, false, false, stats.finish_reason, stats);
             try sendAll(fd, "data: [DONE]\n\n");
         } else {
             var j: std.ArrayListUnmanaged(u8) = .empty;
@@ -1005,6 +1399,10 @@ const ServerState = struct {
                     req_id, created, MODEL_ID,
                 });
                 try appendJsonEscaped(&j, self.allocator, full_text.items);
+                if (reasoning_text.items.len > 0) {
+                    try j.appendSlice(self.allocator, "\",\"reasoning_content\":\"");
+                    try appendJsonEscaped(&j, self.allocator, reasoning_text.items);
+                }
                 try appendFmt(&j, self.allocator, "\"}},\"finish_reason\":\"{s}\"}}]", .{stats.finish_reason});
             } else {
                 try appendFmt(&j, self.allocator, "{{\"id\":\"{s}\",\"object\":\"text_completion\",\"created\":{d},\"model\":\"{s}\",\"choices\":[{{\"text\":\"", .{
@@ -1047,10 +1445,11 @@ const ServerState = struct {
         const dps_log = if (stats.decode_ms > 0.0) @as(f64, @floatFromInt(stats.completion_tokens)) * 1000.0 / stats.decode_ms else 0.0;
         const new_prompt_toks = prompt_toks.len - resume_pos;
         std.debug.print(
-            "[kintsugi-zig] {s} stream={} | prompt={d} (cached={d}, new={d}, {d:.1} ms) | gen={d} ({d:.1} ms, {d:.2} tok/s) | spec={d}/{d} ({d} steps)\n",
+            "[kintsugi-zig] {s} stream={} effort={s} | prompt={d} (cached={d}, new={d}, {d:.1} ms) | gen={d} ({d:.1} ms, {d:.2} tok/s) | spec={d}/{d} ({d} steps)\n",
             .{
                 if (mode == .chat) "POST /v1/chat/completions" else "POST /v1/completions",
                 params.stream,
+                effort.name(),
                 stats.prompt_tokens,
                 resume_pos,
                 new_prompt_toks,
@@ -1141,7 +1540,7 @@ const ServerState = struct {
                 return;
             }
             const params = parseGenParams(parsed.value.object);
-            try self.runGeneration(fd, .completion, prompt_val.string, params);
+            try self.runGeneration(fd, .completion, prompt_val.string, params, .none);
             return;
         }
 
@@ -1163,20 +1562,15 @@ const ServerState = struct {
                 try sendHttpJson(fd, self.allocator, "400 Bad Request", "{\"error\":{\"message\":\"'messages' must be an array\"}}");
                 return;
             }
-            var enable_thinking = true;
-            if (parsed.value.object.get("enable_thinking")) |tv| {
-                if (tv == .bool) enable_thinking = tv.bool;
-            } else if (parsed.value.object.get("chat_template_kwargs")) |kw| {
-                if (kw == .object) {
-                    if (kw.object.get("enable_thinking")) |tv| {
-                        if (tv == .bool) enable_thinking = tv.bool;
-                    }
-                }
-            }
-            const formatted = try formatChatMl(self.allocator, msgs_val.array.items, enable_thinking);
+            const effort = parseReasoningEffort(parsed.value.object);
+            const tools_opt: ?[]const std.json.Value = if (parsed.value.object.get("tools")) |tv|
+                (if (tv == .array) tv.array.items else null)
+            else
+                null;
+            const formatted = try formatChatMl(self.allocator, msgs_val.array.items, effort, tools_opt);
             defer self.allocator.free(formatted);
             const params = parseGenParams(parsed.value.object);
-            try self.runGeneration(fd, .chat, formatted, params);
+            try self.runGeneration(fd, .chat, formatted, params, effort);
             return;
         }
 
@@ -1357,11 +1751,59 @@ test "formatChatMl supports both string and multimodal array message content" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
     defer parsed.deinit();
 
-    const formatted = try formatChatMl(std.testing.allocator, parsed.value.array.items, false);
+    const formatted = try formatChatMl(std.testing.allocator, parsed.value.array.items, .none, null);
     defer std.testing.allocator.free(formatted);
 
     try std.testing.expectEqualStrings(
-        "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nLine 1\nLine 2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n",
+        "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nLine 1\nLine 2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
         formatted,
     );
+}
+
+test "formatChatMl injects official reasoning_effort instructions and <think> prompt" {
+    const payload =
+        \\[{"role":"user","content":"2+2?"},{"role":"assistant","reasoning_content":"2+2=4","content":"4"},{"role":"user","content":"3+3?"}]
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+
+    const low = try formatChatMl(std.testing.allocator, parsed.value.array.items, .low, null);
+    defer std.testing.allocator.free(low);
+    try std.testing.expect(std.mem.startsWith(u8, low, "<|im_start|>system\nReasoning effort is set to low."));
+    try std.testing.expect(std.mem.indexOf(u8, low, "<|im_start|>assistant\n<think>\n2+2=4\n</think>\n\n4<|im_end|>\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, low, "<|im_start|>assistant\n<think>\n"));
+
+    const med = try formatChatMl(std.testing.allocator, parsed.value.array.items, .medium, null);
+    defer std.testing.allocator.free(med);
+    try std.testing.expect(std.mem.startsWith(u8, med, "<|im_start|>user\n2+2?<|im_end|>\n"));
+    try std.testing.expect(std.mem.endsWith(u8, med, "<|im_start|>assistant\n<think>\n"));
+
+    const xhigh = try formatChatMl(std.testing.allocator, parsed.value.array.items, .xhigh, null);
+    defer std.testing.allocator.free(xhigh);
+    try std.testing.expect(std.mem.startsWith(u8, xhigh, "<|im_start|>system\nReasoning effort is set to xhigh."));
+    try std.testing.expect(std.mem.endsWith(u8, xhigh, "<|im_start|>assistant\n<think>\n"));
+}
+
+test "parseReasoningEffort handles OpenAI, DeepSeek, Anthropic and vLLM fields" {
+    const cases = [_]struct { json: []const u8, expected: ReasoningEffort }{
+        .{ .json = "{}", .expected = .xhigh },
+        .{ .json = "{\"reasoning_effort\":\"low\"}", .expected = .low },
+        .{ .json = "{\"reasoning_effort\":\"medium\"}", .expected = .medium },
+        .{ .json = "{\"reasoning_effort\":\"high\"}", .expected = .xhigh },
+        .{ .json = "{\"reasoning_effort\":\"xhigh\"}", .expected = .xhigh },
+        .{ .json = "{\"reasoning_effort\":\"none\"}", .expected = .none },
+        .{ .json = "{\"reasoning\":{\"effort\":\"low\"}}", .expected = .low },
+        .{ .json = "{\"reasoning\":{\"enabled\":false}}", .expected = .none },
+        .{ .json = "{\"enable_thinking\":false}", .expected = .none },
+        .{ .json = "{\"thinking\":{\"type\":\"disabled\"}}", .expected = .none },
+        .{ .json = "{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024}}", .expected = .low },
+        .{ .json = "{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":4096}}", .expected = .medium },
+        .{ .json = "{\"chat_template_kwargs\":{\"reasoning_effort\":\"low\"}}", .expected = .low },
+        .{ .json = "{\"chat_template_kwargs\":{\"enable_thinking\":false}}", .expected = .none },
+    };
+    for (cases) |c| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, c.json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(c.expected, parseReasoningEffort(parsed.value.object));
+    }
 }
