@@ -17,10 +17,12 @@ const attn_sm89_cubin align(8) = @embedFile("attn_sm89.cubin");
 const lmhead_sm89_cubin align(8) = @embedFile("lmhead_sm89.cubin");
 
 pub const MAX_M: usize = 8;
-pub const PREFILL_M: usize = 64;
+pub const PREFILL_M: usize = 128;
 pub const TOPK_K: usize = 64;
 pub const TOPK_BLOCKS: usize = 64;
-pub const MAX_SPLITS: usize = 8;
+pub const MAX_SPLITS: usize = 30;
+pub const MAX_PART_SLOTS: usize = 256; // max (m * n_splits), 256 * 24 * 256 * 4 = 6 MiB
+pub const NUM_ATTN_BUCKETS: usize = 5;
 pub const Q4_HEAD_BYTES: usize = 144; // 256 / 32 * 18
 pub const GDN_QKV_DIM: usize = 10240;
 pub const GDN_STATE_BYTES: usize = 48 * 48 * 128 * 128 * 4; // 144 MiB
@@ -210,8 +212,8 @@ pub const Engine = struct {
     h_meta_pos: i32 = 0,
 
     // Cached static CUDA Graphs (eliminates ~1,550 kernel launches/step!)
-    g_verify8: [3]?cuda.GraphExec = .{ null, null, null },
-    g_commit: [MAX_M]?cuda.GraphExec = .{ null, null, null, null, null, null, null, null },
+    g_verify8: [NUM_ATTN_BUCKETS]?cuda.GraphExec = @splat(null),
+    g_commit: [MAX_M]?cuda.GraphExec = @splat(null),
 
     // DFlash2 capture config (default: [6, 20, 34, 48, 62])
     capture_enabled: bool = false,
@@ -263,9 +265,9 @@ pub const Engine = struct {
         const off_gdn_v = bump(&sc_off, PREFILL_M * 6144 * 4);
         const off_gdn_g = bump(&sc_off, PREFILL_M * 48 * 4);
         const off_gdn_beta = bump(&sc_off, PREFILL_M * 48 * 4);
-        const off_part_o = bump(&sc_off, MAX_M * Spec.n_heads * MAX_SPLITS * Spec.head_dim * 4);
-        const off_part_m = bump(&sc_off, MAX_M * Spec.n_heads * MAX_SPLITS * 4);
-        const off_part_l = bump(&sc_off, MAX_M * Spec.n_heads * MAX_SPLITS * 4);
+        const off_part_o = bump(&sc_off, MAX_PART_SLOTS * Spec.n_heads * Spec.head_dim * 4);
+        const off_part_m = bump(&sc_off, MAX_PART_SLOTS * Spec.n_heads * 4);
+        const off_part_l = bump(&sc_off, MAX_PART_SLOTS * Spec.n_heads * 4);
         const off_xq81 = bump(&sc_off, MAX_M * (Spec.d_model / 32) * 36);
         const off_logits = bump(&sc_off, MAX_M * Spec.n_vocab * 4);
         const off_tk_pval = bump(&sc_off, MAX_M * TOPK_BLOCKS * TOPK_K * 4);
@@ -477,7 +479,16 @@ pub const Engine = struct {
         try self.ctx.copyHtoDAsync(self.d_meta_pos, std.mem.asBytes(&self.h_meta_pos));
 
         const total_seq = self.pos + m;
-        const attn_bucket: usize = if (total_seq >= 1024) 2 else if (total_seq >= 256) 1 else 0;
+        const attn_bucket: usize = if (total_seq >= 16384)
+            4
+        else if (total_seq >= 4096)
+            3
+        else if (total_seq >= 1024)
+            2
+        else if (total_seq >= 256)
+            1
+        else
+            0;
 
         // 2. Execute 64L Trunk (+ Stage-1 GPU LM Head if compute_logits)
         //    Hot speculative verify path (m==8, !commit_immediately, compute_logits, capture_enabled)
@@ -530,15 +541,42 @@ pub const Engine = struct {
         var p_dpos = self.d_meta_pos;
         var p_fb: f32 = Spec.rope_theta;
 
-        // Keep m * n_splits <= MAX_M * MAX_SPLITS (64) so d_part_o/m/l never overflow!
+        // Keep m * n_splits <= MAX_PART_SLOTS (256) so d_part_o/m/l never overflow!
+        // For m=8 decode: 4*2*n_splits blocks -> n_splits=15 (120 blks = 2.0 waves), n_splits=30 (240 blks = 4.0 waves on 60 SMs).
+        // For m=64 prefill: n_splits=4 (256 blks) removes the 64-on-60-SM wave-tail stall!
         const n_splits: u32 = if (m <= MAX_M)
-            (if (attn_bucket == 2) 7 else if (attn_bucket == 1) 4 else 1)
+            switch (attn_bucket) {
+                0 => 1,
+                1 => 4,
+                2 => 7,
+                3 => 15,
+                else => 30,
+            }
         else if (m <= 16)
-            (if (attn_bucket >= 1) 4 else 1)
+            switch (attn_bucket) {
+                0 => 1,
+                1 => 4,
+                2 => 7,
+                else => 15,
+            }
         else if (m <= 32)
-            (if (attn_bucket >= 1) 2 else 1)
+            switch (attn_bucket) {
+                0 => 1,
+                1 => 4,
+                else => 7,
+            }
+        else if (m <= 64)
+            switch (attn_bucket) {
+                0 => 1,
+                1 => 2,
+                else => 4,
+            }
         else
-            1;
+            switch (attn_bucket) {
+                0 => 1,
+                else => 2,
+            };
+        std.debug.assert(@as(usize, m) * @as(usize, n_splits) <= MAX_PART_SLOTS);
         const use_gqa6 = (attn_bucket >= 1) or (m > MAX_M);
 
         // Execute all 64 layers!
