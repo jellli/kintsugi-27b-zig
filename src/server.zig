@@ -2298,9 +2298,25 @@ const ServerState = struct {
 
             if (!stopped) {
                 if (self.dflash) |df| {
+                    const greedy = engine_mod.isGreedySampling(params.temperature, params.top_k, params.top_p);
+                    const draft_sampling: ?dflash_mod.DFlashEngine.DraftSampling = if (greedy) null else .{
+                        .temp = params.temperature,
+                        .top_k = params.top_k,
+                        .top_p = params.top_p,
+                        .rng = &rng,
+                    };
                     while (!stopped and stats.completion_tokens < params.max_tokens) {
                         var draft_toks: [dflash_mod.N_DRAFT]u32 = undefined;
-                        const n_draft = try df.draft(self.eng, cur, self.eng.pos, 0.0, &draft_toks);
+                        var draft_dists: [dflash_mod.N_DRAFT]engine_mod.CandidateDist = undefined;
+                        const n_draft = try df.draftSampled(
+                            self.eng,
+                            cur,
+                            self.eng.pos,
+                            0.0,
+                            draft_sampling,
+                            &draft_toks,
+                            if (greedy) null else &draft_dists,
+                        );
                         stats.draft_n += n_draft;
 
                         var batch: [dflash_mod.BLOCK_SIZE]u32 = undefined;
@@ -2315,23 +2331,31 @@ const ServerState = struct {
                         var next_tok: u32 = 0;
 
                         for (0..n_draft) |k| {
-                            const t_tok = if (params.temperature <= 0.0 or params.top_k == 1)
-                                out.tokens[k]
-                            else
-                                engine_mod.sampleFromCandidates(&out.cands[k], params.temperature, params.top_k, params.top_p, &rng);
-                            stopped = try emitToken(self, t_tok, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats);
+                            const vr: engine_mod.VerifyResult = if (greedy) .{
+                                .accepted = out.tokens[k] == draft_toks[k],
+                                .token = out.tokens[k],
+                            } else blk: {
+                                const target_dist = engine_mod.buildCandidateDist(
+                                    &out.cands[k],
+                                    params.temperature,
+                                    params.top_k,
+                                    params.top_p,
+                                );
+                                break :blk engine_mod.verifySpeculativeToken(&target_dist, &draft_dists[k], draft_toks[k], &rng);
+                            };
+                            stopped = try emitToken(self, vr.token, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats);
                             if (stopped) break;
-                            if (t_tok == draft_toks[k]) {
+                            if (vr.accepted) {
                                 n_acc += 1;
                             } else {
-                                next_tok = t_tok;
+                                next_tok = vr.token;
                                 break;
                             }
                         }
                         stats.draft_n_accepted += n_acc;
 
                         if (!stopped and n_acc == n_draft) {
-                            const bonus = if (params.temperature <= 0.0 or params.top_k == 1)
+                            const bonus = if (greedy)
                                 out.tokens[n_draft]
                             else
                                 engine_mod.sampleFromCandidates(&out.cands[n_draft], params.temperature, params.top_k, params.top_p, &rng);

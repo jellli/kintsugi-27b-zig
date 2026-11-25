@@ -595,6 +595,13 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var total_accepted: usize = 0;
 
     if (dflash_opt) |*df| {
+        const greedy = engine_mod.isGreedySampling(temp, 64, 0.95);
+        const draft_sampling: ?dflash_mod.DFlashEngine.DraftSampling = if (greedy) null else .{
+            .temp = temp,
+            .top_k = 64,
+            .top_p = 0.95,
+            .rng = &rng,
+        };
         if (!tok.isEos(cur) and max_tokens > 0) {
             try gen.append(allocator, cur);
             piece_buf.clearRetainingCapacity();
@@ -603,7 +610,16 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
             while (gen.items.len < max_tokens) {
                 var draft_toks: [dflash_mod.N_DRAFT]u32 = undefined;
-                const n_draft = try df.draft(&eng, cur, eng.pos, 0.0, &draft_toks);
+                var draft_dists: [dflash_mod.N_DRAFT]engine_mod.CandidateDist = undefined;
+                const n_draft = try df.draftSampled(
+                    &eng,
+                    cur,
+                    eng.pos,
+                    0.0,
+                    draft_sampling,
+                    &draft_toks,
+                    if (greedy) null else &draft_dists,
+                );
                 total_drafted += n_draft;
 
                 var batch: [dflash_mod.BLOCK_SIZE]u32 = undefined;
@@ -619,33 +635,36 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 var stopped = false;
 
                 for (0..n_draft) |k| {
-                    const t_tok = if (temp <= 0.0)
-                        out.tokens[k]
-                    else
-                        engine_mod.sampleFromCandidates(&out.cands[k], temp, 64, 0.95, &rng);
-                    if (tok.isEos(t_tok)) {
+                    const vr: engine_mod.VerifyResult = if (greedy) .{
+                        .accepted = out.tokens[k] == draft_toks[k],
+                        .token = out.tokens[k],
+                    } else blk: {
+                        const target_dist = engine_mod.buildCandidateDist(&out.cands[k], temp, 64, 0.95);
+                        break :blk engine_mod.verifySpeculativeToken(&target_dist, &draft_dists[k], draft_toks[k], &rng);
+                    };
+                    if (tok.isEos(vr.token)) {
                         stopped = true;
                         break;
                     }
-                    try gen.append(allocator, t_tok);
+                    try gen.append(allocator, vr.token);
                     piece_buf.clearRetainingCapacity();
-                    try tok.decodeTokenTo(t_tok, &piece_buf, allocator);
+                    try tok.decodeTokenTo(vr.token, &piece_buf, allocator);
                     std.debug.print("{s}", .{piece_buf.items});
                     if (gen.items.len >= max_tokens) {
                         stopped = true;
                         break;
                     }
-                    if (t_tok == draft_toks[k]) {
+                    if (vr.accepted) {
                         n_acc += 1;
                     } else {
-                        next_tok = t_tok;
+                        next_tok = vr.token;
                         break;
                     }
                 }
                 total_accepted += n_acc;
 
                 if (!stopped and n_acc == n_draft) {
-                    const bonus = if (temp <= 0.0)
+                    const bonus = if (greedy)
                         out.tokens[n_draft]
                     else
                         engine_mod.sampleFromCandidates(&out.cands[n_draft], temp, 64, 0.95, &rng);

@@ -1004,37 +1004,82 @@ fn bump(off: *usize, bytes: usize) usize {
     return aligned;
 }
 
-/// Top-k + top-p + temperature sampler on the exact Stage-2 Top-64 candidates!
-pub fn sampleFromCandidates(cands: *const CandidateList, temp: f32, top_k: u32, top_p: f32, rng: *std.Random.DefaultPrng) u32 {
+pub fn isGreedySampling(temp: f32, top_k: u32, top_p: f32) bool {
+    return !std.math.isFinite(temp) or temp <= 0.0 or top_k == 1 or (!std.math.isNan(top_p) and top_p <= 0.0);
+}
+
+/// Normalized discrete probability distribution over up to `TOPK_K` (64) candidate tokens.
+pub const CandidateDist = struct {
+    ids: [TOPK_K]u32 = @splat(0),
+    probs: [TOPK_K]f32 = @splat(0),
+    len: usize = 0,
+
+    pub fn pointMass(id: u32) CandidateDist {
+        var d: CandidateDist = .{};
+        d.ids[0] = id;
+        d.probs[0] = 1.0;
+        d.len = 1;
+        return d;
+    }
+
+    pub fn probOf(self: *const CandidateDist, id: u32) f32 {
+        for (0..self.len) |i| {
+            if (self.ids[i] == id) return self.probs[i];
+        }
+        return 0.0;
+    }
+
+    pub fn sample(self: *const CandidateDist, rng: *std.Random.DefaultPrng) u32 {
+        if (self.len == 0) return 0;
+        if (self.len == 1) return self.ids[0];
+        const r = rng.random().float(f32);
+        var acc: f32 = 0.0;
+        for (0..self.len) |i| {
+            acc += self.probs[i];
+            if (r < acc) return self.ids[i];
+        }
+        return self.ids[self.len - 1];
+    }
+};
+
+/// Build the normalized post-(temperature, top_k, top_p) probability distribution from arbitrary
+/// `(ids, logits)` slices (up to `TOPK_K` valid entries).
+pub fn buildDistFromLogits(
+    ids_in: []const i32,
+    logits_in: []const f32,
+    temp: f32,
+    top_k: u32,
+    top_p: f32,
+) CandidateDist {
     const Entry = struct { id: u32, val: f32 };
     var entries: [TOPK_K]Entry = undefined;
     var n: usize = 0;
-    for (0..TOPK_K) |i| {
-        if (cands.ids[i] >= 0 and !std.math.isNan(cands.logits[i])) {
-            entries[n] = .{ .id = @intCast(cands.ids[i]), .val = cands.logits[i] };
+    const count = @min(@min(ids_in.len, logits_in.len), TOPK_K);
+    for (0..count) |i| {
+        if (ids_in[i] >= 0 and !std.math.isNan(logits_in[i])) {
+            entries[n] = .{ .id = @intCast(ids_in[i]), .val = logits_in[i] };
             n += 1;
         }
     }
-    if (n == 0) return 0;
+    if (n == 0) return .{};
 
     // Greedy fast path (also handles non-finite temp, top_k == 1, or non-positive top_p)
-    const greedy = !std.math.isFinite(temp) or temp <= 0.0 or top_k == 1 or (!std.math.isNan(top_p) and top_p <= 0.0);
-    if (greedy) {
+    if (isGreedySampling(temp, top_k, top_p)) {
         var best = entries[0];
         for (entries[1..n]) |e| {
             if (e.val > best.val) best = e;
         }
-        return best.id;
+        return CandidateDist.pointMass(best.id);
     }
 
     std.mem.sort(Entry, entries[0..n], {}, struct {
         fn gt(_: void, a: Entry, b: Entry) bool {
-            return a.val > b.val;
+            return a.val > b.val or (a.val == b.val and a.id < b.id);
         }
     }.gt);
 
     const max_v = entries[0].val;
-    if (!std.math.isFinite(max_v)) return entries[0].id;
+    if (!std.math.isFinite(max_v)) return CandidateDist.pointMass(entries[0].id);
 
     const k_lim = if (top_k > 0 and top_k < n) @as(usize, top_k) else n;
     const inv_t: f32 = 1.0 / temp;
@@ -1046,7 +1091,7 @@ pub fn sampleFromCandidates(cands: *const CandidateList, temp: f32, top_k: u32, 
         probs[i] = p;
         sum += p;
     }
-    if (!(sum > 0.0) or !std.math.isFinite(sum)) return entries[0].id;
+    if (!(sum > 0.0) or !std.math.isFinite(sum)) return CandidateDist.pointMass(entries[0].id);
 
     const eff_top_p: f32 = if (std.math.isNan(top_p) or top_p > 1.0) 1.0 else top_p;
     const inv_sum = 1.0 / sum;
@@ -1060,13 +1105,83 @@ pub fn sampleFromCandidates(cands: *const CandidateList, temp: f32, top_k: u32, 
             break;
         }
     }
-    const r = rng.random().float(f32) * cum;
-    var acc: f32 = 0.0;
+
+    var out: CandidateDist = .{};
+    const inv_cum = if (cum > 0.0 and std.math.isFinite(cum)) 1.0 / cum else 1.0;
     for (0..cut) |i| {
-        acc += probs[i];
-        if (r <= acc) return entries[i].id;
+        out.ids[i] = entries[i].id;
+        out.probs[i] = probs[i] * inv_cum;
     }
-    return entries[cut - 1].id;
+    out.len = cut;
+    return out;
+}
+
+pub fn buildCandidateDist(cands: *const CandidateList, temp: f32, top_k: u32, top_p: f32) CandidateDist {
+    return buildDistFromLogits(&cands.ids, &cands.logits, temp, top_k, top_p);
+}
+
+/// Top-k + top-p + temperature sampler on the exact Stage-2 Top-64 candidates!
+pub fn sampleFromCandidates(cands: *const CandidateList, temp: f32, top_k: u32, top_p: f32, rng: *std.Random.DefaultPrng) u32 {
+    const dist = buildCandidateDist(cands, temp, top_k, top_p);
+    return dist.sample(rng);
+}
+
+pub const VerifyResult = struct {
+    accepted: bool,
+    token: u32,
+};
+
+/// Exact lossless speculative rejection sampling (Leviathan et al. 2023 / Chen et al. 2023):
+///   Given target distribution `p` and drafter proposal distribution `q` that produced `draft_tok`:
+///   1. Accept `draft_tok` with probability `min(1, p(draft_tok) / q(draft_tok))`.
+///   2. On rejection, sample replacement token from the residual distribution
+///      `p'(x) = max(0, p(x) - q(x)) / sum_y max(0, p(y) - q(y))`.
+///   The resulting token's marginal distribution equals `p` identically for every valid `q`.
+pub fn verifySpeculativeToken(
+    target_dist: *const CandidateDist,
+    draft_dist: *const CandidateDist,
+    draft_tok: u32,
+    rng: *std.Random.DefaultPrng,
+) VerifyResult {
+    if (target_dist.len == 0) return .{ .accepted = false, .token = 0 };
+
+    const p_d = target_dist.probOf(draft_tok);
+    const q_d = draft_dist.probOf(draft_tok);
+
+    if (p_d > 0.0) {
+        if (q_d <= 0.0 or p_d >= q_d) {
+            return .{ .accepted = true, .token = draft_tok };
+        }
+        if (rng.random().float(f32) < p_d / q_d) {
+            return .{ .accepted = true, .token = draft_tok };
+        }
+    }
+
+    // Rejected: draw from residual p'(x) proportional to max(0, p(x) - q(x))
+    var res_probs: [TOPK_K]f32 = undefined;
+    var res_sum: f32 = 0.0;
+    for (0..target_dist.len) |i| {
+        const diff = target_dist.probs[i] - draft_dist.probOf(target_dist.ids[i]);
+        const rp: f32 = if (diff > 0.0) diff else 0.0;
+        res_probs[i] = rp;
+        res_sum += rp;
+    }
+
+    if (res_sum > 0.0 and std.math.isFinite(res_sum)) {
+        const u = rng.random().float(f32) * res_sum;
+        var acc: f32 = 0.0;
+        var last_pos: usize = 0;
+        for (0..target_dist.len) |i| {
+            if (res_probs[i] > 0.0) last_pos = i;
+            acc += res_probs[i];
+            if (u < acc) {
+                return .{ .accepted = false, .token = target_dist.ids[i] };
+            }
+        }
+        return .{ .accepted = false, .token = target_dist.ids[last_pos] };
+    }
+
+    return .{ .accepted = false, .token = target_dist.sample(rng) };
 }
 
 test "sampleFromCandidates greedy ignores invalid slots, NaN, and handles non-finite temp" {
@@ -1148,4 +1263,80 @@ test "sampleFromCandidates respects top_k, top_p, top_k=0, and seed determinism"
         if (tok == 400) seen_400 = true;
     }
     try std.testing.expect(seen_400);
+}
+
+test "verifySpeculativeToken preserves exact target marginal distribution and optimal acceptance rate" {
+    // Target p over {10, 20, 30, 40}: [0.40, 0.30, 0.20, 0.10]
+    var target: CandidateDist = .{};
+    target.ids[0] = 10;
+    target.probs[0] = 0.40;
+    target.ids[1] = 20;
+    target.probs[1] = 0.30;
+    target.ids[2] = 30;
+    target.probs[2] = 0.20;
+    target.ids[3] = 40;
+    target.probs[3] = 0.10;
+    target.len = 4;
+
+    // 1. Identical proposal q == p must achieve 100% acceptance!
+    var rng = std.Random.DefaultPrng.init(2026);
+    for (0..2000) |_| {
+        const d = target.sample(&rng);
+        const vr = verifySpeculativeToken(&target, &target, d, &rng);
+        try std.testing.expect(vr.accepted);
+        try std.testing.expectEqual(d, vr.token);
+    }
+
+    // 2. Mismatched proposal q with partial overlap + out-of-support token 99:
+    //    q over {10, 20, 30, 99}: [0.55, 0.15, 0.20, 0.10]
+    //    Theoretical acceptance = sum_x min(p(x), q(x)) = 0.40 + 0.15 + 0.20 + 0.00 = 0.75
+    var draft: CandidateDist = .{};
+    draft.ids[0] = 10;
+    draft.probs[0] = 0.55;
+    draft.ids[1] = 20;
+    draft.probs[1] = 0.15;
+    draft.ids[2] = 30;
+    draft.probs[2] = 0.20;
+    draft.ids[3] = 99; // not in target!
+    draft.probs[3] = 0.10;
+    draft.len = 4;
+
+    const trials: usize = 200_000;
+    var counts: [4]usize = .{ 0, 0, 0, 0 };
+    var accepted: usize = 0;
+    for (0..trials) |_| {
+        const d = draft.sample(&rng);
+        const vr = verifySpeculativeToken(&target, &draft, d, &rng);
+        if (vr.accepted) accepted += 1;
+        switch (vr.token) {
+            10 => counts[0] += 1,
+            20 => counts[1] += 1,
+            30 => counts[2] += 1,
+            40 => counts[3] += 1,
+            else => return error.UnexpectedOutOfSupportToken,
+        }
+    }
+
+    const inv_n: f64 = 1.0 / @as(f64, @floatFromInt(trials));
+    const acc_rate = @as(f64, @floatFromInt(accepted)) * inv_n;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), acc_rate, 0.006);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.40), @as(f64, @floatFromInt(counts[0])) * inv_n, 0.006);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.30), @as(f64, @floatFromInt(counts[1])) * inv_n, 0.006);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.20), @as(f64, @floatFromInt(counts[2])) * inv_n, 0.006);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.10), @as(f64, @floatFromInt(counts[3])) * inv_n, 0.006);
+
+    // 3. Edge cases: out-of-support draft always rejected; empty target returns 0 safely; point masses match greedy
+    const vr_oos = verifySpeculativeToken(&target, &draft, 99, &rng);
+    try std.testing.expect(!vr_oos.accepted);
+    try std.testing.expect(vr_oos.token == 20 or vr_oos.token == 40); // only tokens with p(x) > q(x)
+
+    const empty_dist: CandidateDist = .{};
+    const vr_empty = verifySpeculativeToken(&empty_dist, &draft, 10, &rng);
+    try std.testing.expect(!vr_empty.accepted);
+    try std.testing.expectEqual(@as(u32, 0), vr_empty.token);
+
+    const pm_a = CandidateDist.pointMass(77);
+    const pm_b = CandidateDist.pointMass(88);
+    try std.testing.expectEqual(VerifyResult{ .accepted = true, .token = 77 }, verifySpeculativeToken(&pm_a, &pm_a, 77, &rng));
+    try std.testing.expectEqual(VerifyResult{ .accepted = false, .token = 77 }, verifySpeculativeToken(&pm_a, &pm_b, 88, &rng));
 }

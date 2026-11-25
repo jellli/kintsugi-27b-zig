@@ -678,8 +678,15 @@ pub const DFlashEngine = struct {
         try target.launchStage1LmHeadGpu(d_draft_hidden, N_DRAFT);
     }
 
+    pub const DraftSampling = struct {
+        temp: f32 = 0.0,
+        top_k: u32 = 64,
+        top_p: f32 = 1.0,
+        rng: *std.Random.DefaultPrng,
+    };
+
     /// Run DFlash2 5-layer noise-block diffusion on `[id_last, MASK * 7]` at positions `n_past..n_past+7`,
-    /// score through Target 2-stage LM Head, and run the exact DFlash2 selector walk on CPU!
+    /// score through Target 2-stage LM Head, and run the exact DFlash2 selector walk on CPU (greedy)!
     /// Returns number of drafted tokens (`0..7`, always `7` when `p_min == 0.0`).
     pub fn draft(
         self: *DFlashEngine,
@@ -688,6 +695,23 @@ pub const DFlashEngine = struct {
         n_past: u32,
         p_min: f32,
         draft_out: *[N_DRAFT]u32,
+    ) !u32 {
+        return self.draftSampled(target, id_last, n_past, p_min, null, draft_out, null);
+    }
+
+    /// Run DFlash2 drafting with optional stochastic sampling (`DraftSampling`).
+    /// When `sampling` is non-greedy, each selector step samples `draft_out[i] ~ q_i` (applying the
+    /// same temperature/top_k/top_p to the Top-16 selector scores) and writes `q_i` into `dists_out[i]`
+    /// so the caller can perform mathematically exact lossless speculative rejection sampling.
+    pub fn draftSampled(
+        self: *DFlashEngine,
+        target: *engine_mod.Engine,
+        id_last: u32,
+        n_past: u32,
+        p_min: f32,
+        sampling: ?DraftSampling,
+        draft_out: *[N_DRAFT]u32,
+        dists_out: ?*[N_DRAFT]engine_mod.CandidateDist,
     ) !u32 {
         // 1. Update anchor row 0 embedding (rows 1..7 are pre-populated with MASK!) + n_past async
         target.model.embedToken(id_last, self.h_emb_buf[0..D_MODEL]);
@@ -712,8 +736,10 @@ pub const DFlashEngine = struct {
         var lm_out: engine_mod.StepOutput = .{};
         try target.finishStage2LmHeadCpu(d_draft_hidden, N_DRAFT, &lm_out);
 
-        // 5. Exact DFlash2 Selector greedy walk on CPU (~2 us, zero VRAM!)
-        //    Matches llama.cpp build_dflash2_selector + common/speculative.cpp verbatim.
+        // 5. Exact DFlash2 Selector autoregressive walk on CPU (~2 us, zero VRAM!)
+        //    Matches llama.cpp build_dflash2_selector + common/speculative.cpp verbatim when greedy,
+        //    and draws from normalized selector scores when stochastic sampling is enabled.
+        const use_stochastic = if (sampling) |s| !engine_mod.isGreedySampling(s.temp, s.top_k, s.top_p) else false;
         var pred_tok: u32 = id_last;
         var prev_vec: [SELECTOR_RANK]f32 = undefined;
         var cond_vec: [SELECTOR_RANK]f32 = undefined;
@@ -751,12 +777,14 @@ pub const DFlashEngine = struct {
             }
 
             // Score Top-16 candidates: score[k] = unary[k] + dot(successor[cand_k], cond)
+            var sel_ids: [SELECTOR_TOP_K]i32 = @splat(-1);
             var scores: [SELECTOR_TOP_K]f32 = undefined;
             var best_k: usize = 0;
             var best_score: f32 = -3.4028234e38;
             for (0..SELECTOR_TOP_K) |k| {
                 const idx = order[k];
                 const cid = cands.ids[idx];
+                sel_ids[k] = cid;
                 if (cid < 0) {
                     scores[k] = -3.4028234e38;
                     continue;
@@ -778,7 +806,17 @@ pub const DFlashEngine = struct {
                 if (1.0 / exp_sum < p_min) break;
             }
 
-            const chosen_id: u32 = @intCast(cands.ids[order[best_k]]);
+            const chosen_id: u32 = if (use_stochastic) blk: {
+                const s = sampling.?;
+                const q_dist = engine_mod.buildDistFromLogits(&sel_ids, &scores, s.temp, s.top_k, s.top_p);
+                if (dists_out) |do| do[n_drafted] = q_dist;
+                break :blk q_dist.sample(s.rng);
+            } else blk: {
+                const cid = sel_ids[best_k];
+                const id: u32 = if (cid >= 0) @intCast(cid) else 0;
+                if (dists_out) |do| do[n_drafted] = engine_mod.CandidateDist.pointMass(id);
+                break :blk id;
+            };
             draft_out[n_drafted] = chosen_id;
             n_drafted += 1;
             pred_tok = chosen_id;
