@@ -873,6 +873,520 @@ fn sendSseChunk(
     try sendAll(fd, j.items);
 }
 
+fn sendToolCallSseStart(
+    allocator: std.mem.Allocator,
+    fd: std.c.fd_t,
+    req_id: []const u8,
+    created: i64,
+    call_index: usize,
+    call_id: []const u8,
+    fn_name: []const u8,
+) !void {
+    var j: std.ArrayListUnmanaged(u8) = .empty;
+    defer j.deinit(allocator);
+    try appendFmt(
+        &j,
+        allocator,
+        "data: {{\"id\":\"{s}\",\"object\":\"chat.completion.chunk\",\"created\":{d},\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":{d},\"id\":\"",
+        .{ req_id, created, MODEL_ID, call_index },
+    );
+    try appendJsonEscaped(&j, allocator, call_id);
+    try j.appendSlice(allocator, "\",\"type\":\"function\",\"function\":{\"name\":\"");
+    try appendJsonEscaped(&j, allocator, fn_name);
+    try j.appendSlice(allocator, "\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n");
+    try sendAll(fd, j.items);
+}
+
+fn sendToolCallSseArgs(
+    allocator: std.mem.Allocator,
+    fd: std.c.fd_t,
+    req_id: []const u8,
+    created: i64,
+    call_index: usize,
+    args_delta: []const u8,
+) !void {
+    if (args_delta.len == 0) return;
+    var j: std.ArrayListUnmanaged(u8) = .empty;
+    defer j.deinit(allocator);
+    try appendFmt(
+        &j,
+        allocator,
+        "data: {{\"id\":\"{s}\",\"object\":\"chat.completion.chunk\",\"created\":{d},\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":{d},\"function\":{{\"arguments\":\"",
+        .{ req_id, created, MODEL_ID, call_index },
+    );
+    try appendJsonEscaped(&j, allocator, args_delta);
+    try j.appendSlice(allocator, "\"}}]},\"finish_reason\":null}]}\n\n");
+    try sendAll(fd, j.items);
+}
+
+const ToolCallRecord = struct {
+    id: []u8,
+    name: []u8,
+    arguments: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn deinit(self: *ToolCallRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.name);
+        self.arguments.deinit(allocator);
+    }
+};
+
+fn partialTagSuffixLen(haystack: []const u8, needle: []const u8) usize {
+    const max_k = @min(haystack.len, needle.len - 1);
+    var k: usize = max_k;
+    while (k > 0) : (k -= 1) {
+        if (std.mem.endsWith(u8, haystack, needle[0..k])) return k;
+    }
+    return 0;
+}
+
+fn isAllAsciiWs(s: []const u8) bool {
+    for (s) |c| {
+        if (c != ' ' and c != '\t' and c != '\r' and c != '\n') return false;
+    }
+    return true;
+}
+
+fn stripOneTrailingNl(s: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, s, "\r\n")) return s[0 .. s.len - 2];
+    if (std.mem.endsWith(u8, s, "\n")) return s[0 .. s.len - 1];
+    return s;
+}
+
+fn lookupToolParamType(
+    tools_opt: ?[]const std.json.Value,
+    fn_name: []const u8,
+    param_name: []const u8,
+) ?[]const u8 {
+    const tools = tools_opt orelse return null;
+    for (tools) |tool| {
+        if (tool != .object) continue;
+        const fn_obj = if (tool.object.get("function")) |fv|
+            (if (fv == .object) fv.object else tool.object)
+        else
+            tool.object;
+        const name_val = fn_obj.get("name") orelse continue;
+        if (name_val != .string or !std.mem.eql(u8, name_val.string, fn_name)) continue;
+        const params_val = fn_obj.get("parameters") orelse return null;
+        if (params_val != .object) return null;
+        const props_val = params_val.object.get("properties") orelse return null;
+        if (props_val != .object) return null;
+        const prop_val = props_val.object.get(param_name) orelse return null;
+        if (prop_val != .object) return null;
+        const type_val = prop_val.object.get("type") orelse return null;
+        if (type_val == .string) return type_val.string;
+        return null;
+    }
+    return null;
+}
+
+/// Streaming parser for Qwen3 / Kintsugi-27B XML tool calls:
+///   `<tool_call>\n<function=NAME>\n<parameter=K>\nVALUE\n</parameter>\n</function>\n</tool_call>`
+/// Also supports JSON fallback `<tool_call>{"name":"...","arguments":{...}}</tool_call>`.
+/// String-typed parameters stream live into `delta.tool_calls[].function.arguments` with a 14-byte
+/// tail holdback so large HTML/code file writes never stall or trigger client read timeouts.
+const ToolCallParser = struct {
+    const Phase = enum {
+        outside,
+        await_call_body,
+        in_json_call,
+        await_param,
+        in_string_param,
+        in_typed_param,
+        await_call_close,
+    };
+
+    allocator: std.mem.Allocator,
+    req_id: []const u8,
+    tools_opt: ?[]const std.json.Value,
+    phase: Phase = .outside,
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    calls: std.ArrayListUnmanaged(ToolCallRecord) = .empty,
+    call_opened_brace: bool = false,
+    strip_leading_nl: bool = false,
+    cur_param_type: ?[]const u8 = null,
+
+    fn init(allocator: std.mem.Allocator, req_id: []const u8, tools_opt: ?[]const std.json.Value) ToolCallParser {
+        return .{
+            .allocator = allocator,
+            .req_id = req_id,
+            .tools_opt = tools_opt,
+        };
+    }
+
+    fn deinit(self: *ToolCallParser) void {
+        self.buf.deinit(self.allocator);
+        for (self.calls.items) |*c| c.deinit(self.allocator);
+        self.calls.deinit(self.allocator);
+    }
+
+    fn consumeFront(self: *ToolCallParser, n: usize) void {
+        if (n == 0) return;
+        const rem = self.buf.items.len - n;
+        if (rem > 0) {
+            std.mem.copyForwards(u8, self.buf.items[0..rem], self.buf.items[n..]);
+        }
+        self.buf.shrinkRetainingCapacity(rem);
+    }
+
+    fn trimFrontWs(self: *ToolCallParser) void {
+        var i: usize = 0;
+        while (i < self.buf.items.len) : (i += 1) {
+            const c = self.buf.items[i];
+            if (c != ' ' and c != '\t' and c != '\r' and c != '\n') break;
+        }
+        self.consumeFront(i);
+    }
+
+    /// Strip at most one leading `\r\n` or `\n`. Returns false if we need more bytes (`\r` at EOF).
+    fn tryStripOneLeadingNl(self: *ToolCallParser) bool {
+        if (!self.strip_leading_nl) return true;
+        if (self.buf.items.len == 0) return false;
+        if (self.buf.items[0] == '\r') {
+            if (self.buf.items.len == 1) return false;
+            if (self.buf.items[1] == '\n') {
+                self.consumeFront(2);
+            } else {
+                self.consumeFront(1);
+            }
+        } else if (self.buf.items[0] == '\n') {
+            self.consumeFront(1);
+        }
+        self.strip_leading_nl = false;
+        return true;
+    }
+
+    fn beginCall(self: *ToolCallParser, fn_name: []const u8, sink: anytype) !void {
+        const call_idx = self.calls.items.len;
+        const id = try std.fmt.allocPrint(self.allocator, "call_{s}_{d}", .{ self.req_id, call_idx });
+        errdefer self.allocator.free(id);
+        const name_dup = try self.allocator.dupe(u8, fn_name);
+        errdefer self.allocator.free(name_dup);
+
+        try self.calls.append(self.allocator, .{
+            .id = id,
+            .name = name_dup,
+        });
+        self.call_opened_brace = false;
+        try sink.onToolCallStart(call_idx, id, name_dup);
+    }
+
+    fn emitArgsDelta(self: *ToolCallParser, delta: []const u8, sink: anytype) !void {
+        if (delta.len == 0 or self.calls.items.len == 0) return;
+        const call_idx = self.calls.items.len - 1;
+        try self.calls.items[call_idx].arguments.appendSlice(self.allocator, delta);
+        try sink.onToolCallArgsDelta(call_idx, delta);
+    }
+
+    fn emitJsonEscapedValueChunk(self: *ToolCallParser, raw_chunk: []const u8, close_quote: bool, sink: anytype) !void {
+        var tmp: std.ArrayListUnmanaged(u8) = .empty;
+        defer tmp.deinit(self.allocator);
+        if (raw_chunk.len > 0) {
+            try appendJsonEscaped(&tmp, self.allocator, raw_chunk);
+        }
+        if (close_quote) try tmp.append(self.allocator, '"');
+        try self.emitArgsDelta(tmp.items, sink);
+    }
+
+    fn emitTypedParamValue(self: *ToolCallParser, raw_val: []const u8, sink: anytype) !void {
+        const trimmed = std.mem.trim(u8, raw_val, " \t\r\n");
+        const is_bool_schema = if (self.cur_param_type) |t| std.mem.eql(u8, t, "boolean") else false;
+        const is_string_schema = if (self.cur_param_type) |t| std.mem.eql(u8, t, "string") else false;
+
+        if (!is_string_schema and trimmed.len > 0) {
+            if (is_bool_schema) {
+                if (std.ascii.eqlIgnoreCase(trimmed, "true")) {
+                    try self.emitArgsDelta("true", sink);
+                    return;
+                }
+                if (std.ascii.eqlIgnoreCase(trimmed, "false")) {
+                    try self.emitArgsDelta("false", sink);
+                    return;
+                }
+            }
+            if (std.json.parseFromSlice(std.json.Value, self.allocator, trimmed, .{})) |parsed| {
+                defer parsed.deinit();
+                if (parsed.value != .string) {
+                    try self.emitArgsDelta(trimmed, sink);
+                    return;
+                }
+            } else |_| {}
+        }
+
+        // Default / string fallback: JSON-encoded string literal
+        var tmp: std.ArrayListUnmanaged(u8) = .empty;
+        defer tmp.deinit(self.allocator);
+        try tmp.append(self.allocator, '"');
+        try appendJsonEscaped(&tmp, self.allocator, raw_val);
+        try tmp.append(self.allocator, '"');
+        try self.emitArgsDelta(tmp.items, sink);
+    }
+
+    fn emitJsonFallbackCall(self: *ToolCallParser, raw_json: []const u8, sink: anytype) !bool {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, raw_json, .{}) catch return false;
+        defer parsed.deinit();
+        if (parsed.value != .object) return false;
+        const name_val = parsed.value.object.get("name") orelse return false;
+        if (name_val != .string or name_val.string.len == 0) return false;
+
+        try self.beginCall(name_val.string, sink);
+        if (parsed.value.object.get("arguments")) |av| {
+            switch (av) {
+                .string => |s| try self.emitArgsDelta(if (s.len > 0) s else "{}", sink),
+                else => {
+                    const s = try std.json.Stringify.valueAlloc(self.allocator, av, .{});
+                    defer self.allocator.free(s);
+                    try self.emitArgsDelta(s, sink);
+                },
+            }
+        } else {
+            try self.emitArgsDelta("{}", sink);
+        }
+        return true;
+    }
+
+    fn feed(self: *ToolCallParser, piece: []const u8, sink: anytype) !void {
+        if (piece.len > 0) {
+            try self.buf.appendSlice(self.allocator, piece);
+        }
+
+        while (self.buf.items.len > 0) {
+            switch (self.phase) {
+                .outside => {
+                    if (std.mem.indexOf(u8, self.buf.items, "<tool_call>")) |idx| {
+                        const before = self.buf.items[0..idx];
+                        if (before.len > 0 and !(self.calls.items.len > 0 and isAllAsciiWs(before))) {
+                            try sink.onContent(before);
+                        }
+                        self.consumeFront(idx + "<tool_call>".len);
+                        self.phase = .await_call_body;
+                        continue;
+                    }
+                    // Suppress pure inter-tool-call whitespace while waiting to see if another <tool_call> follows
+                    if (self.calls.items.len > 0 and isAllAsciiWs(self.buf.items)) {
+                        break;
+                    }
+                    const hold = partialTagSuffixLen(self.buf.items, "<tool_call>");
+                    const safe_len = self.buf.items.len - hold;
+                    if (self.calls.items.len > 0 and isAllAsciiWs(self.buf.items[0..safe_len])) {
+                        break;
+                    }
+                    const ready = utf8ReadyPrefixLen(self.buf.items[0..safe_len]);
+                    if (ready > 0) {
+                        try sink.onContent(self.buf.items[0..ready]);
+                        self.consumeFront(ready);
+                    }
+                    break;
+                },
+
+                .await_call_body => {
+                    self.trimFrontWs();
+                    if (self.buf.items.len == 0) break;
+
+                    if (self.buf.items[0] == '{') {
+                        self.phase = .in_json_call;
+                        continue;
+                    }
+                    if (std.mem.startsWith(u8, self.buf.items, "<function=")) {
+                        const gt_idx = std.mem.indexOfScalarPos(u8, self.buf.items, "<function=".len, '>') orelse {
+                            if (self.buf.items.len > 256) {
+                                // Malformed huge header; emit raw text and bail out
+                                try sink.onContent("<tool_call>");
+                                try sink.onContent(self.buf.items);
+                                self.buf.clearRetainingCapacity();
+                                self.phase = .outside;
+                            }
+                            break;
+                        };
+                        const fn_name = std.mem.trim(u8, self.buf.items["<function=".len .. gt_idx], " \t\r\n");
+                        try self.beginCall(fn_name, sink);
+                        self.consumeFront(gt_idx + 1);
+                        self.phase = .await_param;
+                        continue;
+                    }
+                    if (std.mem.startsWith(u8, self.buf.items, "</tool_call>")) {
+                        self.consumeFront("</tool_call>".len);
+                        self.phase = .outside;
+                        continue;
+                    }
+                    if (std.mem.startsWith(u8, "<function=", self.buf.items) or
+                        std.mem.startsWith(u8, "</tool_call>", self.buf.items))
+                    {
+                        break;
+                    }
+                    // Unexpected body inside <tool_call>: fall back to content
+                    try sink.onContent("<tool_call>");
+                    self.phase = .outside;
+                    continue;
+                },
+
+                .in_json_call => {
+                    const end_idx = std.mem.indexOf(u8, self.buf.items, "</tool_call>") orelse break;
+                    const raw_json = std.mem.trim(u8, self.buf.items[0..end_idx], " \t\r\n");
+                    const ok = try self.emitJsonFallbackCall(raw_json, sink);
+                    if (!ok) {
+                        try sink.onContent("<tool_call>");
+                        try sink.onContent(self.buf.items[0 .. end_idx + "</tool_call>".len]);
+                    }
+                    self.consumeFront(end_idx + "</tool_call>".len);
+                    self.phase = .outside;
+                    continue;
+                },
+
+                .await_param => {
+                    self.trimFrontWs();
+                    if (self.buf.items.len == 0) break;
+
+                    if (std.mem.startsWith(u8, self.buf.items, "<parameter=")) {
+                        const gt_idx = std.mem.indexOfScalarPos(u8, self.buf.items, "<parameter=".len, '>') orelse break;
+                        const param_name = std.mem.trim(u8, self.buf.items["<parameter=".len .. gt_idx], " \t\r\n");
+                        const cur_fn_name = self.calls.items[self.calls.items.len - 1].name;
+                        const ptype = lookupToolParamType(self.tools_opt, cur_fn_name, param_name);
+                        const is_str = if (ptype) |t| std.mem.eql(u8, t, "string") else false;
+
+                        var key_prefix: std.ArrayListUnmanaged(u8) = .empty;
+                        defer key_prefix.deinit(self.allocator);
+                        if (!self.call_opened_brace) {
+                            try key_prefix.append(self.allocator, '{');
+                            self.call_opened_brace = true;
+                        } else {
+                            try key_prefix.append(self.allocator, ',');
+                        }
+                        try key_prefix.append(self.allocator, '"');
+                        try appendJsonEscaped(&key_prefix, self.allocator, param_name);
+                        try key_prefix.appendSlice(self.allocator, "\":");
+                        if (is_str) try key_prefix.append(self.allocator, '"');
+
+                        try self.emitArgsDelta(key_prefix.items, sink);
+                        self.consumeFront(gt_idx + 1);
+                        self.cur_param_type = ptype;
+                        self.strip_leading_nl = true;
+                        self.phase = if (is_str) .in_string_param else .in_typed_param;
+                        continue;
+                    }
+                    if (std.mem.startsWith(u8, self.buf.items, "</function>")) {
+                        self.consumeFront("</function>".len);
+                        try self.emitArgsDelta(if (self.call_opened_brace) "}" else "{}", sink);
+                        self.phase = .await_call_close;
+                        continue;
+                    }
+                    if (std.mem.startsWith(u8, self.buf.items, "</tool_call>")) {
+                        self.consumeFront("</tool_call>".len);
+                        try self.emitArgsDelta(if (self.call_opened_brace) "}" else "{}", sink);
+                        self.phase = .outside;
+                        continue;
+                    }
+                    if (std.mem.startsWith(u8, "<parameter=", self.buf.items) or
+                        std.mem.startsWith(u8, "</function>", self.buf.items) or
+                        std.mem.startsWith(u8, "</tool_call>", self.buf.items))
+                    {
+                        break;
+                    }
+                    // Defensive recovery: skip unexpected non-tag byte until next '<'
+                    if (std.mem.indexOfScalar(u8, self.buf.items, '<')) |next_lt| {
+                        self.consumeFront(if (next_lt == 0) 1 else next_lt);
+                        continue;
+                    }
+                    self.buf.clearRetainingCapacity();
+                    break;
+                },
+
+                .in_string_param => {
+                    if (!self.tryStripOneLeadingNl()) break;
+                    if (std.mem.indexOf(u8, self.buf.items, "</parameter>")) |end_idx| {
+                        const val_chunk = stripOneTrailingNl(self.buf.items[0..end_idx]);
+                        try self.emitJsonEscapedValueChunk(val_chunk, true, sink);
+                        self.consumeFront(end_idx + "</parameter>".len);
+                        self.phase = .await_param;
+                        continue;
+                    }
+                    // Hold back enough bytes to never prematurely flush "\r\n</parameter>"
+                    const max_hold: usize = "</parameter>".len + 2;
+                    if (self.buf.items.len > max_hold) {
+                        const safe_len = self.buf.items.len - max_hold;
+                        const ready = utf8ReadyPrefixLen(self.buf.items[0..safe_len]);
+                        if (ready > 0) {
+                            try self.emitJsonEscapedValueChunk(self.buf.items[0..ready], false, sink);
+                            self.consumeFront(ready);
+                        }
+                    }
+                    break;
+                },
+
+                .in_typed_param => {
+                    if (!self.tryStripOneLeadingNl()) break;
+                    if (std.mem.indexOf(u8, self.buf.items, "</parameter>")) |end_idx| {
+                        const val_chunk = stripOneTrailingNl(self.buf.items[0..end_idx]);
+                        try self.emitTypedParamValue(val_chunk, sink);
+                        self.consumeFront(end_idx + "</parameter>".len);
+                        self.phase = .await_param;
+                        continue;
+                    }
+                    break;
+                },
+
+                .await_call_close => {
+                    self.trimFrontWs();
+                    if (self.buf.items.len == 0) break;
+                    if (std.mem.startsWith(u8, self.buf.items, "</tool_call>")) {
+                        self.consumeFront("</tool_call>".len);
+                        self.phase = .outside;
+                        continue;
+                    }
+                    if (std.mem.startsWith(u8, "</tool_call>", self.buf.items)) {
+                        break;
+                    }
+                    if (std.mem.startsWith(u8, self.buf.items, "<function=")) {
+                        self.phase = .await_call_body;
+                        continue;
+                    }
+                    self.phase = .outside;
+                    continue;
+                },
+            }
+        }
+    }
+
+    fn finish(self: *ToolCallParser, sink: anytype) !void {
+        switch (self.phase) {
+            .outside => {
+                if (self.buf.items.len > 0 and !(self.calls.items.len > 0 and isAllAsciiWs(self.buf.items))) {
+                    try sink.onContent(self.buf.items);
+                }
+            },
+            .in_string_param => {
+                const rem = stripOneTrailingNl(self.buf.items);
+                try self.emitJsonEscapedValueChunk(rem, true, sink);
+                try self.emitArgsDelta("}", sink);
+            },
+            .in_typed_param => {
+                const rem = stripOneTrailingNl(self.buf.items);
+                try self.emitTypedParamValue(rem, sink);
+                try self.emitArgsDelta("}", sink);
+            },
+            .await_param => {
+                try self.emitArgsDelta(if (self.call_opened_brace) "}" else "{}", sink);
+            },
+            .in_json_call => {
+                const raw_json = std.mem.trim(u8, self.buf.items, " \t\r\n");
+                if (!(try self.emitJsonFallbackCall(raw_json, sink))) {
+                    try sink.onContent("<tool_call>");
+                    try sink.onContent(self.buf.items);
+                }
+            },
+            .await_call_body => {
+                if (self.buf.items.len > 0 and !isAllAsciiWs(self.buf.items)) {
+                    try sink.onContent("<tool_call>");
+                    try sink.onContent(self.buf.items);
+                }
+            },
+            .await_call_close => {},
+        }
+        self.buf.clearRetainingCapacity();
+        self.phase = .outside;
+    }
+};
+
 const MAX_CHECKPOINTS: usize = 4;
 
 const PrefixCheckpoint = struct {
@@ -1048,6 +1562,7 @@ const ServerState = struct {
         prompt: []const u8,
         params_in: GenParams,
         effort: ReasoningEffort,
+        tools_opt: ?[]const std.json.Value,
     ) !void {
         const prompt_toks = try self.tok.encode(self.allocator, prompt);
         defer self.allocator.free(prompt_toks);
@@ -1175,14 +1690,106 @@ const ServerState = struct {
             if (st.len > max_stop_len) max_stop_len = st.len;
         }
 
+        const has_tools = mode == .chat and (if (tools_opt) |ts| ts.len > 0 else false);
+        var tool_parser = ToolCallParser.init(self.allocator, req_id, tools_opt);
+        defer tool_parser.deinit();
+
+        const LiveToolSink = struct {
+            allocator: std.mem.Allocator,
+            fd: std.c.fd_t,
+            mode: Mode,
+            req_id: []const u8,
+            created: i64,
+            params: GenParams,
+            max_sl: usize,
+            full_t: *std.ArrayListUnmanaged(u8),
+            pend: *std.ArrayListUnmanaged(u8),
+            stats: *GenStats,
+            hit_stop: bool = false,
+
+            fn onContent(s: *@This(), chunk: []const u8) !void {
+                if (chunk.len == 0 or s.hit_stop) return;
+                try s.full_t.appendSlice(s.allocator, chunk);
+                if (s.params.stream) {
+                    try s.pend.appendSlice(s.allocator, chunk);
+                    if (s.params.n_stops > 0) {
+                        if (findStopInText(s.pend.items, s.params.stops[0..s.params.n_stops])) |sidx| {
+                            if (sidx > 0) {
+                                try sendSseChunk(s.allocator, s.fd, s.mode, s.req_id, s.created, s.pend.items[0..sidx], false, false, null, null);
+                            }
+                            s.pend.clearRetainingCapacity();
+                            s.stats.finish_reason = "stop";
+                            s.hit_stop = true;
+                            return;
+                        }
+                        const safe_stop_len = if (s.pend.items.len > s.max_sl) s.pend.items.len - (s.max_sl - 1) else 0;
+                        const ready = utf8ReadyPrefixLen(s.pend.items[0..safe_stop_len]);
+                        if (ready > 0) {
+                            try sendSseChunk(s.allocator, s.fd, s.mode, s.req_id, s.created, s.pend.items[0..ready], false, false, null, null);
+                            const rem = s.pend.items.len - ready;
+                            std.mem.copyForwards(u8, s.pend.items[0..rem], s.pend.items[ready..]);
+                            s.pend.shrinkRetainingCapacity(rem);
+                        }
+                    } else {
+                        const ready = utf8ReadyPrefixLen(s.pend.items);
+                        if (ready > 0) {
+                            try sendSseChunk(s.allocator, s.fd, s.mode, s.req_id, s.created, s.pend.items[0..ready], false, false, null, null);
+                            const rem = s.pend.items.len - ready;
+                            std.mem.copyForwards(u8, s.pend.items[0..rem], s.pend.items[ready..]);
+                            s.pend.shrinkRetainingCapacity(rem);
+                        }
+                    }
+                } else if (s.params.n_stops > 0) {
+                    if (findStopInText(s.full_t.items, s.params.stops[0..s.params.n_stops])) |sidx| {
+                        s.full_t.shrinkRetainingCapacity(sidx);
+                        s.stats.finish_reason = "stop";
+                        s.hit_stop = true;
+                    }
+                }
+            }
+
+            fn onToolCallStart(s: *@This(), call_idx: usize, call_id: []const u8, fn_name: []const u8) !void {
+                if (!s.params.stream) return;
+                if (s.pend.items.len > 0) {
+                    try sendSseChunk(s.allocator, s.fd, s.mode, s.req_id, s.created, s.pend.items, false, false, null, null);
+                    s.pend.clearRetainingCapacity();
+                }
+                try sendToolCallSseStart(s.allocator, s.fd, s.req_id, s.created, call_idx, call_id, fn_name);
+            }
+
+            fn onToolCallArgsDelta(s: *@This(), call_idx: usize, args_delta: []const u8) !void {
+                if (!s.params.stream) return;
+                try sendToolCallSseArgs(s.allocator, s.fd, s.req_id, s.created, call_idx, args_delta);
+            }
+        };
+
+        var tool_sink: LiveToolSink = .{
+            .allocator = self.allocator,
+            .fd = fd,
+            .mode = mode,
+            .req_id = req_id,
+            .created = created,
+            .params = params,
+            .max_sl = max_stop_len,
+            .full_t = &full_text,
+            .pend = &stream_pending,
+            .stats = &stats,
+        };
+
         const ThinkState = struct {
             in_thinking: bool,
             strip_post_think_nl: bool = false,
+            has_tools: bool,
             reasoning: *std.ArrayListUnmanaged(u8),
+            parser: *ToolCallParser,
+            sink: *LiveToolSink,
         };
         var think_st: ThinkState = .{
             .in_thinking = (mode == .chat and effort != .none),
+            .has_tools = has_tools,
             .reasoning = &reasoning_text,
+            .parser = &tool_parser,
+            .sink = &tool_sink,
         };
 
         const emitToken = struct {
@@ -1194,9 +1801,7 @@ const ServerState = struct {
                 req_id_c: []const u8,
                 created_c: i64,
                 p_c: GenParams,
-                max_sl: usize,
                 p_buf: *std.ArrayListUnmanaged(u8),
-                full_t: *std.ArrayListUnmanaged(u8),
                 pend: *std.ArrayListUnmanaged(u8),
                 t_st: *ThinkState,
                 g_stats: *GenStats,
@@ -1260,45 +1865,24 @@ const ServerState = struct {
                     piece = trimmed;
                 }
 
-                const is_reason = (mode_c == .chat and t_st.in_thinking);
-                const dst_text = if (is_reason) t_st.reasoning else full_t;
-                try dst_text.appendSlice(st_self.allocator, piece);
-
-                if (p_c.stream) {
-                    try pend.appendSlice(st_self.allocator, piece);
-                    if (!is_reason and p_c.n_stops > 0) {
-                        if (findStopInText(pend.items, p_c.stops[0..p_c.n_stops])) |sidx| {
-                            if (sidx > 0) {
-                                try sendSseChunk(st_self.allocator, fd_c, mode_c, req_id_c, created_c, pend.items[0..sidx], false, false, null, null);
-                            }
-                            pend.clearRetainingCapacity();
-                            g_stats.finish_reason = "stop";
-                            return true;
-                        }
-                        // Hold back max_sl - 1 bytes so a stop sequence straddling tokens isn't flushed prematurely
-                        const safe_stop_len = if (pend.items.len > max_sl) pend.items.len - (max_sl - 1) else 0;
-                        const ready = utf8ReadyPrefixLen(pend.items[0..safe_stop_len]);
-                        if (ready > 0) {
-                            try sendSseChunk(st_self.allocator, fd_c, mode_c, req_id_c, created_c, pend.items[0..ready], false, false, null, null);
-                            const rem = pend.items.len - ready;
-                            std.mem.copyForwards(u8, pend.items[0..rem], pend.items[ready..]);
-                            pend.shrinkRetainingCapacity(rem);
-                        }
-                    } else {
+                if (mode_c == .chat and t_st.in_thinking) {
+                    try t_st.reasoning.appendSlice(st_self.allocator, piece);
+                    if (p_c.stream) {
+                        try pend.appendSlice(st_self.allocator, piece);
                         const ready = utf8ReadyPrefixLen(pend.items);
                         if (ready > 0) {
-                            try sendSseChunk(st_self.allocator, fd_c, mode_c, req_id_c, created_c, pend.items[0..ready], is_reason, false, null, null);
+                            try sendSseChunk(st_self.allocator, fd_c, mode_c, req_id_c, created_c, pend.items[0..ready], true, false, null, null);
                             const rem = pend.items.len - ready;
                             std.mem.copyForwards(u8, pend.items[0..rem], pend.items[ready..]);
                             pend.shrinkRetainingCapacity(rem);
                         }
                     }
-                } else if (!is_reason and p_c.n_stops > 0) {
-                    if (findStopInText(full_t.items, p_c.stops[0..p_c.n_stops])) |sidx| {
-                        full_t.shrinkRetainingCapacity(sidx);
-                        g_stats.finish_reason = "stop";
-                        return true;
-                    }
+                } else if (t_st.has_tools) {
+                    try t_st.parser.feed(piece, t_st.sink);
+                    if (t_st.sink.hit_stop) return true;
+                } else {
+                    try t_st.sink.onContent(piece);
+                    if (t_st.sink.hit_stop) return true;
                 }
 
                 if (g_stats.completion_tokens >= p_c.max_tokens) {
@@ -1313,7 +1897,7 @@ const ServerState = struct {
 
         const td0 = nowMs();
         if (params.max_tokens > 0) {
-            var stopped = try emitToken(self, cur, fd, mode, req_id, created, params, max_stop_len, &piece_buf, &full_text, &stream_pending, &think_st, &stats);
+            var stopped = try emitToken(self, cur, fd, mode, req_id, created, params, &piece_buf, &stream_pending, &think_st, &stats);
 
             if (!stopped) {
                 if (self.dflash) |df| {
@@ -1338,7 +1922,7 @@ const ServerState = struct {
                                 out.tokens[k]
                             else
                                 engine_mod.sampleFromCandidates(&out.cands[k], params.temperature, params.top_k, params.top_p, &rng);
-                            stopped = try emitToken(self, t_tok, fd, mode, req_id, created, params, max_stop_len, &piece_buf, &full_text, &stream_pending, &think_st, &stats);
+                            stopped = try emitToken(self, t_tok, fd, mode, req_id, created, params, &piece_buf, &stream_pending, &think_st, &stats);
                             if (stopped) break;
                             if (t_tok == draft_toks[k]) {
                                 n_acc += 1;
@@ -1354,7 +1938,7 @@ const ServerState = struct {
                                 out.tokens[n_draft]
                             else
                                 engine_mod.sampleFromCandidates(&out.cands[n_draft], params.temperature, params.top_k, params.top_p, &rng);
-                            stopped = try emitToken(self, bonus, fd, mode, req_id, created, params, max_stop_len, &piece_buf, &full_text, &stream_pending, &think_st, &stats);
+                            stopped = try emitToken(self, bonus, fd, mode, req_id, created, params, &piece_buf, &stream_pending, &think_st, &stats);
                             next_tok = bonus;
                         }
                         if (stopped) break;
@@ -1371,9 +1955,15 @@ const ServerState = struct {
                         const out = try self.eng.forward(&[_]u32{cur}, true, true);
                         try self.active_tokens.append(self.allocator, cur);
                         cur = engine_mod.sampleFromCandidates(&out.cands[0], params.temperature, params.top_k, params.top_p, &rng);
-                        stopped = try emitToken(self, cur, fd, mode, req_id, created, params, max_stop_len, &piece_buf, &full_text, &stream_pending, &think_st, &stats);
+                        stopped = try emitToken(self, cur, fd, mode, req_id, created, params, &piece_buf, &stream_pending, &think_st, &stats);
                     }
                 }
+            }
+        }
+        if (has_tools) {
+            try tool_parser.finish(&tool_sink);
+            if (tool_parser.calls.items.len > 0 and std.mem.eql(u8, stats.finish_reason, "stop")) {
+                stats.finish_reason = "tool_calls";
             }
         }
         const td1 = nowMs();
@@ -1395,15 +1985,36 @@ const ServerState = struct {
             const dps = if (stats.decode_ms > 0.0) @as(f64, @floatFromInt(stats.completion_tokens)) * 1000.0 / stats.decode_ms else 0.0;
 
             if (mode == .chat) {
-                try appendFmt(&j, self.allocator, "{{\"id\":\"{s}\",\"object\":\"chat.completion\",\"created\":{d},\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"", .{
+                try appendFmt(&j, self.allocator, "{{\"id\":\"{s}\",\"object\":\"chat.completion\",\"created\":{d},\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":", .{
                     req_id, created, MODEL_ID,
                 });
-                try appendJsonEscaped(&j, self.allocator, full_text.items);
-                if (reasoning_text.items.len > 0) {
-                    try j.appendSlice(self.allocator, "\",\"reasoning_content\":\"");
-                    try appendJsonEscaped(&j, self.allocator, reasoning_text.items);
+                if (tool_parser.calls.items.len > 0 and std.mem.trim(u8, full_text.items, " \t\r\n").len == 0) {
+                    try j.appendSlice(self.allocator, "null");
+                } else {
+                    try j.append(self.allocator, '"');
+                    try appendJsonEscaped(&j, self.allocator, full_text.items);
+                    try j.append(self.allocator, '"');
                 }
-                try appendFmt(&j, self.allocator, "\"}},\"finish_reason\":\"{s}\"}}]", .{stats.finish_reason});
+                if (reasoning_text.items.len > 0) {
+                    try j.appendSlice(self.allocator, ",\"reasoning_content\":\"");
+                    try appendJsonEscaped(&j, self.allocator, reasoning_text.items);
+                    try j.append(self.allocator, '"');
+                }
+                if (tool_parser.calls.items.len > 0) {
+                    try j.appendSlice(self.allocator, ",\"tool_calls\":[");
+                    for (tool_parser.calls.items, 0..) |tc, ci| {
+                        if (ci > 0) try j.append(self.allocator, ',');
+                        try j.appendSlice(self.allocator, "{\"id\":\"");
+                        try appendJsonEscaped(&j, self.allocator, tc.id);
+                        try j.appendSlice(self.allocator, "\",\"type\":\"function\",\"function\":{\"name\":\"");
+                        try appendJsonEscaped(&j, self.allocator, tc.name);
+                        try j.appendSlice(self.allocator, "\",\"arguments\":\"");
+                        try appendJsonEscaped(&j, self.allocator, tc.arguments.items);
+                        try j.appendSlice(self.allocator, "\"}}");
+                    }
+                    try j.append(self.allocator, ']');
+                }
+                try appendFmt(&j, self.allocator, "}},\"finish_reason\":\"{s}\"}}]", .{stats.finish_reason});
             } else {
                 try appendFmt(&j, self.allocator, "{{\"id\":\"{s}\",\"object\":\"text_completion\",\"created\":{d},\"model\":\"{s}\",\"choices\":[{{\"text\":\"", .{
                     req_id, created, MODEL_ID,
@@ -1445,11 +2056,12 @@ const ServerState = struct {
         const dps_log = if (stats.decode_ms > 0.0) @as(f64, @floatFromInt(stats.completion_tokens)) * 1000.0 / stats.decode_ms else 0.0;
         const new_prompt_toks = prompt_toks.len - resume_pos;
         std.debug.print(
-            "[kintsugi-zig] {s} stream={} effort={s} | prompt={d} (cached={d}, new={d}, {d:.1} ms) | gen={d} ({d:.1} ms, {d:.2} tok/s) | spec={d}/{d} ({d} steps)\n",
+            "[kintsugi-zig] {s} stream={} effort={s} tools={d} | prompt={d} (cached={d}, new={d}, {d:.1} ms) | gen={d} ({d:.1} ms, {d:.2} tok/s) | spec={d}/{d} ({d} steps)\n",
             .{
                 if (mode == .chat) "POST /v1/chat/completions" else "POST /v1/completions",
                 params.stream,
                 effort.name(),
+                tool_parser.calls.items.len,
                 stats.prompt_tokens,
                 resume_pos,
                 new_prompt_toks,
@@ -1540,7 +2152,7 @@ const ServerState = struct {
                 return;
             }
             const params = parseGenParams(parsed.value.object);
-            try self.runGeneration(fd, .completion, prompt_val.string, params, .none);
+            try self.runGeneration(fd, .completion, prompt_val.string, params, .none, null);
             return;
         }
 
@@ -1570,7 +2182,7 @@ const ServerState = struct {
             const formatted = try formatChatMl(self.allocator, msgs_val.array.items, effort, tools_opt);
             defer self.allocator.free(formatted);
             const params = parseGenParams(parsed.value.object);
-            try self.runGeneration(fd, .chat, formatted, params, effort);
+            try self.runGeneration(fd, .chat, formatted, params, effort, tools_opt);
             return;
         }
 
@@ -1806,4 +2418,123 @@ test "parseReasoningEffort handles OpenAI, DeepSeek, Anthropic and vLLM fields" 
         defer parsed.deinit();
         try std.testing.expectEqual(c.expected, parseReasoningEffort(parsed.value.object));
     }
+}
+
+test "ToolCallParser streams HTML write tool call byte-by-byte without losing UTF-8 or quotes" {
+    const tools_json =
+        \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}}}}}]
+    ;
+    var parsed_tools = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, tools_json, .{});
+    defer parsed_tools.deinit();
+
+    const MockSink = struct {
+        allocator: std.mem.Allocator,
+        content: std.ArrayListUnmanaged(u8) = .empty,
+        starts: usize = 0,
+        streamed_args: std.ArrayListUnmanaged(u8) = .empty,
+        args_chunks: usize = 0,
+
+        fn deinit(s: *@This()) void {
+            s.content.deinit(s.allocator);
+            s.streamed_args.deinit(s.allocator);
+        }
+        fn onContent(s: *@This(), chunk: []const u8) !void {
+            try s.content.appendSlice(s.allocator, chunk);
+        }
+        fn onToolCallStart(s: *@This(), _: usize, _: []const u8, _: []const u8) !void {
+            s.starts += 1;
+        }
+        fn onToolCallArgsDelta(s: *@This(), _: usize, delta: []const u8) !void {
+            s.args_chunks += 1;
+            try s.streamed_args.appendSlice(s.allocator, delta);
+        }
+    };
+
+    const html = "<!DOCTYPE html>\n<html><body><h1 class=\"title\">你好世界</h1><script>const x = \"a\\nb\";</script></body></html>";
+    const xml =
+        "<tool_call>\n<function=write>\n<parameter=file_path>\nindex.html\n</parameter>\n<parameter=content>\n" ++
+        html ++
+        "\n</parameter>\n</function>\n</tool_call>";
+
+    var sink: MockSink = .{ .allocator = std.testing.allocator };
+    defer sink.deinit();
+
+    var parser = ToolCallParser.init(std.testing.allocator, "req1", parsed_tools.value.array.items);
+    defer parser.deinit();
+
+    // Feed 1 byte at a time to stress-test every tag boundary and multi-byte UTF-8 holdback
+    for (xml) |b| {
+        try parser.feed(&[_]u8{b}, &sink);
+    }
+    try parser.finish(&sink);
+
+    try std.testing.expectEqualStrings("", sink.content.items);
+    try std.testing.expectEqual(@as(usize, 1), sink.starts);
+    try std.testing.expect(sink.args_chunks > 5); // actually streamed incrementally!
+    try std.testing.expectEqual(@as(usize, 1), parser.calls.items.len);
+    try std.testing.expectEqualStrings("write", parser.calls.items[0].name);
+    try std.testing.expectEqualStrings(parser.calls.items[0].arguments.items, sink.streamed_args.items);
+
+    var args_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, sink.streamed_args.items, .{});
+    defer args_parsed.deinit();
+    try std.testing.expectEqualStrings("index.html", args_parsed.value.object.get("file_path").?.string);
+    try std.testing.expectEqualStrings(html, args_parsed.value.object.get("content").?.string);
+}
+
+test "ToolCallParser handles pre-text, multiple calls, typed params, zero-arg calls, and JSON fallback" {
+    const tools_json =
+        \\[{"type":"function","function":{"name":"search","parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"},"exact":{"type":"boolean"}}}}},{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{}}}}]
+    ;
+    var parsed_tools = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, tools_json, .{});
+    defer parsed_tools.deinit();
+
+    const MockSink = struct {
+        allocator: std.mem.Allocator,
+        content: std.ArrayListUnmanaged(u8) = .empty,
+        fn deinit(s: *@This()) void {
+            s.content.deinit(s.allocator);
+        }
+        fn onContent(s: *@This(), chunk: []const u8) !void {
+            try s.content.appendSlice(s.allocator, chunk);
+        }
+        fn onToolCallStart(_: *@This(), _: usize, _: []const u8, _: []const u8) !void {}
+        fn onToolCallArgsDelta(_: *@This(), _: usize, _: []const u8) !void {}
+    };
+
+    const raw =
+        "Let me check.\n\n" ++
+        "<tool_call>\n<function=search>\n<parameter=query>\n123\n</parameter>\n<parameter=limit>\n5\n</parameter>\n<parameter=exact>\ntrue\n</parameter>\n</function>\n</tool_call>\n" ++
+        "<tool_call>\n<function=ping>\n</function>\n</tool_call>\n" ++
+        "<tool_call>{\"name\":\"ping\",\"arguments\":{}}</tool_call>";
+
+    var sink: MockSink = .{ .allocator = std.testing.allocator };
+    defer sink.deinit();
+
+    var parser = ToolCallParser.init(std.testing.allocator, "req2", parsed_tools.value.array.items);
+    defer parser.deinit();
+
+    // Feed in 3-byte slices
+    var i: usize = 0;
+    while (i < raw.len) : (i += 3) {
+        const end = @min(i + 3, raw.len);
+        try parser.feed(raw[i..end], &sink);
+    }
+    try parser.finish(&sink);
+
+    try std.testing.expectEqualStrings("Let me check.\n\n", sink.content.items);
+    try std.testing.expectEqual(@as(usize, 3), parser.calls.items.len);
+
+    try std.testing.expectEqualStrings("search", parser.calls.items[0].name);
+    var a0 = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, parser.calls.items[0].arguments.items, .{});
+    defer a0.deinit();
+    // "query" is schema type "string" -> stays string "123", not integer!
+    try std.testing.expectEqualStrings("123", a0.value.object.get("query").?.string);
+    try std.testing.expectEqual(@as(i64, 5), a0.value.object.get("limit").?.integer);
+    try std.testing.expectEqual(true, a0.value.object.get("exact").?.bool);
+
+    try std.testing.expectEqualStrings("ping", parser.calls.items[1].name);
+    try std.testing.expectEqualStrings("{}", parser.calls.items[1].arguments.items);
+
+    try std.testing.expectEqualStrings("ping", parser.calls.items[2].name);
+    try std.testing.expectEqualStrings("{}", parser.calls.items[2].arguments.items);
 }
