@@ -117,7 +117,12 @@ extern "c" fn cuEventSynchronize(hEvent: CUevent) CUresult;
 extern "c" fn cuEventElapsedTime(pMilliseconds: *f32, hStart: CUevent, hEnd: CUevent) CUresult;
 extern "c" fn cuModuleLoadData(module: *CUmodule, image: *const anyopaque) CUresult;
 extern "c" fn cuModuleUnload(hmod: CUmodule) CUresult;
+pub const CUfunction_attribute = enum(c_int) {
+    max_dynamic_shared_size_bytes = 8,
+};
+
 extern "c" fn cuModuleGetFunction(hfunc: *CUfunction, hmod: CUmodule, name: [*:0]const u8) CUresult;
+extern "c" fn cuFuncSetAttribute(hfunc: CUfunction, attrib: CUfunction_attribute, value: c_int) CUresult;
 extern "c" fn cuLaunchKernel(
     f: CUfunction,
     gridDimX: c_uint,
@@ -369,6 +374,10 @@ pub const Module = struct {
         return f;
     }
 };
+
+pub fn setMaxDynamicSharedSize(func: CUfunction, bytes: u32) CudaError!void {
+    try check(cuFuncSetAttribute(func, .max_dynamic_shared_size_bytes, @intCast(bytes)));
+}
 
 pub fn launch(
     func: CUfunction,

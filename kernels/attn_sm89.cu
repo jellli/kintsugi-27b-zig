@@ -1151,3 +1151,444 @@ extern "C" __global__ void __launch_bounds__(192, 2) attn_mma_q4_0_gqa6x8_sm89_d
     const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
     float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, const int* __restrict__ pos_ptr, int n_tokens, int n_splits
 ) { attn_mma_q4_0_gqa6_sm89_impl<true, 8>(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, *pos_ptr, n_tokens, n_splits); }
+
+// =============================================================================
+// 7. Native sm_89 Prefill Q4_0 FlashAttention (FP16-acc Tensor Core, 92+ TFLOPS)
+//    1 Block = 1 KV head x 16 query tokens x ALL 6 GQA Q-heads = 96 Q rows.
+//    12 warps (384 threads, 1 block/SM, 168 regs/thr, 0 B local spill, 94,592 B dyn smem):
+//      - 6 Q-tiles (16 rows = 8 tokens x 2 Q-heads each) x 2 D-halves (128 dims each)
+//      - BC=64 KV tokens/tile: 2-stage cp.async raw Q4_0 ring + XOR-swizzled K/V-aliased sh_kv[64][256]
+//      - 2x Tensor Core throughput via mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 (160 TFLOPS peak)
+//      - LOG2E folded into Q + split online softmax across D-halves (2x less SFU work, 0 extra syncs)
+//      - 2x dp-interleaved P@V accumulation into FP32 O (hides ldmatrix + MMA RAW latency)
+//      - Grid: (4, ceil(n_tokens / 16), n_splits), Block: (384, 1, 1), DynSmem: 94,592 B
+// =============================================================================
+#define ATTN_LOG2E_F 1.4426950408889634f
+#define ATTN_LN2_F   0.6931471805599453f
+#define ATTN_SCALE_LOG2E (ATTN_SCALE * ATTN_LOG2E_F)
+
+static __device__ __forceinline__ void mma_m16n8k16_f16_f16(
+    uint32_t& c0, uint32_t& c1,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1
+) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+        "{%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};\n"
+        : "+r"(c0), "+r"(c1)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1)
+    );
+}
+
+static __device__ __forceinline__ float ex2_approx_f32(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+static __device__ __forceinline__ uint32_t pack_h2_log2(float a, float b) {
+    const half2 h = __floats2half2_rn(a * ATTN_SCALE_LOG2E, b * ATTN_SCALE_LOG2E);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+static __device__ __forceinline__ int attn_swiz_col(int row, int col) {
+    return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
+}
+
+static __device__ __forceinline__ void attn_prefill_q4_0_sm89_impl(
+    const float* __restrict__ q_rot,        // [n_tokens, 24, 256]
+    const uint8_t* __restrict__ k_cache_q4, // [max_cells, 4, 144]
+    const uint8_t* __restrict__ v_cache_q4, // [max_cells, 4, 144]
+    float* __restrict__ part_o,             // [n_tokens, 24, n_splits, 256]
+    float* __restrict__ part_m,             // [n_tokens, 24, n_splits]
+    float* __restrict__ part_l,             // [n_tokens, 24, n_splits]
+    int pos_base,
+    int n_tokens,
+    int n_splits
+) {
+    constexpr int BC = 64;
+    constexpr int N_WARPS = 12;
+    constexpr int N_THREADS = 384;
+    constexpr int N_BC16 = BC / 16;
+
+    const int hkv = blockIdx.x;        // 0..3
+    const int t_base = blockIdx.y * 16;
+    const int sp = blockIdx.z;         // 0..n_splits-1
+    const int tid = threadIdx.x;       // 0..383
+    const int warp = tid >> 5;         // 0..11
+    const int lane = tid & 31;         // 0..31
+
+    const int q_tile = warp >> 1;      // 0..5
+    const int d_half = warp & 1;       // 0 (dims 0..127) or 1 (dims 128..255)
+    const int d_base = d_half * 128;
+
+    const int t_sub = (q_tile >= 3) ? 8 : 0;
+    const int h_sub = (q_tile >= 3) ? (q_tile - 3) : q_tile;
+    const int g = lane >> 2;           // 0..7
+    const int tid_g = lane & 3;        // 0..3
+    const int t = t_base + t_sub + g;
+    const bool t_valid = (t < n_tokens);
+    const int hq_lo = hkv * 6 + h_sub * 2;
+    const int hq_hi = hq_lo + 1;
+
+    // 1. Load Q into registers pre-scaled by ATTN_SCALE * LOG2E
+    uint32_t qa[8][4];
+    if (t_valid) {
+        const float* q_lo = q_rot + ((size_t)t * ATTN_HQ + hq_lo) * ATTN_D + d_base;
+        const float* q_hi = q_rot + ((size_t)t * ATTN_HQ + hq_hi) * ATTN_D + d_base;
+        #pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            const int d0 = ks * 16 + tid_g * 2;
+            qa[ks][0] = pack_h2_log2(q_lo[d0 + 0], q_lo[d0 + 1]);
+            qa[ks][1] = pack_h2_log2(q_hi[d0 + 0], q_hi[d0 + 1]);
+            qa[ks][2] = pack_h2_log2(q_lo[d0 + 8], q_lo[d0 + 9]);
+            qa[ks][3] = pack_h2_log2(q_hi[d0 + 8], q_hi[d0 + 9]);
+        }
+    } else {
+        #pragma unroll
+        for (int ks = 0; ks < 8; ++ks) { qa[ks][0] = qa[ks][1] = qa[ks][2] = qa[ks][3] = 0u; }
+    }
+
+    // 2. FP32 O accumulator (128 dims) + split online softmax state (d_half=0 owns hq_lo, d_half=1 owns hq_hi)
+    float4 o[16];
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) o[dt] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float m_own = -1.0e30f, l_own = 0.0f;
+
+    const int max_t_in_blk = (t_base + 16 < n_tokens) ? (t_base + 16) : n_tokens;
+    const int max_seq_len = pos_base + max_t_in_blk;
+    const int chunk = (max_seq_len + n_splits - 1) / n_splits;
+    const int p_start = sp * chunk;
+    const int p_end = (p_start + chunk < max_seq_len) ? (p_start + chunk) : max_seq_len;
+    const int causal_limit = pos_base + t;
+
+    const size_t kv_stride = (size_t)ATTN_HKV * Q4_0_HEAD_BYTES;
+    const uint8_t* k_base = k_cache_q4 + (size_t)hkv * Q4_0_HEAD_BYTES;
+    const uint8_t* v_base = v_cache_q4 + (size_t)hkv * Q4_0_HEAD_BYTES;
+
+    // Dynamic shared memory layout (94,592 bytes total):
+    //   sh_kv    : 64 * 256 * 2        = 32,768 B (K and V share this XOR-swizzled buffer)
+    //   sh_q4    : 2 * 128 * 144       = 36,864 B (2-stage cp.async raw Q4_0 K+V ring)
+    //   sh_s     : 2 * 6 * 8 * 32 * 8  = 24,576 B (D-half S/P exchange)
+    //   sh_alpha : 6 * 2 * 8 * 4       =    384 B (split-softmax rescale factor exchange)
+    extern __shared__ uint8_t dyn_smem[];
+    __half (*sh_kv)[256] = reinterpret_cast<__half (*)[256]>(dyn_smem);
+    uint8_t (*sh_q4)[2 * BC][Q4_0_HEAD_BYTES] = reinterpret_cast<uint8_t (*)[2 * BC][Q4_0_HEAD_BYTES]>(
+        dyn_smem + BC * 256 * 2
+    );
+    uint2 (*sh_s)[6][N_BC16 * 2][32] = reinterpret_cast<uint2 (*)[6][N_BC16 * 2][32]>(
+        dyn_smem + BC * 256 * 2 + 2 * 2 * BC * Q4_0_HEAD_BYTES
+    );
+    float (*sh_alpha)[2][8] = reinterpret_cast<float (*)[2][8]>(
+        dyn_smem + BC * 256 * 2 + 2 * 2 * BC * Q4_0_HEAD_BYTES + 2 * 6 * N_BC16 * 2 * 32 * sizeof(uint2)
+    );
+
+    const int blk = lane >> 2;
+    const int sub = lane & 3;
+    const int idx_lo = blk * 32 + sub * 4;
+    const int idx_hi = idx_lo + 16;
+
+    const int mat = lane >> 3;
+    const int r_in_mat = lane & 7;
+    const int k_ld_row = ((mat >> 1) * 8) + r_in_mat;
+    const int k_ld_col_off = (mat & 1) * 8;
+    const int v_ld_row = ((mat & 1) * 8) + r_in_mat;
+    const int v_ld_col_off = (mat >> 1) * 8;
+
+    constexpr int TOTAL_CHUNKS = 2 * BC * 9; // 1152 = 3 * 384 exact!
+    auto issue_q4_tile = [&](int p_t, int t_len, int stage) {
+        #pragma unroll
+        for (int c = tid; c < TOTAL_CHUNKS; c += N_THREADS) {
+            const int row = c / 9;
+            const int ch = c - row * 9;
+            const bool is_v = (row >= BC);
+            const int r = is_v ? (row - BC) : row;
+            if (r < t_len) {
+                const uint8_t* src = (is_v ? v_base : k_base) + (size_t)(p_t + r) * kv_stride + ch * 16;
+                cp_async_16(&sh_q4[stage][row][ch * 16], src);
+            }
+        }
+        cp_async_commit();
+    };
+
+    const int n_tiles = (p_end > p_start) ? ((p_end - p_start + BC - 1) / BC) : 0;
+    if (n_tiles > 0) {
+        const int first_len = (p_start + BC < p_end) ? BC : (p_end - p_start);
+        issue_q4_tile(p_start, first_len, 0);
+        cp_async_wait_all();
+        __syncthreads();
+    }
+
+    const half4 h4_zero = { __float2half2_rn(0.0f), __float2half2_rn(0.0f) };
+
+    for (int ti = 0; ti < n_tiles; ++ti) {
+        const int cur = ti & 1;
+        const int nxt = cur ^ 1;
+        const int p_tile = p_start + ti * BC;
+        const int tile_len = (p_tile + BC < p_end) ? BC : (p_end - p_tile);
+
+        // Stage A: Dequantize 64 K heads into XOR-swizzled sh_kv
+        #pragma unroll
+        for (int r = warp; r < BC; r += N_WARPS) {
+            half4 hlo, hhi;
+            if (r < tile_len) dequant_q4_0_8_h4(sh_q4[cur][r], blk, sub, hlo, hhi);
+            else { hlo = h4_zero; hhi = h4_zero; }
+            *reinterpret_cast<half4*>(&sh_kv[r][attn_swiz_col(r, idx_lo)]) = hlo;
+            *reinterpret_cast<half4*>(&sh_kv[r][attn_swiz_col(r, idx_hi)]) = hhi;
+        }
+        __syncthreads();
+
+        // Prefetch next tile's Q4_0 K+V asynchronously while Tensor Cores run
+        if (ti + 1 < n_tiles) {
+            const int p_next = p_tile + BC;
+            const int next_len = (p_next + BC < p_end) ? BC : (p_end - p_next);
+            issue_q4_tile(p_next, next_len, nxt);
+        }
+
+        // Stage B: Q @ K^T (FP16-acc Tensor Core MMA)
+        uint32_t s_lo[N_BC16 * 2], s_hi[N_BC16 * 2];
+        #pragma unroll
+        for (int j = 0; j < N_BC16 * 2; ++j) { s_lo[j] = 0u; s_hi[j] = 0u; }
+
+        #pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            const int sc = (((d_base + ks * 16 + k_ld_col_off) >> 3) ^ r_in_mat) << 3;
+            #pragma unroll
+            for (int nb = 0; nb < N_BC16; ++nb) {
+                uint32_t kb0, kb1, kb2, kb3;
+                ldmatrix_x4(kb0, kb1, kb2, kb3, &sh_kv[nb * 16 + k_ld_row][sc]);
+                mma_m16n8k16_f16_f16(s_lo[2 * nb + 0], s_hi[2 * nb + 0], qa[ks][0], qa[ks][1], qa[ks][2], qa[ks][3], kb0, kb1);
+                mma_m16n8k16_f16_f16(s_lo[2 * nb + 1], s_hi[2 * nb + 1], qa[ks][0], qa[ks][1], qa[ks][2], qa[ks][3], kb2, kb3);
+            }
+        }
+
+        // Half-traffic S exchange: d_half=0 publishes s_hi, d_half=1 publishes s_lo
+        if (d_half == 0) {
+            #pragma unroll
+            for (int j = 0; j < N_BC16 * 2; ++j) sh_s[0][q_tile][j][lane].y = s_hi[j];
+        } else {
+            #pragma unroll
+            for (int j = 0; j < N_BC16 * 2; ++j) sh_s[1][q_tile][j][lane].x = s_lo[j];
+        }
+        __syncthreads();
+
+        // Stage C: Dequantize 64 V heads into sh_kv (reusing K's smem)
+        #pragma unroll
+        for (int r = warp; r < BC; r += N_WARPS) {
+            half4 hlo, hhi;
+            if (r < tile_len) dequant_q4_0_8_h4(sh_q4[cur][BC + r], blk, sub, hlo, hhi);
+            else { hlo = h4_zero; hhi = h4_zero; }
+            *reinterpret_cast<half4*>(&sh_kv[r][attn_swiz_col(r, idx_lo)]) = hlo;
+            *reinterpret_cast<half4*>(&sh_kv[r][attn_swiz_col(r, idx_hi)]) = hhi;
+        }
+
+        // Stage D: Split online softmax (d_half=0 computes hq_lo, d_half=1 computes hq_hi)
+        uint32_t s_own[N_BC16 * 2];
+        if (d_half == 0) {
+            #pragma unroll
+            for (int j = 0; j < N_BC16 * 2; ++j) {
+                const uint32_t op = sh_s[1][q_tile][j][lane].x;
+                half2 v = __hadd2(*reinterpret_cast<const half2*>(&s_lo[j]), *reinterpret_cast<const half2*>(&op));
+                s_own[j] = *reinterpret_cast<const uint32_t*>(&v);
+            }
+        } else {
+            #pragma unroll
+            for (int j = 0; j < N_BC16 * 2; ++j) {
+                const uint32_t op = sh_s[0][q_tile][j][lane].y;
+                half2 v = __hadd2(*reinterpret_cast<const half2*>(&s_hi[j]), *reinterpret_cast<const half2*>(&op));
+                s_own[j] = *reinterpret_cast<const uint32_t*>(&v);
+            }
+        }
+
+        // Warp-uniform fast path: all 8 tokens in this warp (t_min..t_max) are valid and fully unmasked!
+        // Keeping fast_all warp-uniform guarantees 100% warp convergence on all __shfl_xor_sync(0xffffffffu) calls.
+        const int t_min = t_base + t_sub;
+        const bool warp_fast_all = (t_min + 7 < n_tokens) && (tile_len == BC) && (p_tile + BC - 1 <= pos_base + t_min);
+        float alpha_own = 1.0f;
+
+        if (warp_fast_all) {
+            half2 hmax = *reinterpret_cast<const half2*>(&s_own[0]);
+            #pragma unroll
+            for (int j = 1; j < N_BC16 * 2; ++j) {
+                hmax = __hmax2(hmax, *reinterpret_cast<const half2*>(&s_own[j]));
+            }
+            float m_blk = fmaxf(__low2float(hmax), __high2float(hmax));
+            m_blk = fmaxf(m_blk, __shfl_xor_sync(0xffffffffu, m_blk, 1));
+            m_blk = fmaxf(m_blk, __shfl_xor_sync(0xffffffffu, m_blk, 2));
+
+            const float m_new = fmaxf(m_own, m_blk);
+            alpha_own = (m_own > -1.0e29f) ? ((m_new == m_own) ? 1.0f : ex2_approx_f32(m_own - m_new)) : 0.0f;
+
+            float l_blk = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < N_BC16 * 2; ++j) {
+                const half2 v = *reinterpret_cast<const half2*>(&s_own[j]);
+                const float p0 = ex2_approx_f32(__low2float(v) - m_new);
+                const float p1 = ex2_approx_f32(__high2float(v) - m_new);
+                l_blk += p0 + p1;
+                s_own[j] = pack_h2(p0, p1);
+            }
+            l_blk += __shfl_xor_sync(0xffffffffu, l_blk, 1);
+            l_blk += __shfl_xor_sync(0xffffffffu, l_blk, 2);
+            l_own = l_own * alpha_own + l_blk;
+            m_own = m_new;
+        } else {
+            float m_blk = -1.0e30f;
+            #pragma unroll
+            for (int nb = 0; nb < N_BC16; ++nb) {
+                const int base_c = nb * 16 + 2 * tid_g;
+                #pragma unroll
+                for (int k2 = 0; k2 < 2; ++k2) {
+                    const int j = 2 * nb + k2;
+                    const half2 v = *reinterpret_cast<const half2*>(&s_own[j]);
+                    const int c0 = base_c + k2 * 8;
+                    const int c1 = c0 + 1;
+                    float f0 = (t_valid && c0 < tile_len && p_tile + c0 <= causal_limit) ? __low2float(v) : -1.0e30f;
+                    float f1 = (t_valid && c1 < tile_len && p_tile + c1 <= causal_limit) ? __high2float(v) : -1.0e30f;
+                    m_blk = fmaxf(m_blk, fmaxf(f0, f1));
+                }
+            }
+            m_blk = fmaxf(m_blk, __shfl_xor_sync(0xffffffffu, m_blk, 1));
+            m_blk = fmaxf(m_blk, __shfl_xor_sync(0xffffffffu, m_blk, 2));
+
+            const bool has_v = (m_blk > -1.0e29f);
+            const float m_new = has_v ? fmaxf(m_own, m_blk) : m_own;
+            if (has_v) {
+                alpha_own = (m_own > -1.0e29f) ? ((m_new == m_own) ? 1.0f : ex2_approx_f32(m_own - m_new)) : 0.0f;
+            }
+
+            float l_blk = 0.0f;
+            if (has_v) {
+                #pragma unroll
+                for (int nb = 0; nb < N_BC16; ++nb) {
+                    const int base_c = nb * 16 + 2 * tid_g;
+                    #pragma unroll
+                    for (int k2 = 0; k2 < 2; ++k2) {
+                        const int j = 2 * nb + k2;
+                        const half2 v = *reinterpret_cast<const half2*>(&s_own[j]);
+                        const int c0 = base_c + k2 * 8;
+                        const int c1 = c0 + 1;
+                        const float p0 = (t_valid && c0 < tile_len && p_tile + c0 <= causal_limit) ? ex2_approx_f32(__low2float(v) - m_new) : 0.0f;
+                        const float p1 = (t_valid && c1 < tile_len && p_tile + c1 <= causal_limit) ? ex2_approx_f32(__high2float(v) - m_new) : 0.0f;
+                        l_blk += p0 + p1;
+                        s_own[j] = pack_h2(p0, p1);
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (int j = 0; j < N_BC16 * 2; ++j) s_own[j] = 0u;
+            }
+            // Keep warp shuffle outside lane-divergent `if (has_v)` so all 32 lanes converge!
+            l_blk += __shfl_xor_sync(0xffffffffu, l_blk, 1);
+            l_blk += __shfl_xor_sync(0xffffffffu, l_blk, 2);
+            if (has_v) {
+                l_own = l_own * alpha_own + l_blk;
+                m_own = m_new;
+            }
+        }
+
+        // Publish computed P + alpha to partner D-half before V-ready barrier
+        if (d_half == 0) {
+            #pragma unroll
+            for (int j = 0; j < N_BC16 * 2; ++j) { s_lo[j] = s_own[j]; sh_s[0][q_tile][j][lane].x = s_own[j]; }
+            if (tid_g == 0) sh_alpha[q_tile][0][g] = alpha_own;
+        } else {
+            #pragma unroll
+            for (int j = 0; j < N_BC16 * 2; ++j) { s_hi[j] = s_own[j]; sh_s[1][q_tile][j][lane].y = s_own[j]; }
+            if (tid_g == 0) sh_alpha[q_tile][1][g] = alpha_own;
+        }
+        __syncthreads();
+
+        float alpha_lo, alpha_hi;
+        if (d_half == 0) {
+            #pragma unroll
+            for (int j = 0; j < N_BC16 * 2; ++j) s_hi[j] = sh_s[1][q_tile][j][lane].y;
+            alpha_lo = alpha_own;
+            alpha_hi = sh_alpha[q_tile][1][g];
+        } else {
+            #pragma unroll
+            for (int j = 0; j < N_BC16 * 2; ++j) s_lo[j] = sh_s[0][q_tile][j][lane].x;
+            alpha_lo = sh_alpha[q_tile][0][g];
+            alpha_hi = alpha_own;
+        }
+
+        if (alpha_lo != 1.0f) {
+            #pragma unroll
+            for (int dt = 0; dt < 16; ++dt) { o[dt].x *= alpha_lo; o[dt].y *= alpha_lo; }
+        }
+        if (alpha_hi != 1.0f) {
+            #pragma unroll
+            for (int dt = 0; dt < 16; ++dt) { o[dt].z *= alpha_hi; o[dt].w *= alpha_hi; }
+        }
+
+        // Stage E: 2x dp-interleaved P @ V (4 independent FP16-acc MMAs/step -> FP32 O)
+        #pragma unroll
+        for (int dp2 = 0; dp2 < 4; ++dp2) {
+            const int dpA = dp2 * 2;
+            const int dpB = dpA + 1;
+            const int scA = (((d_base + dpA * 16 + v_ld_col_off) >> 3) ^ r_in_mat) << 3;
+            const int scB = (((d_base + dpB * 16 + v_ld_col_off) >> 3) ^ r_in_mat) << 3;
+            uint32_t a0_lo = 0u, a0_hi = 0u, a1_lo = 0u, a1_hi = 0u;
+            uint32_t b0_lo = 0u, b0_hi = 0u, b1_lo = 0u, b1_hi = 0u;
+            #pragma unroll
+            for (int nb = 0; nb < N_BC16; ++nb) {
+                const int vr = nb * 16 + v_ld_row;
+                uint32_t va0, va1, va2, va3;
+                uint32_t vb0, vb1, vb2, vb3;
+                ldmatrix_x4_trans(va0, va1, va2, va3, &sh_kv[vr][scA]);
+                ldmatrix_x4_trans(vb0, vb1, vb2, vb3, &sh_kv[vr][scB]);
+                const uint32_t p0 = s_lo[2 * nb + 0], p1 = s_hi[2 * nb + 0];
+                const uint32_t p2 = s_lo[2 * nb + 1], p3 = s_hi[2 * nb + 1];
+                mma_m16n8k16_f16_f16(a0_lo, a0_hi, p0, p1, p2, p3, va0, va1);
+                mma_m16n8k16_f16_f16(a1_lo, a1_hi, p0, p1, p2, p3, va2, va3);
+                mma_m16n8k16_f16_f16(b0_lo, b0_hi, p0, p1, p2, p3, vb0, vb1);
+                mma_m16n8k16_f16_f16(b1_lo, b1_hi, p0, p1, p2, p3, vb2, vb3);
+            }
+            const half2 ha0 = *reinterpret_cast<const half2*>(&a0_lo), ha1 = *reinterpret_cast<const half2*>(&a0_hi);
+            const half2 ha2 = *reinterpret_cast<const half2*>(&a1_lo), ha3 = *reinterpret_cast<const half2*>(&a1_hi);
+            const half2 hb0 = *reinterpret_cast<const half2*>(&b0_lo), hb1 = *reinterpret_cast<const half2*>(&b0_hi);
+            const half2 hb2 = *reinterpret_cast<const half2*>(&b1_lo), hb3 = *reinterpret_cast<const half2*>(&b1_hi);
+            o[2 * dpA + 0].x += __low2float(ha0); o[2 * dpA + 0].y += __high2float(ha0);
+            o[2 * dpA + 0].z += __low2float(ha1); o[2 * dpA + 0].w += __high2float(ha1);
+            o[2 * dpA + 1].x += __low2float(ha2); o[2 * dpA + 1].y += __high2float(ha2);
+            o[2 * dpA + 1].z += __low2float(ha3); o[2 * dpA + 1].w += __high2float(ha3);
+            o[2 * dpB + 0].x += __low2float(hb0); o[2 * dpB + 0].y += __high2float(hb0);
+            o[2 * dpB + 0].z += __low2float(hb1); o[2 * dpB + 0].w += __high2float(hb1);
+            o[2 * dpB + 1].x += __low2float(hb2); o[2 * dpB + 1].y += __high2float(hb2);
+            o[2 * dpB + 1].z += __low2float(hb3); o[2 * dpB + 1].w += __high2float(hb3);
+        }
+
+        if (ti + 1 < n_tiles) cp_async_wait_all();
+        __syncthreads();
+    }
+
+    // 3. Store partial (m in natural log domain, l, o) to Split-K buffers
+    if (t_valid) {
+        const size_t meta_lo = ((size_t)t * ATTN_HQ + hq_lo) * n_splits + sp;
+        const size_t meta_hi = ((size_t)t * ATTN_HQ + hq_hi) * n_splits + sp;
+        const float m_nat = (m_own > -1.0e29f) ? (m_own * ATTN_LN2_F) : -1.0e30f;
+        if (tid_g == 0) {
+            if (d_half == 0) { part_m[meta_lo] = m_nat; part_l[meta_lo] = l_own; }
+            else             { part_m[meta_hi] = m_nat; part_l[meta_hi] = l_own; }
+        }
+        float* dst_lo = part_o + meta_lo * ATTN_D + d_base;
+        float* dst_hi = part_o + meta_hi * ATTN_D + d_base;
+        #pragma unroll
+        for (int dt = 0; dt < 16; ++dt) {
+            const int off = dt * 8 + tid_g * 2;
+            *reinterpret_cast<float2*>(dst_lo + off) = make_float2(o[dt].x, o[dt].y);
+            *reinterpret_cast<float2*>(dst_hi + off) = make_float2(o[dt].z, o[dt].w);
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(384, 1) attn_prefill_q4_0_sm89(
+    const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
+    float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, int pos_base, int n_tokens, int n_splits
+) { attn_prefill_q4_0_sm89_impl(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, pos_base, n_tokens, n_splits); }
+
+extern "C" __global__ void __launch_bounds__(384, 1) attn_prefill_q4_0_sm89_dpos(
+    const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
+    float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, const int* __restrict__ pos_ptr, int n_tokens, int n_splits
+) { attn_prefill_q4_0_sm89_impl(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, *pos_ptr, n_tokens, n_splits); }
+

@@ -17,7 +17,8 @@ const attn_sm89_cubin align(8) = @embedFile("attn_sm89.cubin");
 const lmhead_sm89_cubin align(8) = @embedFile("lmhead_sm89.cubin");
 
 pub const MAX_M: usize = 8;
-pub const PREFILL_M: usize = 240; // 30*8 -> 4*30*1=120 blocks (exact 1.0 full wave on 60 SMs with n_splits=1!)
+pub const PREFILL_M: usize = 240; // 15*16 -> 4*15*1=60 blocks (exact 1.0 wave for Prefill FA on 60 SMs with n_splits=1!)
+pub const ATTN_PREFILL_SMEM_BYTES: u32 = 94592; // sh_kv(32768) + sh_q4(36864) + sh_s(24576) + sh_alpha(384)
 pub const TOPK_K: usize = 64;
 pub const TOPK_BLOCKS: usize = 64;
 pub const MAX_SPLITS: usize = 30;
@@ -76,6 +77,7 @@ pub const Kernels = struct {
     fn_attn_fa_naive_tree: cuda.CUfunction,
     fn_attn_fa_gqa6: cuda.CUfunction,
     fn_attn_fa_gqa6_tree: cuda.CUfunction,
+    fn_attn_fa_prefill: cuda.CUfunction,
     fn_attn_red: cuda.CUfunction,
     fn_attn_compact_b: cuda.CUfunction,
 
@@ -100,6 +102,9 @@ pub const Kernels = struct {
         errdefer mod_attn.deinit();
         var mod_lm = try cuda.Module.loadData(lmhead_sm89_cubin);
         errdefer mod_lm.deinit();
+
+        const fn_attn_fa_prefill = try mod_attn.getFunction("attn_prefill_q4_0_sm89_dpos");
+        try cuda.setMaxDynamicSharedSize(fn_attn_fa_prefill, ATTN_PREFILL_SMEM_BYTES);
 
         return .{
             .mod_core = mod_core,
@@ -145,6 +150,7 @@ pub const Kernels = struct {
             .fn_attn_fa_naive_tree = try mod_attn.getFunction("attn_decode_q4_0_splitk_sm89_dpos_tree"),
             .fn_attn_fa_gqa6 = try mod_attn.getFunction("attn_mma_q4_0_gqa6x8_sm89_dpos"),
             .fn_attn_fa_gqa6_tree = try mod_attn.getFunction("attn_mma_q4_0_gqa6x8_sm89_dpos_tree"),
+            .fn_attn_fa_prefill = fn_attn_fa_prefill,
             .fn_attn_red = try mod_attn.getFunction("attn_splitk_reduce_gate_had128_f16"),
             .fn_attn_compact_b = try mod_attn.getFunction("attn_compact_branch_b_kv"),
 
@@ -913,13 +919,28 @@ pub const Engine = struct {
                     const fn_kv = if (is_tree) self.ks.fn_attn_kv_tree else self.ks.fn_attn_kv;
                     try cuda.launch(fn_kv, .{ Spec.n_kv_heads, m, 2 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_kv);
 
-                    // 2E. Split-K Q4_0 FlashAttention (adaptive: sm_89 Tensor Core MMA6x8 for seq >= 256 / prefill, 1-warp for short seq)
+                    // 2E. Split-K Q4_0 FlashAttention (adaptive: FP16-acc Prefill FA for m>32, MMA6x8 for decode/verify, 1-warp for short seq)
                     var p_po = self.d_part_o;
                     var p_pm = self.d_part_m;
                     var p_pl = self.d_part_l;
                     var p_ns: c_int = @intCast(n_splits);
 
-                    if (use_gqa6) {
+                    if (!is_tree and m > 32) {
+                        var p_fa = [_]?*anyopaque{
+                            @ptrCast(&p_qrot), @ptrCast(&p_kcp), @ptrCast(&p_vcp),
+                            @ptrCast(&p_po),   @ptrCast(&p_pm),  @ptrCast(&p_pl),
+                            @ptrCast(&p_dpos), @ptrCast(&p_m),   @ptrCast(&p_ns),
+                        };
+                        const prefill_ty: u32 = (m + 15) / 16;
+                        try cuda.launch(
+                            self.ks.fn_attn_fa_prefill,
+                            .{ Spec.n_kv_heads, prefill_ty, n_splits },
+                            .{ 384, 1, 1 },
+                            ATTN_PREFILL_SMEM_BYTES,
+                            self.ctx.stream,
+                            &p_fa,
+                        );
+                    } else if (use_gqa6) {
                         var p_fa = [_]?*anyopaque{
                             @ptrCast(&p_qrot), @ptrCast(&p_kcp), @ptrCast(&p_vcp),
                             @ptrCast(&p_po),   @ptrCast(&p_pm),  @ptrCast(&p_pl),
