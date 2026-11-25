@@ -20,7 +20,7 @@ const MAX_REQ_BODY: usize = 16 * 1024 * 1024;
 const MAX_STOPS: usize = 8;
 
 pub const ServeConfig = struct {
-    host: []const u8 = "127.0.0.1",
+    host: []const u8 = "0.0.0.0",
     port: u16 = 8080,
     model_path: []const u8,
     drafter_path: []const u8,
@@ -28,7 +28,7 @@ pub const ServeConfig = struct {
 };
 
 const GenParams = struct {
-    max_tokens: usize = 256,
+    max_tokens: usize = 2048,
     temperature: f32 = 0.0,
     top_k: u32 = 64,
     top_p: f32 = 0.95,
@@ -155,14 +155,16 @@ fn sendHttpJson(fd: std.c.fd_t, allocator: std.mem.Allocator, status: []const u8
             "Content-Type: application/json; charset=utf-8\r\n" ++
             "Content-Length: {d}\r\n" ++
             "Access-Control-Allow-Origin: *\r\n" ++
-            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
+            "Access-Control-Allow-Headers: *\r\n" ++
             "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" ++
             "Connection: close\r\n\r\n",
         .{ status, body.len },
     );
     defer allocator.free(hdr);
     try sendAll(fd, hdr);
-    try sendAll(fd, body);
+    if (body.len > 0) {
+        try sendAll(fd, body);
+    }
 }
 
 fn sendSseHeaders(fd: std.c.fd_t) !void {
@@ -172,7 +174,7 @@ fn sendSseHeaders(fd: std.c.fd_t) !void {
         "Cache-Control: no-cache\r\n" ++
         "X-Accel-Buffering: no\r\n" ++
         "Access-Control-Allow-Origin: *\r\n" ++
-        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
+        "Access-Control-Allow-Headers: *\r\n" ++
         "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" ++
         "Connection: close\r\n\r\n";
     try sendAll(fd, hdr);
@@ -183,11 +185,66 @@ const HttpRequest = struct {
     path: []const u8,
     body: []const u8,
     raw: []u8,
+    owned_body: ?[]u8 = null,
 
     fn deinit(self: *HttpRequest, allocator: std.mem.Allocator) void {
+        if (self.owned_body) |ob| allocator.free(ob);
         allocator.free(self.raw);
     }
 };
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// Decodes an HTTP/1.1 Transfer-Encoding: chunked body.
+/// Returns `null` if more bytes are needed to reach the terminating `0\r\n\r\n` chunk.
+pub fn tryDecodeChunkedBody(allocator: std.mem.Allocator, data: []const u8) !?[]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var pos: usize = 0;
+    while (true) {
+        const crlf = std.mem.indexOfPos(u8, data, pos, "\r\n") orelse {
+            out.deinit(allocator);
+            return null;
+        };
+        const size_line = data[pos..crlf];
+        const semi = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
+        const size_str = std.mem.trim(u8, size_line[0..semi], " \t");
+        const chunk_len = std.fmt.parseInt(usize, size_str, 16) catch return error.InvalidChunkedBody;
+        pos = crlf + 2;
+
+        if (chunk_len == 0) {
+            // Wait for trailing CRLF (or trailers + CRLF)
+            if (pos + 2 <= data.len and std.mem.eql(u8, data[pos .. pos + 2], "\r\n")) {
+                return try out.toOwnedSlice(allocator);
+            }
+            if (std.mem.indexOfPos(u8, data, pos, "\r\n\r\n") != null) {
+                return try out.toOwnedSlice(allocator);
+            }
+            out.deinit(allocator);
+            return null;
+        }
+
+        if (out.items.len + chunk_len > MAX_REQ_BODY) return error.BodyTooLarge;
+        if (pos + chunk_len + 2 > data.len) {
+            out.deinit(allocator);
+            return null;
+        }
+        try out.appendSlice(allocator, data[pos .. pos + chunk_len]);
+        if (!std.mem.eql(u8, data[pos + chunk_len .. pos + chunk_len + 2], "\r\n")) {
+            return error.InvalidChunkedBody;
+        }
+        pos += chunk_len + 2;
+    }
+}
 
 fn readHttpRequest(allocator: std.mem.Allocator, fd: std.c.fd_t) !?HttpRequest {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -196,6 +253,8 @@ fn readHttpRequest(allocator: std.mem.Allocator, fd: std.c.fd_t) !?HttpRequest {
     var tmp: [4096]u8 = undefined;
     var header_end: ?usize = null;
     var content_length: usize = 0;
+    var is_chunked = false;
+    var expect_continue = false;
 
     while (header_end == null) {
         const n = std.c.recv(fd, &tmp, tmp.len, 0);
@@ -203,22 +262,32 @@ fn readHttpRequest(allocator: std.mem.Allocator, fd: std.c.fd_t) !?HttpRequest {
             if (buf.items.len == 0) return null;
             break;
         }
-        if (n < 0) return error.RecvFailed;
+        if (n < 0) {
+            if (buf.items.len == 0) return null; // Idle preconnect/keep-alive timeout
+            return error.RecvFailed;
+        }
         try buf.appendSlice(allocator, tmp[0..@intCast(n)]);
         if (buf.items.len > 64 * 1024) return error.HeadersTooLarge;
 
         if (std.mem.indexOf(u8, buf.items, "\r\n\r\n")) |idx| {
             header_end = idx + 4;
-            // Parse Content-Length (case-insensitive)
             var lines = std.mem.splitSequence(u8, buf.items[0..idx], "\r\n");
             _ = lines.next(); // request line
             while (lines.next()) |line| {
                 if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
                     const key = std.mem.trim(u8, line[0..colon], " \t");
+                    const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
                     if (std.ascii.eqlIgnoreCase(key, "content-length")) {
-                        const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
                         content_length = std.fmt.parseInt(usize, val, 10) catch return error.InvalidContentLength;
                         if (content_length > MAX_REQ_BODY) return error.BodyTooLarge;
+                    } else if (std.ascii.eqlIgnoreCase(key, "transfer-encoding")) {
+                        if (containsIgnoreCase(val, "chunked")) {
+                            is_chunked = true;
+                        }
+                    } else if (std.ascii.eqlIgnoreCase(key, "expect")) {
+                        if (containsIgnoreCase(val, "100-continue")) {
+                            expect_continue = true;
+                        }
                     }
                 }
             }
@@ -226,11 +295,31 @@ fn readHttpRequest(allocator: std.mem.Allocator, fd: std.c.fd_t) !?HttpRequest {
     }
 
     const hend = header_end orelse return error.MalformedRequest;
-    const total_needed = hend + content_length;
-    while (buf.items.len < total_needed) {
-        const n = std.c.recv(fd, &tmp, tmp.len, 0);
-        if (n <= 0) break;
-        try buf.appendSlice(allocator, tmp[0..@intCast(n)]);
+    if (expect_continue) {
+        sendAll(fd, "HTTP/1.1 100 Continue\r\n\r\n") catch {};
+    }
+
+    var owned_body: ?[]u8 = null;
+    errdefer if (owned_body) |ob| allocator.free(ob);
+
+    if (is_chunked) {
+        while (true) {
+            if (try tryDecodeChunkedBody(allocator, buf.items[hend..])) |decoded| {
+                owned_body = decoded;
+                break;
+            }
+            const n = std.c.recv(fd, &tmp, tmp.len, 0);
+            if (n <= 0) return error.IncompleteChunkedBody;
+            try buf.appendSlice(allocator, tmp[0..@intCast(n)]);
+            if (buf.items.len > MAX_REQ_BODY + 64 * 1024) return error.BodyTooLarge;
+        }
+    } else {
+        const total_needed = hend + content_length;
+        while (buf.items.len < total_needed) {
+            const n = std.c.recv(fd, &tmp, tmp.len, 0);
+            if (n <= 0) break;
+            try buf.appendSlice(allocator, tmp[0..@intCast(n)]);
+        }
     }
 
     const raw = try buf.toOwnedSlice(allocator);
@@ -241,14 +330,22 @@ fn readHttpRequest(allocator: std.mem.Allocator, fd: std.c.fd_t) !?HttpRequest {
     var parts = std.mem.splitScalar(u8, req_line, ' ');
     const method = parts.next() orelse return error.MalformedRequest;
     const full_target = parts.next() orelse return error.MalformedRequest;
-    const path = if (std.mem.indexOfScalar(u8, full_target, '?')) |q| full_target[0..q] else full_target;
-    const body_end = @min(raw.len, total_needed);
+    var path = if (std.mem.indexOfScalar(u8, full_target, '?')) |q| full_target[0..q] else full_target;
+    if (path.len > 1 and path[path.len - 1] == '/') {
+        path = path[0 .. path.len - 1];
+    }
+
+    const body_slice = if (owned_body) |ob|
+        ob
+    else
+        raw[hend..@min(raw.len, hend + content_length)];
 
     return .{
         .method = method,
         .path = path,
-        .body = raw[hend..body_end],
+        .body = body_slice,
         .raw = raw,
+        .owned_body = owned_body,
     };
 }
 
@@ -269,7 +366,9 @@ fn jsonUsize(v: std.json.Value) ?usize {
 
 fn parseGenParams(obj: std.json.ObjectMap) GenParams {
     var p: GenParams = .{};
-    if (obj.get("max_tokens")) |v| {
+    if (obj.get("max_completion_tokens")) |v| {
+        if (jsonUsize(v)) |n| p.max_tokens = n;
+    } else if (obj.get("max_tokens")) |v| {
         if (jsonUsize(v)) |n| p.max_tokens = n;
     } else if (obj.get("n_predict")) |v| {
         if (jsonUsize(v)) |n| p.max_tokens = n;
@@ -323,11 +422,33 @@ pub fn formatChatMl(
     for (messages) |m| {
         if (m != .object) continue;
         const role = if (m.object.get("role")) |rv| (if (rv == .string) rv.string else "user") else "user";
-        const content = if (m.object.get("content")) |cv| (if (cv == .string) cv.string else "") else "";
         try out.appendSlice(allocator, "<|im_start|>");
         try out.appendSlice(allocator, role);
         try out.append(allocator, '\n');
-        try out.appendSlice(allocator, content);
+        if (m.object.get("content")) |cv| {
+            switch (cv) {
+                .string => |s| try out.appendSlice(allocator, s),
+                .array => |arr| {
+                    var wrote_part = false;
+                    for (arr.items) |part| {
+                        if (part == .string) {
+                            if (wrote_part) try out.append(allocator, '\n');
+                            try out.appendSlice(allocator, part.string);
+                            wrote_part = true;
+                        } else if (part == .object) {
+                            if (part.object.get("text")) |tv| {
+                                if (tv == .string) {
+                                    if (wrote_part) try out.append(allocator, '\n');
+                                    try out.appendSlice(allocator, tv.string);
+                                    wrote_part = true;
+                                }
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
         try out.appendSlice(allocator, "<|im_end|>\n");
     }
     try out.appendSlice(allocator, "<|im_start|>assistant\n");
@@ -717,7 +838,7 @@ const ServerState = struct {
             return;
         }
 
-        if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/health")) {
+        if (std.mem.eql(u8, req.method, "GET") and (std.mem.eql(u8, req.path, "/health") or std.mem.eql(u8, req.path, "/"))) {
             const body = try std.fmt.allocPrint(
                 self.allocator,
                 "{{\"status\":\"ok\",\"model\":\"{s}\",\"speculative\":{},\"kv_cells\":{d}}}",
@@ -728,7 +849,7 @@ const ServerState = struct {
             return;
         }
 
-        if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/v1/models")) {
+        if (std.mem.eql(u8, req.method, "GET") and (std.mem.eql(u8, req.path, "/v1/models") or std.mem.eql(u8, req.path, "/models"))) {
             const body =
                 "{\"object\":\"list\",\"data\":[{\"id\":\"Kintsugi-27B\",\"object\":\"model\",\"created\":1700000000,\"owned_by\":\"kintsugi-zig\"}]}";
             try sendHttpJson(fd, self.allocator, "200 OK", body);
@@ -737,7 +858,7 @@ const ServerState = struct {
 
         if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/tokenize")) {
             var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, req.body, .{}) catch {
-                try sendHttpJson(self.allocator_or_fd(fd), self.allocator, "400 Bad Request", "{\"error\":{\"message\":\"invalid JSON\"}}");
+                try sendHttpJson(fd, self.allocator, "400 Bad Request", "{\"error\":{\"message\":\"invalid JSON\"}}");
                 return;
             };
             defer parsed.deinit();
@@ -823,13 +944,74 @@ const ServerState = struct {
             return;
         }
 
+        std.debug.print("[kintsugi-zig] 404 {s} {s}\n", .{ req.method, req.path });
         try sendHttpJson(fd, self.allocator, "404 Not Found", "{\"error\":{\"message\":\"endpoint not found\"}}");
     }
-
-    inline fn allocator_or_fd(_: *const ServerState, fd: std.c.fd_t) std.c.fd_t {
-        return fd;
-    }
 };
+
+const ListenSocket = struct {
+    fd: std.c.fd_t,
+    dual_stack: bool,
+};
+
+fn createListenSocket(host: []const u8, port: u16) !ListenSocket {
+    const is_wildcard = std.mem.eql(u8, host, "0.0.0.0") or std.mem.eql(u8, host, "::");
+    const is_v6_loopback = std.mem.eql(u8, host, "::1");
+
+    if (is_wildcard or is_v6_loopback) {
+        const fd6 = std.c.socket(std.c.AF.INET6, std.c.SOCK.STREAM, 0);
+        if (fd6 >= 0) {
+            var reuse: c_int = 1;
+            _ = std.c.setsockopt(fd6, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &reuse, @sizeOf(c_int));
+            var v6only: c_int = if (is_v6_loopback) 1 else 0;
+            _ = std.c.setsockopt(fd6, std.c.IPPROTO.IPV6, std.c.IPV6.V6ONLY, &v6only, @sizeOf(c_int));
+
+            var addr6: std.c.sockaddr.in6 = .{
+                .family = std.c.AF.INET6,
+                .port = std.mem.nativeToBig(u16, port),
+                .flowinfo = 0,
+                .addr = @splat(0),
+                .scope_id = 0,
+            };
+            if (is_v6_loopback) {
+                addr6.addr[15] = 1;
+            }
+            if (std.c.bind(fd6, @ptrCast(&addr6), @sizeOf(std.c.sockaddr.in6)) == 0) {
+                if (std.c.listen(fd6, 32) == 0) {
+                    return .{ .fd = fd6, .dual_stack = is_wildcard };
+                }
+            }
+            _ = std.c.close(fd6);
+            if (is_v6_loopback) {
+                std.debug.print("error: failed to bind [{s}]:{d}\n", .{ host, port });
+                return error.BindFailed;
+            }
+            // Fall through to IPv4 bind if IPv6 wildcard bind failed
+        }
+    }
+
+    const fd4 = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+    if (fd4 < 0) return error.SocketCreateFailed;
+    errdefer _ = std.c.close(fd4);
+
+    var reuse: c_int = 1;
+    _ = std.c.setsockopt(fd4, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &reuse, @sizeOf(c_int));
+
+    var addr4: std.c.sockaddr.in = .{
+        .family = std.c.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = try parseIpv4(if (std.mem.eql(u8, host, "::")) "0.0.0.0" else host),
+        .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    if (std.c.bind(fd4, @ptrCast(&addr4), @sizeOf(std.c.sockaddr.in)) < 0) {
+        std.debug.print("error: failed to bind {s}:{d}\n", .{ host, port });
+        return error.BindFailed;
+    }
+    if (std.c.listen(fd4, 32) < 0) {
+        return error.ListenFailed;
+    }
+    return .{ .fd = fd4, .dual_stack = false };
+}
 
 pub fn run(allocator: std.mem.Allocator, cfg: ServeConfig) !void {
     const t0 = nowMs();
@@ -853,35 +1035,17 @@ pub fn run(allocator: std.mem.Allocator, cfg: ServeConfig) !void {
     const t1 = nowMs();
     const vinfo = try ctx.queryInfo();
 
-    // Create TCP listener socket
-    const listen_fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
-    if (listen_fd < 0) return error.SocketCreateFailed;
-    defer _ = std.c.close(listen_fd);
-
-    var reuse: c_int = 1;
-    _ = std.c.setsockopt(listen_fd, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &reuse, @sizeOf(c_int));
-
-    var addr: std.c.sockaddr.in = .{
-        .family = std.c.AF.INET,
-        .port = std.mem.nativeToBig(u16, cfg.port),
-        .addr = try parseIpv4(cfg.host),
-        .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
-    };
-    if (std.c.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) < 0) {
-        std.debug.print("error: failed to bind {s}:{d}\n", .{ cfg.host, cfg.port });
-        return error.BindFailed;
-    }
-    if (std.c.listen(listen_fd, 16) < 0) {
-        return error.ListenFailed;
-    }
+    const listener = try createListenSocket(cfg.host, cfg.port);
+    defer _ = std.c.close(listener.fd);
 
     std.debug.print(
-        "kintsugi-zig OpenAI server listening on http://{s}:{d}\n" ++
+        "kintsugi-zig OpenAI server listening on http://{s}:{d}{s}\n" ++
             "  Model      : {s} (loaded in {d:.0} ms | spec={} | KV pool: {d} Q4_0 cells | VRAM free: {d} MiB)\n" ++
-            "  Endpoints  : GET /health, GET /v1/models, POST /tokenize, POST /v1/completions, POST /v1/chat/completions\n",
+            "  Endpoints  : GET /, GET /health, GET /v1/models, POST /tokenize, POST /v1/completions, POST /v1/chat/completions\n",
         .{
             cfg.host,
             cfg.port,
+            if (listener.dual_stack) " (dual-stack IPv4 + IPv6)" else "",
             MODEL_ID,
             t1 - t0,
             cfg.use_spec,
@@ -897,12 +1061,16 @@ pub fn run(allocator: std.mem.Allocator, cfg: ServeConfig) !void {
         .dflash = if (dflash_opt != null) &dflash_opt.? else null,
     };
 
+    const rcv_timeout: std.c.timeval = .{ .sec = 10, .usec = 0 };
+
     while (true) {
-        var client_addr: std.c.sockaddr = undefined;
-        var client_len: std.c.socklen_t = @sizeOf(std.c.sockaddr);
-        const client_fd = std.c.accept(listen_fd, &client_addr, &client_len);
+        var client_addr: std.c.sockaddr.storage = undefined;
+        var client_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
+        const client_fd = std.c.accept(listener.fd, @ptrCast(&client_addr), &client_len);
         if (client_fd < 0) continue;
         defer _ = std.c.close(client_fd);
+
+        _ = std.c.setsockopt(client_fd, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, &rcv_timeout, @sizeOf(std.c.timeval));
 
         state.handleClient(client_fd) catch |err| {
             std.debug.print("[kintsugi-zig] request error: {}\n", .{err});
@@ -933,4 +1101,30 @@ test "parseIpv4 parses localhost and dotted quads" {
     try std.testing.expectEqual(std.mem.nativeToBig(u32, 0x7f000001), try parseIpv4("127.0.0.1"));
     try std.testing.expectEqual(std.mem.nativeToBig(u32, 0x7f000001), try parseIpv4("localhost"));
     try std.testing.expectEqual(std.mem.nativeToBig(u32, 0x00000000), try parseIpv4("0.0.0.0"));
+}
+
+test "tryDecodeChunkedBody decodes multi-chunk HTTP bodies and handles partial data" {
+    const partial = "5\r\nhello\r\n6\r\n world";
+    try std.testing.expect((try tryDecodeChunkedBody(std.testing.allocator, partial)) == null);
+
+    const complete = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    const decoded = (try tryDecodeChunkedBody(std.testing.allocator, complete)).?;
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("hello world", decoded);
+}
+
+test "formatChatMl supports both string and multimodal array message content" {
+    const payload =
+        \\[{"role":"system","content":"You are helpful."},{"role":"user","content":[{"type":"text","text":"Line 1"},{"type":"text","text":"Line 2"}]}]
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+
+    const formatted = try formatChatMl(std.testing.allocator, parsed.value.array.items, false);
+    defer std.testing.allocator.free(formatted);
+
+    try std.testing.expectEqualStrings(
+        "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nLine 1\nLine 2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n",
+        formatted,
+    );
 }
