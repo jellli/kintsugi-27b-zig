@@ -2347,114 +2347,297 @@ const ServerState = struct {
                     };
                     var pending_commit: u32 = 0;
                     var pl_state: dflash_mod.PromptLookupState = .{};
+                    const tree_thresh: f32 = dflash_mod.DFlashEngine.DEFAULT_TREE_THRESH;
                     while (!stopped and stats.completion_tokens < params.max_tokens) {
-                        var draft_toks: [dflash_mod.N_DRAFT]u32 = undefined;
-                        var draft_dists: [dflash_mod.N_DRAFT]engine_mod.CandidateDist = undefined;
+                        var plan: dflash_mod.DFlashEngine.DraftPlan = .{};
                         const pl_nd = pl_state.tryDraft(
                             self.active_tokens.items,
                             cur,
-                            &draft_toks,
-                            if (greedy) null else &draft_dists,
+                            &plan.tokens,
+                            if (greedy) null else &plan.dists,
                         );
                         const used_lookup = (pl_nd == dflash_mod.N_DRAFT);
-                        const n_draft = if (used_lookup) blk: {
+                        if (used_lookup) {
+                            plan.is_tree = false;
+                            plan.n_draft = pl_nd;
                             if (pending_commit > 0) {
                                 try df.commitAndInject(self.eng, pending_commit);
                                 pending_commit = 0;
                             }
-                            break :blk pl_nd;
-                        } else if (pending_commit > 0) blk: {
-                            const nd = try df.commitInjectAndDraftSampled(
+                        } else if (pending_commit > 0) {
+                            plan = try df.commitInjectAndDraftPlan(
                                 self.eng,
                                 pending_commit,
                                 cur,
                                 0.0,
+                                tree_thresh,
                                 draft_sampling,
-                                &draft_toks,
-                                if (greedy) null else &draft_dists,
                             );
                             pending_commit = 0;
-                            break :blk nd;
-                        } else try df.draftSampled(
-                            self.eng,
-                            cur,
-                            self.eng.pos,
-                            0.0,
-                            draft_sampling,
-                            &draft_toks,
-                            if (greedy) null else &draft_dists,
-                        );
+                        } else {
+                            plan = try df.draftPlan(
+                                self.eng,
+                                cur,
+                                self.eng.pos,
+                                0.0,
+                                tree_thresh,
+                                draft_sampling,
+                            );
+                        }
+                        const n_draft = plan.n_draft;
                         stats.draft_n += n_draft;
 
                         var batch: [dflash_mod.BLOCK_SIZE]u32 = undefined;
                         batch[0] = cur;
-                        for (0..n_draft) |k| batch[1 + k] = draft_toks[k];
+                        for (0..n_draft) |k| batch[1 + k] = plan.tokens[k];
                         const m: u32 = 1 + n_draft;
 
-                        const out = try self.eng.forward(batch[0..m], false, true);
+                        const out = if (plan.is_tree)
+                            try self.eng.forwardTree8(&batch)
+                        else
+                            try self.eng.forward(batch[0..m], false, true);
                         stats.spec_steps += 1;
 
                         var n_acc: u32 = 0;
                         var next_tok: u32 = 0;
+                        var won_branch_b = false;
 
-                        for (0..n_draft) |k| {
-                            const vr: engine_mod.VerifyResult = if (greedy and !has_penalties) .{
-                                .accepted = out.tokens[k] == draft_toks[k],
-                                .token = out.tokens[k],
-                            } else blk: {
-                                const cands_k = if (has_penalties)
-                                    engine_mod.applyTokenPenalties(&out.cands[k], &gen_counts, params.frequency_penalty, params.presence_penalty)
+                        if (plan.is_tree) {
+                            const br_a_len = dflash_mod.DFlashEngine.TREE_BRANCH_A_LEN;
+                            const br_b_len = dflash_mod.DFlashEngine.TREE_BRANCH_B_LEN;
+                            const d_a0 = plan.tokens[0];
+                            const d_b0 = plan.tokens[br_a_len];
+
+                            const fr: engine_mod.ForkVerifyResult = if (greedy and !has_penalties) .{
+                                .branch = if (out.tokens[0] == d_a0)
+                                    .branch_a
+                                else if (out.tokens[0] == d_b0)
+                                    .branch_b
                                 else
-                                    out.cands[k];
+                                    .rejected,
+                                .token = out.tokens[0],
+                            } else blk: {
+                                const cands_0 = if (has_penalties)
+                                    engine_mod.applyTokenPenalties(&out.cands[0], &gen_counts, params.frequency_penalty, params.presence_penalty)
+                                else
+                                    out.cands[0];
                                 if (greedy) {
-                                    const best_tok = engine_mod.sampleFromCandidatesEx(&cands_k, 0.0, 1, 0.0, 0.0, &rng);
-                                    break :blk .{ .accepted = best_tok == draft_toks[k], .token = best_tok };
+                                    const best_tok = engine_mod.sampleFromCandidatesEx(&cands_0, 0.0, 1, 0.0, 0.0, &rng);
+                                    break :blk .{
+                                        .branch = if (best_tok == d_a0)
+                                            .branch_a
+                                        else if (best_tok == d_b0)
+                                            .branch_b
+                                        else
+                                            .rejected,
+                                        .token = best_tok,
+                                    };
                                 }
-                                const target_dist = engine_mod.buildCandidateDistEx(
-                                    &cands_k,
+                                const target_dist_0 = engine_mod.buildCandidateDistEx(
+                                    &cands_0,
                                     params.temperature,
                                     params.top_k,
                                     params.top_p,
                                     params.min_p,
                                 );
-                                break :blk engine_mod.verifySpeculativeToken(&target_dist, &draft_dists[k], draft_toks[k], &rng);
-                            };
-                            stopped = try emitToken(self, vr.token, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats, has_penalties, &gen_counts);
-                            if (stopped) break;
-                            if (vr.accepted) {
-                                n_acc += 1;
-                            } else {
-                                next_tok = vr.token;
-                                break;
-                            }
-                        }
-                        stats.draft_n_accepted += n_acc;
-                        pl_state.recordOutcome(used_lookup, n_acc);
-
-                        if (!stopped and n_acc == n_draft) {
-                            const bonus = if (greedy and !has_penalties)
-                                out.tokens[n_draft]
-                            else blk: {
-                                const cands_b = if (has_penalties)
-                                    engine_mod.applyTokenPenalties(&out.cands[n_draft], &gen_counts, params.frequency_penalty, params.presence_penalty)
-                                else
-                                    out.cands[n_draft];
-                                break :blk engine_mod.sampleFromCandidatesEx(
-                                    &cands_b,
-                                    params.temperature,
-                                    params.top_k,
-                                    params.top_p,
-                                    params.min_p,
+                                break :blk engine_mod.verifySpeculativeFork(
+                                    &target_dist_0,
+                                    &plan.dists[0],
+                                    d_a0,
+                                    &plan.dists[br_a_len],
+                                    d_b0,
                                     &rng,
                                 );
                             };
-                            stopped = try emitToken(self, bonus, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats, has_penalties, &gen_counts);
-                            next_tok = bonus;
+
+                            stopped = try emitToken(self, fr.token, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats, has_penalties, &gen_counts);
+
+                            if (!stopped) {
+                                switch (fr.branch) {
+                                    .rejected => {
+                                        next_tok = fr.token;
+                                    },
+                                    .branch_a => {
+                                        n_acc = 1;
+                                        for (1..br_a_len) |j| {
+                                            const vr: engine_mod.VerifyResult = if (greedy and !has_penalties) .{
+                                                .accepted = out.tokens[j] == plan.tokens[j],
+                                                .token = out.tokens[j],
+                                            } else blk: {
+                                                const cands_j = if (has_penalties)
+                                                    engine_mod.applyTokenPenalties(&out.cands[j], &gen_counts, params.frequency_penalty, params.presence_penalty)
+                                                else
+                                                    out.cands[j];
+                                                if (greedy) {
+                                                    const best_tok = engine_mod.sampleFromCandidatesEx(&cands_j, 0.0, 1, 0.0, 0.0, &rng);
+                                                    break :blk .{ .accepted = best_tok == plan.tokens[j], .token = best_tok };
+                                                }
+                                                const td = engine_mod.buildCandidateDistEx(
+                                                    &cands_j,
+                                                    params.temperature,
+                                                    params.top_k,
+                                                    params.top_p,
+                                                    params.min_p,
+                                                );
+                                                break :blk engine_mod.verifySpeculativeToken(&td, &plan.dists[j], plan.tokens[j], &rng);
+                                            };
+                                            stopped = try emitToken(self, vr.token, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats, has_penalties, &gen_counts);
+                                            if (stopped) break;
+                                            if (vr.accepted) {
+                                                n_acc += 1;
+                                            } else {
+                                                next_tok = vr.token;
+                                                break;
+                                            }
+                                        }
+                                        if (!stopped and n_acc == br_a_len) {
+                                            const bonus = if (greedy and !has_penalties)
+                                                out.tokens[br_a_len]
+                                            else blk: {
+                                                const cands_b = if (has_penalties)
+                                                    engine_mod.applyTokenPenalties(&out.cands[br_a_len], &gen_counts, params.frequency_penalty, params.presence_penalty)
+                                                else
+                                                    out.cands[br_a_len];
+                                                break :blk engine_mod.sampleFromCandidatesEx(
+                                                    &cands_b,
+                                                    params.temperature,
+                                                    params.top_k,
+                                                    params.top_p,
+                                                    params.min_p,
+                                                    &rng,
+                                                );
+                                            };
+                                            stopped = try emitToken(self, bonus, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats, has_penalties, &gen_counts);
+                                            next_tok = bonus;
+                                        }
+                                    },
+                                    .branch_b => {
+                                        won_branch_b = true;
+                                        n_acc = 1;
+                                        for (1..br_b_len) |j| {
+                                            const slot = br_a_len + j;
+                                            const vr: engine_mod.VerifyResult = if (greedy and !has_penalties) .{
+                                                .accepted = out.tokens[slot] == plan.tokens[slot],
+                                                .token = out.tokens[slot],
+                                            } else blk: {
+                                                const cands_j = if (has_penalties)
+                                                    engine_mod.applyTokenPenalties(&out.cands[slot], &gen_counts, params.frequency_penalty, params.presence_penalty)
+                                                else
+                                                    out.cands[slot];
+                                                if (greedy) {
+                                                    const best_tok = engine_mod.sampleFromCandidatesEx(&cands_j, 0.0, 1, 0.0, 0.0, &rng);
+                                                    break :blk .{ .accepted = best_tok == plan.tokens[slot], .token = best_tok };
+                                                }
+                                                const td = engine_mod.buildCandidateDistEx(
+                                                    &cands_j,
+                                                    params.temperature,
+                                                    params.top_k,
+                                                    params.top_p,
+                                                    params.min_p,
+                                                );
+                                                break :blk engine_mod.verifySpeculativeToken(&td, &plan.dists[slot], plan.tokens[slot], &rng);
+                                            };
+                                            stopped = try emitToken(self, vr.token, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats, has_penalties, &gen_counts);
+                                            if (stopped) break;
+                                            if (vr.accepted) {
+                                                n_acc += 1;
+                                            } else {
+                                                next_tok = vr.token;
+                                                break;
+                                            }
+                                        }
+                                        if (!stopped and n_acc == br_b_len) {
+                                            const bslot = br_a_len + br_b_len;
+                                            const bonus = if (greedy and !has_penalties)
+                                                out.tokens[bslot]
+                                            else blk: {
+                                                const cands_b = if (has_penalties)
+                                                    engine_mod.applyTokenPenalties(&out.cands[bslot], &gen_counts, params.frequency_penalty, params.presence_penalty)
+                                                else
+                                                    out.cands[bslot];
+                                                break :blk engine_mod.sampleFromCandidatesEx(
+                                                    &cands_b,
+                                                    params.temperature,
+                                                    params.top_k,
+                                                    params.top_p,
+                                                    params.min_p,
+                                                    &rng,
+                                                );
+                                            };
+                                            stopped = try emitToken(self, bonus, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats, has_penalties, &gen_counts);
+                                            next_tok = bonus;
+                                        }
+                                    },
+                                }
+                            }
+                            stats.draft_n_accepted += n_acc;
+                            pl_state.recordOutcome(false, n_acc);
+                        } else {
+                            for (0..n_draft) |k| {
+                                const vr: engine_mod.VerifyResult = if (greedy and !has_penalties) .{
+                                    .accepted = out.tokens[k] == plan.tokens[k],
+                                    .token = out.tokens[k],
+                                } else blk: {
+                                    const cands_k = if (has_penalties)
+                                        engine_mod.applyTokenPenalties(&out.cands[k], &gen_counts, params.frequency_penalty, params.presence_penalty)
+                                    else
+                                        out.cands[k];
+                                    if (greedy) {
+                                        const best_tok = engine_mod.sampleFromCandidatesEx(&cands_k, 0.0, 1, 0.0, 0.0, &rng);
+                                        break :blk .{ .accepted = best_tok == plan.tokens[k], .token = best_tok };
+                                    }
+                                    const target_dist = engine_mod.buildCandidateDistEx(
+                                        &cands_k,
+                                        params.temperature,
+                                        params.top_k,
+                                        params.top_p,
+                                        params.min_p,
+                                    );
+                                    break :blk engine_mod.verifySpeculativeToken(&target_dist, &plan.dists[k], plan.tokens[k], &rng);
+                                };
+                                stopped = try emitToken(self, vr.token, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats, has_penalties, &gen_counts);
+                                if (stopped) break;
+                                if (vr.accepted) {
+                                    n_acc += 1;
+                                } else {
+                                    next_tok = vr.token;
+                                    break;
+                                }
+                            }
+                            stats.draft_n_accepted += n_acc;
+                            pl_state.recordOutcome(used_lookup, n_acc);
+
+                            if (!stopped and n_acc == n_draft) {
+                                const bonus = if (greedy and !has_penalties)
+                                    out.tokens[n_draft]
+                                else blk: {
+                                    const cands_b = if (has_penalties)
+                                        engine_mod.applyTokenPenalties(&out.cands[n_draft], &gen_counts, params.frequency_penalty, params.presence_penalty)
+                                    else
+                                        out.cands[n_draft];
+                                    break :blk engine_mod.sampleFromCandidatesEx(
+                                        &cands_b,
+                                        params.temperature,
+                                        params.top_k,
+                                        params.top_p,
+                                        params.min_p,
+                                        &rng,
+                                    );
+                                };
+                                stopped = try emitToken(self, bonus, mode, params, max_stop_len, &piece_buf, &think_filter, &think_sink, &stats, has_penalties, &gen_counts);
+                                next_tok = bonus;
+                            }
                         }
                         if (stopped) break;
 
                         const n_commit = n_acc + 1;
-                        try self.active_tokens.appendSlice(self.allocator, batch[0..n_commit]);
+                        if (won_branch_b) {
+                            try self.eng.compactBranchB(n_acc);
+                            try self.active_tokens.append(self.allocator, batch[0]);
+                            try self.active_tokens.appendSlice(self.allocator, batch[5 .. 5 + n_acc]);
+                        } else {
+                            try self.active_tokens.appendSlice(self.allocator, batch[0..n_commit]);
+                        }
                         pending_commit = n_commit;
                         cur = next_tok;
                     }

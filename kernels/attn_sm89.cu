@@ -101,6 +101,7 @@ static __device__ __forceinline__ void quantize_q4_0_warp(float val, uint8_t* ds
 //    Grid   : (24, n_tokens, 1) — 1 block = 1 head (256 threads = 8 warps)
 //    Block  : (256, 1, 1)
 // =============================================================================
+template <bool IS_TREE>
 static __device__ __forceinline__ void attn_q_norm_mrope_split_f32_impl(
     const float* __restrict__ q_full,
     const float* __restrict__ q_bias,
@@ -140,7 +141,8 @@ static __device__ __forceinline__ void attn_q_norm_mrope_split_f32_impl(
     __syncthreads();
 
     if (tid < (ATTN_ROPE_D / 2)) {
-        const float pos = (float)(pos_base + t);
+        const int rel_pos = IS_TREE ? ((t < 5) ? t : (t - 4)) : t;
+        const float pos = (float)(pos_base + rel_pos);
         const float inv_freq = powf(rope_freq_base, -((float)(2 * tid) / (float)ATTN_ROPE_D));
         const float theta = pos * inv_freq;
         float s, c;
@@ -157,12 +159,17 @@ static __device__ __forceinline__ void attn_q_norm_mrope_split_f32_impl(
 extern "C" __global__ void __launch_bounds__(256, 4) attn_q_norm_mrope_split_f32(
     const float* __restrict__ q_full, const float* __restrict__ q_bias, const float* __restrict__ q_norm,
     float* __restrict__ q_out, float* __restrict__ gate_out, int pos_base, float rope_freq_base, float eps
-) { attn_q_norm_mrope_split_f32_impl(q_full, q_bias, q_norm, q_out, gate_out, pos_base, rope_freq_base, eps); }
+) { attn_q_norm_mrope_split_f32_impl<false>(q_full, q_bias, q_norm, q_out, gate_out, pos_base, rope_freq_base, eps); }
 
 extern "C" __global__ void __launch_bounds__(256, 4) attn_q_norm_mrope_split_f32_dpos(
     const float* __restrict__ q_full, const float* __restrict__ q_bias, const float* __restrict__ q_norm,
     float* __restrict__ q_out, float* __restrict__ gate_out, const int* __restrict__ pos_ptr, float rope_freq_base, float eps
-) { attn_q_norm_mrope_split_f32_impl(q_full, q_bias, q_norm, q_out, gate_out, *pos_ptr, rope_freq_base, eps); }
+) { attn_q_norm_mrope_split_f32_impl<false>(q_full, q_bias, q_norm, q_out, gate_out, *pos_ptr, rope_freq_base, eps); }
+
+extern "C" __global__ void __launch_bounds__(256, 4) attn_q_norm_mrope_split_f32_dpos_tree(
+    const float* __restrict__ q_full, const float* __restrict__ q_bias, const float* __restrict__ q_norm,
+    float* __restrict__ q_out, float* __restrict__ gate_out, const int* __restrict__ pos_ptr, float rope_freq_base, float eps
+) { attn_q_norm_mrope_split_f32_impl<true>(q_full, q_bias, q_norm, q_out, gate_out, *pos_ptr, rope_freq_base, eps); }
 
 // =============================================================================
 // 2. Fused K/V Bias + K RMSNorm(256) + Partial RoPE(64) + Q4_0 KV Cache Quantize & Store
@@ -174,6 +181,7 @@ extern "C" __global__ void __launch_bounds__(256, 4) attn_q_norm_mrope_split_f32
 //    Grid           : (4, n_tokens, 2) — z=0 processes K (norm+rope+quant), z=1 processes V (quant)
 //    Block          : (256, 1, 1) — 8 warps = 8 Q4_0 blocks of 32 elements
 // =============================================================================
+template <bool IS_TREE>
 static __device__ __forceinline__ void attn_k_norm_mrope_kv_q4_0_store_impl(
     const float* __restrict__ k_in,
     const float* __restrict__ v_in,
@@ -217,8 +225,9 @@ static __device__ __forceinline__ void attn_k_norm_mrope_kv_q4_0_store_impl(
         if (tid < ATTN_ROPE_D) sh_k[tid] = kv;
         __syncthreads();
 
+        const int rel_pos = IS_TREE ? ((t < 5) ? t : (t - 4)) : t;
         if (tid < (ATTN_ROPE_D / 2)) {
-            const float pos = (float)(pos_base + t);
+            const float pos = (float)(pos_base + rel_pos);
             const float inv_freq = powf(rope_freq_base, -((float)(2 * tid) / (float)ATTN_ROPE_D));
             const float theta = pos * inv_freq;
             float s, c;
@@ -226,7 +235,7 @@ static __device__ __forceinline__ void attn_k_norm_mrope_kv_q4_0_store_impl(
             val = sh_k[tid] * c - sh_k[tid + (ATTN_ROPE_D / 2)] * s;
         } else if (tid < ATTN_ROPE_D) {
             const int pair = tid - (ATTN_ROPE_D / 2);
-            const float pos = (float)(pos_base + t);
+            const float pos = (float)(pos_base + rel_pos);
             const float inv_freq = powf(rope_freq_base, -((float)(2 * pair) / (float)ATTN_ROPE_D));
             const float theta = pos * inv_freq;
             float s, c;
@@ -244,14 +253,21 @@ extern "C" __global__ void __launch_bounds__(256, 4) attn_k_norm_mrope_kv_q4_0_s
     const float* __restrict__ k_bias, const float* __restrict__ v_bias,
     const float* __restrict__ k_norm, uint8_t* __restrict__ k_cache_q4, uint8_t* __restrict__ v_cache_q4,
     int pos_base, float rope_freq_base, float eps
-) { attn_k_norm_mrope_kv_q4_0_store_impl(k_in, v_in, k_bias, v_bias, k_norm, k_cache_q4, v_cache_q4, pos_base, rope_freq_base, eps); }
+) { attn_k_norm_mrope_kv_q4_0_store_impl<false>(k_in, v_in, k_bias, v_bias, k_norm, k_cache_q4, v_cache_q4, pos_base, rope_freq_base, eps); }
 
 extern "C" __global__ void __launch_bounds__(256, 4) attn_k_norm_mrope_kv_q4_0_store_dpos(
     const float* __restrict__ k_in, const float* __restrict__ v_in,
     const float* __restrict__ k_bias, const float* __restrict__ v_bias,
     const float* __restrict__ k_norm, uint8_t* __restrict__ k_cache_q4, uint8_t* __restrict__ v_cache_q4,
     const int* __restrict__ pos_ptr, float rope_freq_base, float eps
-) { attn_k_norm_mrope_kv_q4_0_store_impl(k_in, v_in, k_bias, v_bias, k_norm, k_cache_q4, v_cache_q4, *pos_ptr, rope_freq_base, eps); }
+) { attn_k_norm_mrope_kv_q4_0_store_impl<false>(k_in, v_in, k_bias, v_bias, k_norm, k_cache_q4, v_cache_q4, *pos_ptr, rope_freq_base, eps); }
+
+extern "C" __global__ void __launch_bounds__(256, 4) attn_k_norm_mrope_kv_q4_0_store_dpos_tree(
+    const float* __restrict__ k_in, const float* __restrict__ v_in,
+    const float* __restrict__ k_bias, const float* __restrict__ v_bias,
+    const float* __restrict__ k_norm, uint8_t* __restrict__ k_cache_q4, uint8_t* __restrict__ v_cache_q4,
+    const int* __restrict__ pos_ptr, float rope_freq_base, float eps
+) { attn_k_norm_mrope_kv_q4_0_store_impl<true>(k_in, v_in, k_bias, v_bias, k_norm, k_cache_q4, v_cache_q4, *pos_ptr, rope_freq_base, eps); }
 
 // Helper: load 8 elements (4 low + 4 high) from one Q4_0 block for lane's (blk, sub)
 static __device__ __forceinline__ void load_q4_0_8(
@@ -290,6 +306,7 @@ static __device__ __forceinline__ void load_q4_0_8(
 //      part_m : [n_tokens, 24, n_splits]
 //      part_l : [n_tokens, 24, n_splits]
 // =============================================================================
+template <bool IS_TREE>
 static __device__ __forceinline__ void attn_decode_q4_0_splitk_sm89_impl(
     const float* __restrict__ q_rot,        // [n_tokens, 24, 256]
     const uint8_t* __restrict__ k_cache_q4, // [max_cells, 4, 144]
@@ -346,6 +363,7 @@ static __device__ __forceinline__ void attn_decode_q4_0_splitk_sm89_impl(
     const uint8_t* v_base = v_cache_q4 + (size_t)hkv * Q4_0_HEAD_BYTES;
 
     for (int p = p_start; p < p_end; ++p) {
+        if (IS_TREE && t >= 5 && p > pos_base && p < pos_base + 5) continue;
         float k0, k1, k2, k3, k4, k5, k6, k7;
         load_q4_0_8(k_base + (size_t)p * kv_stride, blk, sub, k0, k1, k2, k3, k4, k5, k6, k7);
 
@@ -383,12 +401,17 @@ static __device__ __forceinline__ void attn_decode_q4_0_splitk_sm89_impl(
 extern "C" __global__ void __launch_bounds__(32, 16) attn_decode_q4_0_splitk_sm89(
     const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
     float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, int pos_base, int n_splits
-) { attn_decode_q4_0_splitk_sm89_impl(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, pos_base, n_splits); }
+) { attn_decode_q4_0_splitk_sm89_impl<false>(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, pos_base, n_splits); }
 
 extern "C" __global__ void __launch_bounds__(32, 16) attn_decode_q4_0_splitk_sm89_dpos(
     const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
     float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, const int* __restrict__ pos_ptr, int n_splits
-) { attn_decode_q4_0_splitk_sm89_impl(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, *pos_ptr, n_splits); }
+) { attn_decode_q4_0_splitk_sm89_impl<false>(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, *pos_ptr, n_splits); }
+
+extern "C" __global__ void __launch_bounds__(32, 16) attn_decode_q4_0_splitk_sm89_dpos_tree(
+    const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
+    float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, const int* __restrict__ pos_ptr, int n_splits
+) { attn_decode_q4_0_splitk_sm89_impl<true>(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, *pos_ptr, n_splits); }
 
 // =============================================================================
 // 4. Fused Split-K Reduce + Sigmoid(gate) + escha_rin + Had128 -> FP16
@@ -470,6 +493,7 @@ extern "C" __global__ void __launch_bounds__(32, 16) attn_splitk_reduce_gate_had
 // =============================================================================
 #define FA_TILE_KV 16
 
+template <bool IS_TREE>
 static __device__ __forceinline__ void attn_decode_q4_0_gqa6_sm89_impl(
     const float* __restrict__ q_rot,        // [n_tokens, 24, 256]
     const uint8_t* __restrict__ k_cache_q4, // [max_cells, 4, 144]
@@ -563,47 +587,54 @@ static __device__ __forceinline__ void attn_decode_q4_0_gqa6_sm89_impl(
             const int j_max = (p_tile + tile_len - 1 <= causal_limit)
                 ? tile_len
                 : (causal_limit - p_tile + 1);
+            const bool tree_skip_tile = IS_TREE && (t >= 5) && (p_tile + tile_len - 1 > pos_base);
             // Fast 4-token blocked online softmax: 1 rescale per 4 tokens + MUFU.EX2 (__expf) + HFMA2 QK!
             int j = 0;
-            for (; j + 3 < j_max; j += 4) {
-                float sc[4];
-                #pragma unroll
-                for (int u = 0; u < 4; ++u) {
-                    const half4 klo = sh_k_lo[j + u][lane];
-                    const half4 khi = sh_k_hi[j + u][lane];
-                    half2 acc2 = __hmul2(qlo.x, klo.x);
-                    acc2 = __hfma2(qlo.y, klo.y, acc2);
-                    acc2 = __hfma2(qhi.x, khi.x, acc2);
-                    acc2 = __hfma2(qhi.y, khi.y, acc2);
-                    const float dot = __low2float(acc2) + __high2float(acc2);
-                    sc[u] = warp_sum_32(dot) * ATTN_SCALE;
-                }
-                const float m_blk = fmaxf(fmaxf(sc[0], sc[1]), fmaxf(sc[2], sc[3]));
-                const float m_new = fmaxf(m_run, m_blk);
-                const float alpha = __expf(m_run - m_new);
-                m_run = m_new;
-                l_run *= alpha;
-                o0 *= alpha; o1 *= alpha; o2 *= alpha; o3 *= alpha;
-                o4 *= alpha; o5 *= alpha; o6 *= alpha; o7 *= alpha;
+            if (!tree_skip_tile) {
+                for (; j + 3 < j_max; j += 4) {
+                    float sc[4];
+                    #pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        const half4 klo = sh_k_lo[j + u][lane];
+                        const half4 khi = sh_k_hi[j + u][lane];
+                        half2 acc2 = __hmul2(qlo.x, klo.x);
+                        acc2 = __hfma2(qlo.y, klo.y, acc2);
+                        acc2 = __hfma2(qhi.x, khi.x, acc2);
+                        acc2 = __hfma2(qhi.y, khi.y, acc2);
+                        const float dot = __low2float(acc2) + __high2float(acc2);
+                        sc[u] = warp_sum_32(dot) * ATTN_SCALE;
+                    }
+                    const float m_blk = fmaxf(fmaxf(sc[0], sc[1]), fmaxf(sc[2], sc[3]));
+                    const float m_new = fmaxf(m_run, m_blk);
+                    const float alpha = __expf(m_run - m_new);
+                    m_run = m_new;
+                    l_run *= alpha;
+                    o0 *= alpha; o1 *= alpha; o2 *= alpha; o3 *= alpha;
+                    o4 *= alpha; o5 *= alpha; o6 *= alpha; o7 *= alpha;
 
-                #pragma unroll
-                for (int u = 0; u < 4; ++u) {
-                    const float p = __expf(sc[u] - m_new);
-                    l_run += p;
-                    const half4 vlo = sh_v_lo[j + u][lane];
-                    const half4 vhi = sh_v_hi[j + u][lane];
-                    o0 = fmaf(p, __low2float(vlo.x), o0);
-                    o1 = fmaf(p, __high2float(vlo.x), o1);
-                    o2 = fmaf(p, __low2float(vlo.y), o2);
-                    o3 = fmaf(p, __high2float(vlo.y), o3);
-                    o4 = fmaf(p, __low2float(vhi.x), o4);
-                    o5 = fmaf(p, __high2float(vhi.x), o5);
-                    o6 = fmaf(p, __low2float(vhi.y), o6);
-                    o7 = fmaf(p, __high2float(vhi.y), o7);
+                    #pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        const float p = __expf(sc[u] - m_new);
+                        l_run += p;
+                        const half4 vlo = sh_v_lo[j + u][lane];
+                        const half4 vhi = sh_v_hi[j + u][lane];
+                        o0 = fmaf(p, __low2float(vlo.x), o0);
+                        o1 = fmaf(p, __high2float(vlo.x), o1);
+                        o2 = fmaf(p, __low2float(vlo.y), o2);
+                        o3 = fmaf(p, __high2float(vlo.y), o3);
+                        o4 = fmaf(p, __low2float(vhi.x), o4);
+                        o5 = fmaf(p, __high2float(vhi.x), o5);
+                        o6 = fmaf(p, __low2float(vhi.y), o6);
+                        o7 = fmaf(p, __high2float(vhi.y), o7);
+                    }
                 }
             }
-            // Tail (0..3 remaining causal tokens)
+            // Tail (0..3 remaining causal tokens, or boundary tile for Branch B in tree mode)
             for (; j < j_max; ++j) {
+                if (IS_TREE && t >= 5) {
+                    const int p_cur = p_tile + j;
+                    if (p_cur > pos_base && p_cur < pos_base + 5) continue;
+                }
                 const half4 klo = sh_k_lo[j][lane];
                 const half4 khi = sh_k_hi[j][lane];
                 half2 acc2 = __hmul2(qlo.x, klo.x);
@@ -649,9 +680,37 @@ static __device__ __forceinline__ void attn_decode_q4_0_gqa6_sm89_impl(
 extern "C" __global__ void __launch_bounds__(768, 1) attn_decode_q4_0_gqa6_sm89(
     const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
     float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, int pos_base, int n_tokens, int n_splits
-) { attn_decode_q4_0_gqa6_sm89_impl(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, pos_base, n_tokens, n_splits); }
+) { attn_decode_q4_0_gqa6_sm89_impl<false>(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, pos_base, n_tokens, n_splits); }
 
 extern "C" __global__ void __launch_bounds__(768, 1) attn_decode_q4_0_gqa6_sm89_dpos(
     const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
     float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, const int* __restrict__ pos_ptr, int n_tokens, int n_splits
-) { attn_decode_q4_0_gqa6_sm89_impl(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, *pos_ptr, n_tokens, n_splits); }
+) { attn_decode_q4_0_gqa6_sm89_impl<false>(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, *pos_ptr, n_tokens, n_splits); }
+
+extern "C" __global__ void __launch_bounds__(768, 1) attn_decode_q4_0_gqa6_sm89_dpos_tree(
+    const float* __restrict__ q_rot, const uint8_t* __restrict__ k_cache_q4, const uint8_t* __restrict__ v_cache_q4,
+    float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, const int* __restrict__ pos_ptr, int n_tokens, int n_splits
+) { attn_decode_q4_0_gqa6_sm89_impl<true>(q_rot, k_cache_q4, v_cache_q4, part_o, part_m, part_l, *pos_ptr, n_tokens, n_splits); }
+
+// =============================================================================
+// 6. Branch-B Q4_0 KV Cache Compaction across all 16 FullAttn layers
+//    Moves slots (pos_base + 5 + k) -> (pos_base + 1 + k) for k = 0 .. n_acc_b - 1.
+//    Each token per layer = 4 * 144 = 576 bytes = 144 uint32_t words.
+//    Grid : (16, n_acc_b, 2)  [z=0: K cache, z=1: V cache]
+//    Block: (144, 1, 1)
+// =============================================================================
+extern "C" __global__ void __launch_bounds__(144, 4) attn_compact_branch_b_kv(
+    uint8_t* __restrict__ k_cache_q4,
+    uint8_t* __restrict__ v_cache_q4,
+    uint64_t kv_layer_bytes,
+    int pos_base
+) {
+    const uint64_t layer = blockIdx.x; // 0..15
+    const int k = blockIdx.y;          // 0..n_acc_b-1 (0..2)
+    const int tid = threadIdx.x;       // 0..143
+    uint8_t* base = (blockIdx.z == 0 ? k_cache_q4 : v_cache_q4) + layer * kv_layer_bytes;
+    const size_t tok_bytes = (size_t)ATTN_HKV * Q4_0_HEAD_BYTES; // 576 bytes (4-byte aligned)
+    uint32_t* dst = reinterpret_cast<uint32_t*>(base + (size_t)(pos_base + 1 + k) * tok_bytes);
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(base + (size_t)(pos_base + 5 + k) * tok_bytes);
+    dst[tid] = src[tid];
+}

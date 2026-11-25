@@ -766,30 +766,68 @@ pub const DFlashEngine = struct {
         return self.finishDraftSelectorCpu(target, id_last, p_min, sampling, draft_out, dists_out);
     }
 
-    /// Fused single-CUDA-Graph `target.commit(n_commit)` + `dflash.inject(n_commit)` + `dflash.draft(id_last)`!
-    /// Eliminates 2 inter-graph CUDA driver launches per speculative decode step and advances `target.pos += n_commit`.
-    pub fn commitInjectAndDraftSampled(
+    pub const TREE_BRANCH_A_LEN: usize = 4; // verify slots 1..4
+    pub const TREE_BRANCH_B_LEN: usize = 3; // verify slots 5..7
+    pub const DEFAULT_TREE_THRESH: f32 = 0.75;
+
+    pub const DraftPlan = struct {
+        is_tree: bool = false,
+        n_draft: u32 = 0,
+        /// Linear: `tokens[0..7]` map to verify slots `1..7`.
+        /// Tree  : `tokens[0..4]` map to Branch A (`1..4`), `tokens[4..7]` map to Branch B (`5..7`).
+        tokens: [N_DRAFT]u32 = @splat(0),
+        dists: [N_DRAFT]engine_mod.CandidateDist = undefined,
+        p0_top1: f32 = 1.0,
+    };
+
+    /// Run DFlash2 drafting and adaptively choose Linear (1+7) vs Top-2 Tree (1+4+3) based on
+    /// pos-0 selector confidence (`p0_top1 < tree_thresh`) with ZERO extra GPU passes!
+    pub fn draftPlan(
+        self: *DFlashEngine,
+        target: *engine_mod.Engine,
+        id_last: u32,
+        n_past: u32,
+        p_min: f32,
+        tree_thresh: f32,
+        sampling: ?DraftSampling,
+    ) !DraftPlan {
+        target.model.embedToken(id_last, self.h_emb_buf[0..D_MODEL]);
+        try self.ctx.copyHtoDAsync(self.d_residual, std.mem.sliceAsBytes(self.h_emb_buf));
+        self.h_meta_pos = @intCast(n_past);
+        try self.ctx.copyHtoDAsync(self.d_meta_pos, std.mem.asBytes(&self.h_meta_pos));
+
+        if (self.g_draft) |exec| {
+            try exec.launch(self.ctx.stream);
+        } else {
+            try self.ctx.beginCapture();
+            try self.launchDraftBodyWithPos(target, self.d_meta_pos);
+            const exec = try self.ctx.endCaptureExec();
+            self.g_draft = exec;
+            try exec.launch(self.ctx.stream);
+        }
+
+        return self.finishDraftPlanCpu(target, id_last, p_min, tree_thresh, sampling);
+    }
+
+    /// Fused single-CUDA-Graph `commit + inject + draft` returning an adaptive `DraftPlan`!
+    pub fn commitInjectAndDraftPlan(
         self: *DFlashEngine,
         target: *engine_mod.Engine,
         n_commit: u32,
         id_last: u32,
         p_min: f32,
+        tree_thresh: f32,
         sampling: ?DraftSampling,
-        draft_out: *[N_DRAFT]u32,
-        dists_out: ?*[N_DRAFT]engine_mod.CandidateDist,
-    ) !u32 {
+    ) !DraftPlan {
         std.debug.assert(n_commit >= 1 and n_commit <= BLOCK_SIZE);
         const pos_before = target.pos;
         const pos_after = pos_before + n_commit;
 
-        // 1. Upload next draft anchor embedding + [pos_before, pos_after] pair async
-        //    (Safe before inject because launchEncodeAndInjectBodyFrom uses d_delta, not d_residual!)
         target.model.embedToken(id_last, self.h_emb_buf[0..D_MODEL]);
         try self.ctx.copyHtoDAsync(self.d_residual, std.mem.sliceAsBytes(self.h_emb_buf));
         self.h_meta_pos_pair = .{ @intCast(pos_before), @intCast(pos_after) };
-        try self.ctx.copyHtoDAsync(self.d_meta_pos, std.mem.sliceAsBytes(&self.h_meta_pos_pair));
+        try self.ctx.copyHtoDAsync(self.d_meta_pos, std.mem.asBytes(&self.h_meta_pos_pair));
 
-        // 2. Launch single fused CUDA Graph: GDN Commit -> DFlash2 KV Inject -> DFlash2 Draft + Target Stage-1 LM Head!
         const idx: usize = n_commit - 1;
         if (self.g_commit_inject_draft[idx]) |exec| {
             try exec.launch(self.ctx.stream);
@@ -806,7 +844,25 @@ pub const DFlashEngine = struct {
         }
         target.pos = pos_after;
 
-        return self.finishDraftSelectorCpu(target, id_last, p_min, sampling, draft_out, dists_out);
+        return self.finishDraftPlanCpu(target, id_last, p_min, tree_thresh, sampling);
+    }
+
+    /// Fused single-CUDA-Graph `target.commit(n_commit)` + `dflash.inject(n_commit)` + `dflash.draft(id_last)`!
+    /// Eliminates 2 inter-graph CUDA driver launches per speculative decode step and advances `target.pos += n_commit`.
+    pub fn commitInjectAndDraftSampled(
+        self: *DFlashEngine,
+        target: *engine_mod.Engine,
+        n_commit: u32,
+        id_last: u32,
+        p_min: f32,
+        sampling: ?DraftSampling,
+        draft_out: *[N_DRAFT]u32,
+        dists_out: ?*[N_DRAFT]engine_mod.CandidateDist,
+    ) !u32 {
+        const plan = try self.commitInjectAndDraftPlan(target, n_commit, id_last, p_min, 0.0, sampling);
+        draft_out.* = plan.tokens;
+        if (dists_out) |do| do.* = plan.dists;
+        return plan.n_draft;
     }
 
     pub fn commitInjectAndDraft(
@@ -829,99 +885,242 @@ pub const DFlashEngine = struct {
         draft_out: *[N_DRAFT]u32,
         dists_out: ?*[N_DRAFT]engine_mod.CandidateDist,
     ) !u32 {
+        const plan = try self.finishDraftPlanCpu(target, id_last, p_min, 0.0, sampling);
+        draft_out.* = plan.tokens;
+        if (dists_out) |do| do.* = plan.dists;
+        return plan.n_draft;
+    }
+
+    const ScoredTop16 = struct {
+        ids: [SELECTOR_TOP_K]i32 = @splat(-1),
+        scores: [SELECTOR_TOP_K]f32 = @splat(-3.4028234e38),
+        best_k: usize = 0,
+        best_score: f32 = -3.4028234e38,
+    };
+
+    fn extractTop16Order(cands: *const engine_mod.CandidateList, top16_idx: *[SELECTOR_TOP_K]usize) void {
+        var order: [engine_mod.TOPK_K]usize = undefined;
+        for (0..engine_mod.TOPK_K) |k| order[k] = k;
+        for (0..SELECTOR_TOP_K) |k| {
+            var best_j = k;
+            var best_v = cands.logits[order[k]];
+            var best_id = cands.ids[order[k]];
+            for (k + 1..engine_mod.TOPK_K) |j| {
+                const vj = cands.logits[order[j]];
+                const idj = cands.ids[order[j]];
+                if (vj > best_v or (vj == best_v and idj >= 0 and (best_id < 0 or idj < best_id))) {
+                    best_j = j;
+                    best_v = vj;
+                    best_id = idj;
+                }
+            }
+            const tmp = order[k];
+            order[k] = order[best_j];
+            order[best_j] = tmp;
+            top16_idx[k] = order[k];
+        }
+    }
+
+    fn scoreSelectorPos(
+        self: *const DFlashEngine,
+        cands: *const engine_mod.CandidateList,
+        top16_idx: *const [SELECTOR_TOP_K]usize,
+        pos_i: usize,
+        pred_tok: u32,
+    ) ScoredTop16 {
+        var prev_vec: [SELECTOR_RANK]f32 = undefined;
+        var cond_vec: [SELECTOR_RANK]f32 = undefined;
+        dequantQ4_0Row256(self.sel_prev_q4_mmap, pred_tok, &prev_vec);
+        const gate_row = self.h_sel_gate[pos_i * SELECTOR_RANK ..][0..SELECTOR_RANK];
+        for (0..SELECTOR_RANK) |r| {
+            cond_vec[r] = prev_vec[r] * gate_row[r];
+        }
+
+        var res: ScoredTop16 = .{};
+        for (0..SELECTOR_TOP_K) |k| {
+            const idx = top16_idx[k];
+            const cid = cands.ids[idx];
+            res.ids[k] = cid;
+            if (cid < 0) continue;
+            const pairwise = dotQ4_0Row256(self.sel_next_q4_mmap, @intCast(cid), &cond_vec);
+            const sc = cands.logits[idx] + pairwise;
+            res.scores[k] = sc;
+            if (sc > res.best_score) {
+                res.best_score = sc;
+                res.best_k = k;
+            }
+        }
+        return res;
+    }
+
+    fn pickSelectorToken(
+        scored: *const ScoredTop16,
+        use_stochastic: bool,
+        sampling: ?DraftSampling,
+        dist_out: *engine_mod.CandidateDist,
+    ) u32 {
+        if (use_stochastic) {
+            const s = sampling.?;
+            const q_dist = engine_mod.buildDistFromLogitsEx(&scored.ids, &scored.scores, s.temp, s.top_k, s.top_p, s.min_p);
+            dist_out.* = q_dist;
+            return q_dist.sample(s.rng);
+        } else {
+            const cid = scored.ids[scored.best_k];
+            const id: u32 = if (cid >= 0) @intCast(cid) else 0;
+            dist_out.* = engine_mod.CandidateDist.pointMass(id);
+            return id;
+        }
+    }
+
+    fn finishDraftPlanCpu(
+        self: *DFlashEngine,
+        target: *engine_mod.Engine,
+        id_last: u32,
+        p_min: f32,
+        tree_thresh: f32,
+        sampling: ?DraftSampling,
+    ) !DraftPlan {
         // 3. Single D2H + sync for selector gate + Stage-2 exact Q8_0 rescore on CPU
         const d_draft_hidden = self.d_norm + D_MODEL * 4;
         try self.ctx.copyDtoHAsync(std.mem.sliceAsBytes(self.h_sel_gate), self.d_sel_gate);
         var lm_out: engine_mod.StepOutput = .{};
         try target.finishStage2LmHeadCpu(d_draft_hidden, N_DRAFT, &lm_out);
 
-        // 5. Exact DFlash2 Selector autoregressive walk on CPU (~2 us, zero VRAM!)
-        //    Matches llama.cpp build_dflash2_selector + common/speculative.cpp verbatim when greedy,
-        //    and draws from normalized selector scores when stochastic sampling is enabled.
         const use_stochastic = if (sampling) |s| !engine_mod.isGreedySamplingEx(s.temp, s.top_k, s.top_p, s.min_p) else false;
-        var pred_tok: u32 = id_last;
-        var prev_vec: [SELECTOR_RANK]f32 = undefined;
-        var cond_vec: [SELECTOR_RANK]f32 = undefined;
-        var n_drafted: u32 = 0;
+        var plan: DraftPlan = .{};
 
-        for (0..N_DRAFT) |pos_i| {
-            // Sort exact Stage-2 rescored Top-64 candidates descending and take Top-16
-            var order: [engine_mod.TOPK_K]usize = undefined;
-            for (0..engine_mod.TOPK_K) |k| order[k] = k;
-            const cands = &lm_out.cands[pos_i];
-            // Partial selection sort for top 16 (64*16 = 1024 comparisons = < 1 us!)
+        // Pos 0: score Top-16 conditioned on `id_last`
+        var top16_0: [SELECTOR_TOP_K]usize = undefined;
+        extractTop16Order(&lm_out.cands[0], &top16_0);
+        const sc0 = self.scoreSelectorPos(&lm_out.cands[0], &top16_0, 0, id_last);
+
+        // Compute pos-0 Top-1 confidence
+        var p0_top1: f32 = 1.0;
+        var q_a0: engine_mod.CandidateDist = undefined;
+        var d_a0: u32 = 0;
+        if (use_stochastic) {
+            const s = sampling.?;
+            q_a0 = engine_mod.buildDistFromLogitsEx(&sc0.ids, &sc0.scores, s.temp, s.top_k, s.top_p, s.min_p);
+            p0_top1 = if (q_a0.len > 0) q_a0.probs[0] else 1.0;
+            d_a0 = q_a0.sample(s.rng);
+        } else {
+            var exp_sum: f32 = 0.0;
             for (0..SELECTOR_TOP_K) |k| {
-                var best_j = k;
-                var best_v = cands.logits[order[k]];
-                var best_id = cands.ids[order[k]];
-                for (k + 1..engine_mod.TOPK_K) |j| {
-                    const vj = cands.logits[order[j]];
-                    const idj = cands.ids[order[j]];
-                    if (vj > best_v or (vj == best_v and idj >= 0 and (best_id < 0 or idj < best_id))) {
-                        best_j = j;
-                        best_v = vj;
-                        best_id = idj;
+                if (sc0.ids[k] >= 0) exp_sum += @exp(sc0.scores[k] - sc0.best_score);
+            }
+            p0_top1 = if (exp_sum > 0.0 and std.math.isFinite(exp_sum)) (1.0 / exp_sum) else 1.0;
+            if (p_min > 0.0 and p0_top1 < p_min) {
+                plan.p0_top1 = p0_top1;
+                return plan;
+            }
+            const cid = sc0.ids[sc0.best_k];
+            d_a0 = if (cid >= 0) @intCast(cid) else 0;
+            q_a0 = engine_mod.CandidateDist.pointMass(d_a0);
+        }
+        plan.p0_top1 = p0_top1;
+
+        // Check if adaptive Top-2 Tree mode triggers (low pos-0 confidence + valid distinct Branch B candidate!)
+        if (tree_thresh > 0.0 and p0_top1 < tree_thresh) {
+            var have_b0 = false;
+            var d_b0: u32 = 0;
+            var q_b0: engine_mod.CandidateDist = .{};
+
+            if (use_stochastic) {
+                const s = sampling.?;
+                q_b0 = q_a0.conditionExcluding(d_a0);
+                if (q_b0.len > 0) {
+                    d_b0 = q_b0.sample(s.rng);
+                    have_b0 = true;
+                }
+            } else {
+                var second_score: f32 = -3.4028234e38;
+                var second_id: i32 = -1;
+                for (0..SELECTOR_TOP_K) |k| {
+                    const cid = sc0.ids[k];
+                    if (cid < 0 or @as(u32, @intCast(cid)) == d_a0) continue;
+                    if (sc0.scores[k] > second_score) {
+                        second_score = sc0.scores[k];
+                        second_id = cid;
                     }
                 }
-                const tmp = order[k];
-                order[k] = order[best_j];
-                order[best_j] = tmp;
-            }
-
-            // Dequantize predecessor embedding [256] and gate elementwise
-            dequantQ4_0Row256(self.sel_prev_q4_mmap, pred_tok, &prev_vec);
-            const gate_row = self.h_sel_gate[pos_i * SELECTOR_RANK ..][0..SELECTOR_RANK];
-            for (0..SELECTOR_RANK) |r| {
-                cond_vec[r] = prev_vec[r] * gate_row[r];
-            }
-
-            // Score Top-16 candidates: score[k] = unary[k] + dot(successor[cand_k], cond)
-            var sel_ids: [SELECTOR_TOP_K]i32 = @splat(-1);
-            var scores: [SELECTOR_TOP_K]f32 = undefined;
-            var best_k: usize = 0;
-            var best_score: f32 = -3.4028234e38;
-            for (0..SELECTOR_TOP_K) |k| {
-                const idx = order[k];
-                const cid = cands.ids[idx];
-                sel_ids[k] = cid;
-                if (cid < 0) {
-                    scores[k] = -3.4028234e38;
-                    continue;
-                }
-                const pairwise = dotQ4_0Row256(self.sel_next_q4_mmap, @intCast(cid), &cond_vec);
-                const sc = cands.logits[idx] + pairwise;
-                scores[k] = sc;
-                if (sc > best_score) {
-                    best_score = sc;
-                    best_k = k;
+                if (second_id >= 0) {
+                    d_b0 = @intCast(second_id);
+                    q_b0 = engine_mod.CandidateDist.pointMass(d_b0);
+                    have_b0 = true;
                 }
             }
+
+            if (have_b0) {
+                plan.is_tree = true;
+                plan.n_draft = N_DRAFT;
+                plan.tokens[0] = d_a0;
+                plan.dists[0] = q_a0;
+                plan.tokens[TREE_BRANCH_A_LEN] = d_b0;
+                plan.dists[TREE_BRANCH_A_LEN] = q_b0;
+
+                // Extract Top-16 unary orders for positions 1, 2, 3 once (reused across Branch A & B!)
+                var top16_1: [SELECTOR_TOP_K]usize = undefined;
+                var top16_2: [SELECTOR_TOP_K]usize = undefined;
+                var top16_3: [SELECTOR_TOP_K]usize = undefined;
+                extractTop16Order(&lm_out.cands[1], &top16_1);
+                extractTop16Order(&lm_out.cands[2], &top16_2);
+                extractTop16Order(&lm_out.cands[3], &top16_3);
+
+                // Branch A walk: slots 1, 2, 3 (pos_i = 1, 2, 3) conditioned on d_a0 -> d_a1 -> d_a2
+                var pred_a = d_a0;
+                const sc_a1 = self.scoreSelectorPos(&lm_out.cands[1], &top16_1, 1, pred_a);
+                pred_a = pickSelectorToken(&sc_a1, use_stochastic, sampling, &plan.dists[1]);
+                plan.tokens[1] = pred_a;
+
+                const sc_a2 = self.scoreSelectorPos(&lm_out.cands[2], &top16_2, 2, pred_a);
+                pred_a = pickSelectorToken(&sc_a2, use_stochastic, sampling, &plan.dists[2]);
+                plan.tokens[2] = pred_a;
+
+                const sc_a3 = self.scoreSelectorPos(&lm_out.cands[3], &top16_3, 3, pred_a);
+                pred_a = pickSelectorToken(&sc_a3, use_stochastic, sampling, &plan.dists[3]);
+                plan.tokens[3] = pred_a;
+
+                // Branch B walk: slots 5, 6 (pos_i = 1, 2) conditioned on d_b0 -> d_b1 (ZERO extra GPU pass!)
+                var pred_b = d_b0;
+                const sc_b1 = self.scoreSelectorPos(&lm_out.cands[1], &top16_1, 1, pred_b);
+                pred_b = pickSelectorToken(&sc_b1, use_stochastic, sampling, &plan.dists[TREE_BRANCH_A_LEN + 1]);
+                plan.tokens[TREE_BRANCH_A_LEN + 1] = pred_b;
+
+                const sc_b2 = self.scoreSelectorPos(&lm_out.cands[2], &top16_2, 2, pred_b);
+                pred_b = pickSelectorToken(&sc_b2, use_stochastic, sampling, &plan.dists[TREE_BRANCH_A_LEN + 2]);
+                plan.tokens[TREE_BRANCH_A_LEN + 2] = pred_b;
+
+                return plan;
+            }
+        }
+
+        // Standard Linear 1+7 chain
+        plan.is_tree = false;
+        plan.tokens[0] = d_a0;
+        plan.dists[0] = q_a0;
+        plan.n_draft = 1;
+        var pred_tok = d_a0;
+
+        for (1..N_DRAFT) |pos_i| {
+            var top16: [SELECTOR_TOP_K]usize = undefined;
+            extractTop16Order(&lm_out.cands[pos_i], &top16);
+            const sc = self.scoreSelectorPos(&lm_out.cands[pos_i], &top16, pos_i, pred_tok);
 
             if (p_min > 0.0) {
                 var exp_sum: f32 = 0.0;
                 for (0..SELECTOR_TOP_K) |k| {
-                    exp_sum += @exp(scores[k] - best_score);
+                    exp_sum += @exp(sc.scores[k] - sc.best_score);
                 }
                 if (1.0 / exp_sum < p_min) break;
             }
 
-            const chosen_id: u32 = if (use_stochastic) blk: {
-                const s = sampling.?;
-                const q_dist = engine_mod.buildDistFromLogitsEx(&sel_ids, &scores, s.temp, s.top_k, s.top_p, s.min_p);
-                if (dists_out) |do| do[n_drafted] = q_dist;
-                break :blk q_dist.sample(s.rng);
-            } else blk: {
-                const cid = sel_ids[best_k];
-                const id: u32 = if (cid >= 0) @intCast(cid) else 0;
-                if (dists_out) |do| do[n_drafted] = engine_mod.CandidateDist.pointMass(id);
-                break :blk id;
-            };
-            draft_out[n_drafted] = chosen_id;
-            n_drafted += 1;
+            const chosen_id = pickSelectorToken(&sc, use_stochastic, sampling, &plan.dists[plan.n_draft]);
+            plan.tokens[plan.n_draft] = chosen_id;
+            plan.n_draft += 1;
             pred_tok = chosen_id;
         }
 
-        return n_drafted;
+        return plan;
     }
 };
 

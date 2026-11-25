@@ -54,17 +54,25 @@ pub const Kernels = struct {
 
     // GDN
     fn_gdn_conv: cuda.CUfunction,
+    fn_gdn_conv_tree: cuda.CUfunction,
     fn_gdn_ab: cuda.CUfunction,
     fn_gdn_rec: cuda.CUfunction,
+    fn_gdn_rec_tree: cuda.CUfunction,
     fn_gdn_commit_conv: cuda.CUfunction,
+    fn_gdn_compact_b: cuda.CUfunction,
     fn_gdn_post: cuda.CUfunction,
 
     // FullAttn
     fn_attn_q: cuda.CUfunction,
+    fn_attn_q_tree: cuda.CUfunction,
     fn_attn_kv: cuda.CUfunction,
+    fn_attn_kv_tree: cuda.CUfunction,
     fn_attn_fa_naive: cuda.CUfunction,
+    fn_attn_fa_naive_tree: cuda.CUfunction,
     fn_attn_fa_gqa6: cuda.CUfunction,
+    fn_attn_fa_gqa6_tree: cuda.CUfunction,
     fn_attn_red: cuda.CUfunction,
+    fn_attn_compact_b: cuda.CUfunction,
 
     // FFN + 2-Stage LM Head
     fn_swiglu: cuda.CUfunction,
@@ -111,16 +119,24 @@ pub const Kernels = struct {
             .fn_escha_had_out = try mod_escha.getFunction("escha_had_out_f32"),
 
             .fn_gdn_conv = try mod_gdn.getFunction("gdn_conv1d_silu_l2norm_f32"),
+            .fn_gdn_conv_tree = try mod_gdn.getFunction("gdn_conv1d_silu_l2norm_tree_f32"),
             .fn_gdn_ab = try mod_gdn.getFunction("gdn_alpha_beta_f16_f32"),
             .fn_gdn_rec = try mod_gdn.getFunction("gdn_recurrence_sm89"),
+            .fn_gdn_rec_tree = try mod_gdn.getFunction("gdn_recurrence_tree_sm89"),
             .fn_gdn_commit_conv = try mod_gdn.getFunction("gdn_commit_conv_state_f32"),
+            .fn_gdn_compact_b = try mod_gdn.getFunction("gdn_compact_branch_b_save"),
             .fn_gdn_post = try mod_gdn.getFunction("gdn_norm_gate_had128_f16"),
 
             .fn_attn_q = try mod_attn.getFunction("attn_q_norm_mrope_split_f32_dpos"),
+            .fn_attn_q_tree = try mod_attn.getFunction("attn_q_norm_mrope_split_f32_dpos_tree"),
             .fn_attn_kv = try mod_attn.getFunction("attn_k_norm_mrope_kv_q4_0_store_dpos"),
+            .fn_attn_kv_tree = try mod_attn.getFunction("attn_k_norm_mrope_kv_q4_0_store_dpos_tree"),
             .fn_attn_fa_naive = try mod_attn.getFunction("attn_decode_q4_0_splitk_sm89_dpos"),
+            .fn_attn_fa_naive_tree = try mod_attn.getFunction("attn_decode_q4_0_splitk_sm89_dpos_tree"),
             .fn_attn_fa_gqa6 = try mod_attn.getFunction("attn_decode_q4_0_gqa6_sm89_dpos"),
+            .fn_attn_fa_gqa6_tree = try mod_attn.getFunction("attn_decode_q4_0_gqa6_sm89_dpos_tree"),
             .fn_attn_red = try mod_attn.getFunction("attn_splitk_reduce_gate_had128_f16"),
+            .fn_attn_compact_b = try mod_attn.getFunction("attn_compact_branch_b_kv"),
 
             .fn_swiglu = try mod_lm.getFunction("fused_swiglu_had128_f16"),
             .fn_q81 = try mod_lm.getFunction("quantize_f32_to_q8_1_sm89"),
@@ -213,6 +229,7 @@ pub const Engine = struct {
 
     // Cached static CUDA Graphs (eliminates ~1,550 kernel launches/step!)
     g_verify8: [NUM_ATTN_BUCKETS]?cuda.GraphExec = @splat(null),
+    g_verify8_tree: [NUM_ATTN_BUCKETS]?cuda.GraphExec = @splat(null),
     g_commit: [MAX_M]?cuda.GraphExec = @splat(null),
 
     // DFlash2 capture config (default: [6, 20, 34, 48, 62])
@@ -359,6 +376,9 @@ pub const Engine = struct {
         for (&self.g_verify8) |*g| {
             if (g.*) |*exec| exec.deinit();
         }
+        for (&self.g_verify8_tree) |*g| {
+            if (g.*) |*exec| exec.deinit();
+        }
         for (&self.g_commit) |*g| {
             if (g.*) |*exec| exec.deinit();
         }
@@ -498,13 +518,13 @@ pub const Engine = struct {
                 try exec.launch(self.ctx.stream);
             } else {
                 try self.ctx.beginCapture();
-                try self.launchForwardBody(8, false, true, attn_bucket);
+                try self.launchForwardBody(8, false, true, attn_bucket, false);
                 const exec = try self.ctx.endCaptureExec();
                 self.g_verify8[attn_bucket] = exec;
                 try exec.launch(self.ctx.stream);
             }
         } else {
-            try self.launchForwardBody(m, commit_immediately, compute_logits, attn_bucket);
+            try self.launchForwardBody(m, commit_immediately, compute_logits, attn_bucket, false);
         }
 
         if (commit_immediately) {
@@ -526,12 +546,61 @@ pub const Engine = struct {
         return out;
     }
 
+    /// Run a speculative M=8 Top-2 Tree verification pass:
+    ///   Slot 0: `cur` at `pos_base + 0`
+    ///   Branch A (slots 1..4): `pos_base + 1..4` (parent chain 0 -> 1 -> 2 -> 3 -> 4)
+    ///   Branch B (slots 5..7): `pos_base + 1..3` (parent chain 0 -> 5 -> 6 -> 7)
+    /// Keeps GDN state untouched at `self.pos`, saves per-layer GDN/KV/capture buffers for all 8 slots,
+    /// and returns Stage-2 exact Top-64 candidates for all 8 slots.
+    pub fn forwardTree8(self: *Engine, tokens: *const [MAX_M]u32) !StepOutput {
+        const m: u32 = MAX_M;
+        if (self.pos + m > self.max_kv_cells) return error.ContextFull;
+
+        for (tokens, 0..) |tok, r| {
+            self.model.embedToken(tok, self.h_emb_buf[r * Spec.d_model ..][0..Spec.d_model]);
+        }
+        try self.ctx.copyHtoDAsync(self.d_residual, std.mem.sliceAsBytes(self.h_emb_buf[0 .. m * Spec.d_model]));
+        self.h_meta_pos = @intCast(self.pos);
+        try self.ctx.copyHtoDAsync(self.d_meta_pos, std.mem.asBytes(&self.h_meta_pos));
+
+        const total_seq = self.pos + m;
+        const attn_bucket: usize = if (total_seq >= 16384)
+            4
+        else if (total_seq >= 4096)
+            3
+        else if (total_seq >= 1024)
+            2
+        else if (total_seq >= 256)
+            1
+        else
+            0;
+
+        if (self.capture_enabled) {
+            if (self.g_verify8_tree[attn_bucket]) |exec| {
+                try exec.launch(self.ctx.stream);
+            } else {
+                try self.ctx.beginCapture();
+                try self.launchForwardBody(8, false, true, attn_bucket, true);
+                const exec = try self.ctx.endCaptureExec();
+                self.g_verify8_tree[attn_bucket] = exec;
+                try exec.launch(self.ctx.stream);
+            }
+        } else {
+            try self.launchForwardBody(8, false, true, attn_bucket, true);
+        }
+
+        var out: StepOutput = .{};
+        try self.finishStage2LmHeadCpu(self.d_xnorm, m, &out);
+        return out;
+    }
+
     fn launchForwardBody(
         self: *const Engine,
         m: u32,
         commit_immediately: bool,
         compute_logits: bool,
         attn_bucket: usize,
+        is_tree: bool,
     ) !void {
         var prev_bias: cuda.CUdeviceptr = 0;
         var has_delta: c_int = 0;
@@ -637,13 +706,22 @@ pub const Engine = struct {
                     var p_ko = d_k_out;
                     var p_vo = d_v_out;
                     var p_nc: c_int = @intCast(m);
-                    var p_conv = [_]?*anyopaque{
-                        @ptrCast(&p_qkv), @ptrCast(&p_qb),  @ptrCast(&p_cw),
-                        @ptrCast(&p_cin), @ptrCast(&p_cout), @ptrCast(&p_qo),
-                        @ptrCast(&p_ko),  @ptrCast(&p_vo),  @ptrCast(&p_m),
-                        @ptrCast(&p_nc), @ptrCast(&p_eps),
-                    };
-                    try cuda.launch(self.ks.fn_gdn_conv, .{ 80, 1, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &p_conv);
+                    if (is_tree) {
+                        var p_conv_t = [_]?*anyopaque{
+                            @ptrCast(&p_qkv), @ptrCast(&p_qb), @ptrCast(&p_cw),
+                            @ptrCast(&p_cin), @ptrCast(&p_qo), @ptrCast(&p_ko),
+                            @ptrCast(&p_vo),  @ptrCast(&p_eps),
+                        };
+                        try cuda.launch(self.ks.fn_gdn_conv_tree, .{ 80, 1, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &p_conv_t);
+                    } else {
+                        var p_conv = [_]?*anyopaque{
+                            @ptrCast(&p_qkv), @ptrCast(&p_qb),  @ptrCast(&p_cw),
+                            @ptrCast(&p_cin), @ptrCast(&p_cout), @ptrCast(&p_qo),
+                            @ptrCast(&p_ko),  @ptrCast(&p_vo),  @ptrCast(&p_m),
+                            @ptrCast(&p_nc), @ptrCast(&p_eps),
+                        };
+                        try cuda.launch(self.ks.fn_gdn_conv, .{ 80, 1, 1 }, .{ 128, 1, 1 }, 0, self.ctx.stream, &p_conv);
+                    }
 
                     // 2D. GDN alpha + beta FP16 GEMV + exp/sigmoid gates (tiled along y for m > 8)
                     const d_g_out = if (commit_immediately) self.d_gdn_g else self.d_gdn_save_g + g_idx * MAX_M * 48 * 4;
@@ -666,13 +744,22 @@ pub const Engine = struct {
                     var p_sin = d_st;
                     var p_sout: cuda.CUdeviceptr = if (commit_immediately) d_st else 0;
                     var p_aout = self.d_buf_c;
-                    var p_rec = [_]?*anyopaque{
-                        @ptrCast(&p_qo), @ptrCast(&p_ko), @ptrCast(&p_vo),
-                        @ptrCast(&p_go), @ptrCast(&p_bo), @ptrCast(&p_sin),
-                        @ptrCast(&p_sout), @ptrCast(&p_aout), @ptrCast(&p_m),
-                        @ptrCast(&p_nc),
-                    };
-                    try cuda.launch(self.ks.fn_gdn_rec, .{ 48, 8, 1 }, .{ 32, 4, 1 }, 0, self.ctx.stream, &p_rec);
+                    if (is_tree) {
+                        var p_rec_t = [_]?*anyopaque{
+                            @ptrCast(&p_qo),  @ptrCast(&p_ko),  @ptrCast(&p_vo),
+                            @ptrCast(&p_go),  @ptrCast(&p_bo),  @ptrCast(&p_sin),
+                            @ptrCast(&p_aout),
+                        };
+                        try cuda.launch(self.ks.fn_gdn_rec_tree, .{ 48, 8, 1 }, .{ 32, 4, 1 }, 0, self.ctx.stream, &p_rec_t);
+                    } else {
+                        var p_rec = [_]?*anyopaque{
+                            @ptrCast(&p_qo), @ptrCast(&p_ko), @ptrCast(&p_vo),
+                            @ptrCast(&p_go), @ptrCast(&p_bo), @ptrCast(&p_sin),
+                            @ptrCast(&p_sout), @ptrCast(&p_aout), @ptrCast(&p_m),
+                            @ptrCast(&p_nc),
+                        };
+                        try cuda.launch(self.ks.fn_gdn_rec, .{ 48, 8, 1 }, .{ 32, 4, 1 }, 0, self.ctx.stream, &p_rec);
+                    }
 
                     // 2F. Fused GDN RMSNorm(128) * SiLU(z + z_bias) * rin + Had128 -> FP16
                     var p_z = self.d_buf_b;
@@ -738,7 +825,8 @@ pub const Engine = struct {
                         @ptrCast(&p_qrot),  @ptrCast(&p_gate), @ptrCast(&p_dpos),
                         @ptrCast(&p_fb),    @ptrCast(&p_eps),
                     };
-                    try cuda.launch(self.ks.fn_attn_q, .{ Spec.n_heads, m, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_q);
+                    const fn_q = if (is_tree) self.ks.fn_attn_q_tree else self.ks.fn_attn_q;
+                    try cuda.launch(fn_q, .{ Spec.n_heads, m, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_q);
 
                     // 2D. K RMSNorm + MRoPE + Q4_0 KV Cache Append at [*dpos .. *dpos+m)
                     const d_kc = self.d_kv_k + @as(usize, al.attn_idx) * self.kv_layer_bytes;
@@ -755,7 +843,8 @@ pub const Engine = struct {
                         @ptrCast(&p_kn),  @ptrCast(&p_kcp), @ptrCast(&p_vcp), @ptrCast(&p_dpos),
                         @ptrCast(&p_fb),  @ptrCast(&p_eps),
                     };
-                    try cuda.launch(self.ks.fn_attn_kv, .{ Spec.n_kv_heads, m, 2 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_kv);
+                    const fn_kv = if (is_tree) self.ks.fn_attn_kv_tree else self.ks.fn_attn_kv;
+                    try cuda.launch(fn_kv, .{ Spec.n_kv_heads, m, 2 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_kv);
 
                     // 2E. Split-K Q4_0 FlashAttention (adaptive: GQA6x4 tiled for seq >= 256, 1-warp for short seq!)
                     var p_po = self.d_part_o;
@@ -770,14 +859,16 @@ pub const Engine = struct {
                             @ptrCast(&p_dpos), @ptrCast(&p_m),   @ptrCast(&p_ns),
                         };
                         const gqa6_ty: u32 = (m + 3) / 4;
-                        try cuda.launch(self.ks.fn_attn_fa_gqa6, .{ Spec.n_kv_heads, gqa6_ty, n_splits }, .{ 768, 1, 1 }, 0, self.ctx.stream, &p_fa);
+                        const fn_gqa6 = if (is_tree) self.ks.fn_attn_fa_gqa6_tree else self.ks.fn_attn_fa_gqa6;
+                        try cuda.launch(fn_gqa6, .{ Spec.n_kv_heads, gqa6_ty, n_splits }, .{ 768, 1, 1 }, 0, self.ctx.stream, &p_fa);
                     } else {
                         var p_fa = [_]?*anyopaque{
                             @ptrCast(&p_qrot), @ptrCast(&p_kcp), @ptrCast(&p_vcp),
                             @ptrCast(&p_po),   @ptrCast(&p_pm),  @ptrCast(&p_pl),
                             @ptrCast(&p_dpos), @ptrCast(&p_ns),
                         };
-                        try cuda.launch(self.ks.fn_attn_fa_naive, .{ Spec.n_heads, m, n_splits }, .{ 32, 1, 1 }, 0, self.ctx.stream, &p_fa);
+                        const fn_naive = if (is_tree) self.ks.fn_attn_fa_naive_tree else self.ks.fn_attn_fa_naive;
+                        try cuda.launch(fn_naive, .{ Spec.n_heads, m, n_splits }, .{ 32, 1, 1 }, 0, self.ctx.stream, &p_fa);
                     }
 
                     // 2F. Fused Split-K Reduce + sigmoid(gate) + rin + Had128 -> FP16
@@ -938,6 +1029,39 @@ pub const Engine = struct {
         self.pos += n_commit;
     }
 
+    /// Compact Branch-B accepted slots `5 .. 5 + n_acc_b - 1` into contiguous slots `1 .. n_acc_b`
+    /// across `d_cap_buf`, all 16 FullAttn Q4_0 KV caches, and all 48 GDN saved state buffers (~25 us).
+    /// After this call, standard `commitSpeculative` / `commitAndInject` / `commitInjectAndDraftSampled`
+    /// works identically for `n_commit = 1 + n_acc_b`!
+    pub fn compactBranchB(self: *const Engine, n_acc_b: u32) !void {
+        std.debug.assert(n_acc_b >= 1 and n_acc_b <= 3);
+
+        // 1. Compact DFlash2 captured hidden states: slots 5..5+n_acc_b -> 1..1+n_acc_b (non-overlapping!)
+        const cap_row_bytes: usize = 5 * Spec.d_model * 4;
+        try self.ctx.copyDtoDAsync(
+            self.d_cap_buf + 1 * cap_row_bytes,
+            self.d_cap_buf + 5 * cap_row_bytes,
+            @as(usize, n_acc_b) * cap_row_bytes,
+        );
+
+        // 2. Compact 16-layer FullAttn Q4_0 K/V cache: pos_base + 5..5+n_acc_b -> pos_base + 1..1+n_acc_b
+        var p_kk = self.d_kv_k;
+        var p_kv = self.d_kv_v;
+        var p_lbytes: u64 = @intCast(self.kv_layer_bytes);
+        var p_pos: c_int = @intCast(self.pos);
+        var p_kv_args = [_]?*anyopaque{ @ptrCast(&p_kk), @ptrCast(&p_kv), @ptrCast(&p_lbytes), @ptrCast(&p_pos) };
+        try cuda.launch(self.ks.fn_attn_compact_b, .{ 16, n_acc_b, 2 }, .{ 144, 1, 1 }, 0, self.ctx.stream, &p_kv_args);
+
+        // 3. Compact 48-layer GDN speculative save buffers: slots 5..5+n_acc_b -> 1..1+n_acc_b
+        var p_qkv = self.d_gdn_save_qkv;
+        var p_k = self.d_gdn_save_k;
+        var p_v = self.d_gdn_save_v;
+        var p_g = self.d_gdn_save_g;
+        var p_b = self.d_gdn_save_beta;
+        var p_gdn_args = [_]?*anyopaque{ @ptrCast(&p_qkv), @ptrCast(&p_k), @ptrCast(&p_v), @ptrCast(&p_g), @ptrCast(&p_b) };
+        try cuda.launch(self.ks.fn_gdn_compact_b, .{ 48, n_acc_b, 1 }, .{ 256, 1, 1 }, 0, self.ctx.stream, &p_gdn_args);
+    }
+
     /// Launch Stage-1 Q4_0 LM head + Exact Top-64 on GPU (capturable inside a CUDA Graph!).
     pub fn launchStage1LmHeadGpu(self: *const Engine, d_hidden: cuda.CUdeviceptr, m: u32) !void {
         var p_x = d_hidden;
@@ -1085,6 +1209,25 @@ pub const CandidateDist = struct {
             if (r < acc) return self.ids[i];
         }
         return self.ids[self.len - 1];
+    }
+
+    /// Return the conditional distribution `P(X = x | X != excluded_id)` (renormalized).
+    /// Returns an empty distribution (`len == 0`) if all probability mass was on `excluded_id`.
+    pub fn conditionExcluding(self: *const CandidateDist, excluded_id: u32) CandidateDist {
+        var out: CandidateDist = .{};
+        var sum: f32 = 0.0;
+        for (0..self.len) |i| {
+            if (self.ids[i] != excluded_id and self.probs[i] > 0.0) {
+                out.ids[out.len] = self.ids[i];
+                out.probs[out.len] = self.probs[i];
+                sum += self.probs[i];
+                out.len += 1;
+            }
+        }
+        if (out.len == 0 or !(sum > 0.0) or !std.math.isFinite(sum)) return .{};
+        const inv = 1.0 / sum;
+        for (0..out.len) |i| out.probs[i] *= inv;
+        return out;
     }
 };
 
@@ -1295,6 +1438,71 @@ pub fn verifySpeculativeToken(
     return .{ .accepted = false, .token = target_dist.sample(rng) };
 }
 
+pub const ForkBranch = enum {
+    branch_a,
+    branch_b,
+    rejected,
+};
+
+pub const ForkVerifyResult = struct {
+    branch: ForkBranch,
+    token: u32,
+};
+
+/// Mathematically exact lossless Top-2 fork verification (SpecInfer / Sequoia):
+///   Given target distribution `p`, Branch-A draft `d_a ~ q_a`, and Branch-B draft `d_b ~ q_b`:
+///   1. Try `d_a` against `p` with accept probability `min(1, p(d_a) / q_a(d_a))`.
+///   2. If rejected, form the normalized residual target `p_1(x) proportional to max(0, p(x) - q_a(x))`
+///      and run standard lossless `verifySpeculativeToken(&p_1, q_b, d_b, rng)`.
+///   Marginal distribution of `result.token` equals `p` identically, even when `q_b = q_a(. | x != d_a)`!
+pub fn verifySpeculativeFork(
+    target_dist: *const CandidateDist,
+    draft_a_dist: *const CandidateDist,
+    draft_a_tok: u32,
+    draft_b_dist: *const CandidateDist,
+    draft_b_tok: u32,
+    rng: *std.Random.DefaultPrng,
+) ForkVerifyResult {
+    if (target_dist.len == 0) return .{ .branch = .rejected, .token = 0 };
+
+    // 1. Verify Branch A against target p
+    const p_a = target_dist.probOf(draft_a_tok);
+    const q_a = draft_a_dist.probOf(draft_a_tok);
+    if (p_a > 0.0) {
+        if (q_a <= 0.0 or p_a >= q_a) {
+            return .{ .branch = .branch_a, .token = draft_a_tok };
+        }
+        if (rng.random().float(f32) < p_a / q_a) {
+            return .{ .branch = .branch_a, .token = draft_a_tok };
+        }
+    }
+
+    // 2. Rejected Branch A -> construct normalized residual target p_1(x) proportional to max(0, p(x) - q_a(x))
+    var p1: CandidateDist = .{};
+    var res_sum: f32 = 0.0;
+    for (0..target_dist.len) |i| {
+        const diff = target_dist.probs[i] - draft_a_dist.probOf(target_dist.ids[i]);
+        if (diff > 0.0) {
+            p1.ids[p1.len] = target_dist.ids[i];
+            p1.probs[p1.len] = diff;
+            res_sum += diff;
+            p1.len += 1;
+        }
+    }
+    if (p1.len == 0 or !(res_sum > 0.0) or !std.math.isFinite(res_sum)) {
+        return .{ .branch = .rejected, .token = target_dist.sample(rng) };
+    }
+    const inv_sum = 1.0 / res_sum;
+    for (0..p1.len) |i| p1.probs[i] *= inv_sum;
+
+    // 3. Verify Branch B against residual target p_1
+    const vr_b = verifySpeculativeToken(&p1, draft_b_dist, draft_b_tok, rng);
+    return .{
+        .branch = if (vr_b.accepted) .branch_b else .rejected,
+        .token = vr_b.token,
+    };
+}
+
 test "sampleFromCandidates greedy ignores invalid slots, NaN, and handles non-finite temp" {
     var cands: CandidateList = .{
         .logits = @splat(-std.math.inf(f32)),
@@ -1500,4 +1708,78 @@ test "applyTokenPenalties modifies logits by frequency and presence counts" {
     // Greedy pick after penalties switches from 10 -> 30
     var rng = std.Random.DefaultPrng.init(1);
     try std.testing.expectEqual(@as(u32, 30), sampleFromCandidatesEx(&pen, 0.0, 64, 1.0, 0.0, &rng));
+}
+
+test "verifySpeculativeFork preserves exact target marginal distribution with without-replacement Top-2 drafts" {
+    // Target p over {10, 20, 30, 40}: [0.35, 0.30, 0.25, 0.10]
+    var target: CandidateDist = .{};
+    target.ids[0] = 10;
+    target.probs[0] = 0.35;
+    target.ids[1] = 20;
+    target.probs[1] = 0.30;
+    target.ids[2] = 30;
+    target.probs[2] = 0.25;
+    target.ids[3] = 40;
+    target.probs[3] = 0.10;
+    target.len = 4;
+
+    // Mismatched drafter q_a over {10, 20, 30, 99}: [0.55, 0.15, 0.20, 0.10]
+    // Single-draft acceptance = 0.35 + 0.15 + 0.20 = 0.70.
+    // With Branch B drawn from q_b = q_a(. | x != d_a), total acceptance strictly exceeds 0.70!
+    var draft_a: CandidateDist = .{};
+    draft_a.ids[0] = 10;
+    draft_a.probs[0] = 0.55;
+    draft_a.ids[1] = 20;
+    draft_a.probs[1] = 0.15;
+    draft_a.ids[2] = 30;
+    draft_a.probs[2] = 0.20;
+    draft_a.ids[3] = 99;
+    draft_a.probs[3] = 0.10;
+    draft_a.len = 4;
+
+    var rng = std.Random.DefaultPrng.init(20261125);
+    const trials: usize = 200_000;
+    var counts: [4]usize = .{ 0, 0, 0, 0 };
+    var acc_a: usize = 0;
+    var acc_b: usize = 0;
+
+    for (0..trials) |_| {
+        const d_a = draft_a.sample(&rng);
+        const draft_b = draft_a.conditionExcluding(d_a);
+        const d_b = draft_b.sample(&rng);
+        try std.testing.expect(d_a != d_b);
+
+        const fr = verifySpeculativeFork(&target, &draft_a, d_a, &draft_b, d_b, &rng);
+        switch (fr.branch) {
+            .branch_a => acc_a += 1,
+            .branch_b => acc_b += 1,
+            .rejected => {},
+        }
+        switch (fr.token) {
+            10 => counts[0] += 1,
+            20 => counts[1] += 1,
+            30 => counts[2] += 1,
+            40 => counts[3] += 1,
+            else => return error.UnexpectedOutOfSupportToken,
+        }
+    }
+
+    const inv_n: f64 = 1.0 / @as(f64, @floatFromInt(trials));
+    const rate_a = @as(f64, @floatFromInt(acc_a)) * inv_n;
+    const rate_b = @as(f64, @floatFromInt(acc_b)) * inv_n;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.70), rate_a, 0.006);
+    try std.testing.expect(rate_b > 0.12); // Branch B lifts pos-0 acceptance substantially!
+    // Exact target marginal distribution preserved across all 4 tokens:
+    try std.testing.expectApproxEqAbs(@as(f64, 0.35), @as(f64, @floatFromInt(counts[0])) * inv_n, 0.006);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.30), @as(f64, @floatFromInt(counts[1])) * inv_n, 0.006);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), @as(f64, @floatFromInt(counts[2])) * inv_n, 0.006);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.10), @as(f64, @floatFromInt(counts[3])) * inv_n, 0.006);
+
+    // Greedy point-mass case: accepts Branch B when argmax == d_b != d_a
+    const pm_t = CandidateDist.pointMass(20);
+    const pm_a = CandidateDist.pointMass(10);
+    const pm_b = CandidateDist.pointMass(20);
+    const gr_b = verifySpeculativeFork(&pm_t, &pm_a, 10, &pm_b, 20, &rng);
+    try std.testing.expectEqual(ForkBranch.branch_b, gr_b.branch);
+    try std.testing.expectEqual(@as(u32, 20), gr_b.token);
 }

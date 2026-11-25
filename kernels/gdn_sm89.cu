@@ -389,3 +389,202 @@ extern "C" __global__ void __launch_bounds__(256, 4) gdn_norm_gate_had128_f16(
     out_h.y = __floats2half2_rn(v.z * GDN_INV_SQRT128, v.w * GDN_INV_SQRT128);
     ((half4*)(xh_out + base))[lane] = out_h;
 }
+
+// =============================================================================
+// 5. Top-2 Tree Speculation (M=8: 0 -> Branch A [1..4] | Branch B [5..7])
+//    5a. Tree Conv1D + SiLU + L2-Norm (saves h0..h2 after t=0, restores before t=5)
+//    5b. Tree Register-Resident Recurrence (saves s[4][4] after t=0 in 8 KiB smem -> 0 spills!)
+//    5c. Branch-B Save Compaction (copies slots 5..5+n_acc_b-1 -> 1..n_acc_b across all 48 layers)
+// =============================================================================
+extern "C" __global__ void __launch_bounds__(128, 4) gdn_conv1d_silu_l2norm_tree_f32(
+    const float* __restrict__ qkv_in,
+    const float* __restrict__ qkv_bias,
+    const float* __restrict__ conv_w,
+    const float* __restrict__ conv_state_in,
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    float eps
+) {
+    const int head_blk = blockIdx.x; // 0..79
+    const int tid = threadIdx.x;     // 0..127
+    const int ch = head_blk * GDN_D + tid;
+
+    const float b = qkv_bias ? qkv_bias[ch] : 0.0f;
+    const float4 w = ((const float4*)conv_w)[ch];
+
+    float h0 = conv_state_in[0 * GDN_QKV_DIM + ch];
+    float h1 = conv_state_in[1 * GDN_QKV_DIM + ch];
+    float h2 = conv_state_in[2 * GDN_QKV_DIM + ch];
+    float s0 = h0, s1 = h1, s2 = h2;
+
+    const bool is_qk = (head_blk < 2 * GDN_HK);
+    __shared__ float sh_warp_sq[4];
+
+    for (int t = 0; t < 8; ++t) {
+        if (t == 5) {
+            h0 = s0;
+            h1 = s1;
+            h2 = s2;
+        }
+        const float x_cur = qkv_in[(size_t)t * GDN_QKV_DIM + ch] + b;
+        const float conv = h0 * w.x + h1 * w.y + h2 * w.z + x_cur * w.w;
+        float val = silu_f32(conv);
+
+        h0 = h1;
+        h1 = h2;
+        h2 = x_cur;
+
+        if (t == 0) {
+            s0 = h0;
+            s1 = h1;
+            s2 = h2;
+        }
+
+        if (is_qk) {
+            float sq = warp_sum_32(val * val);
+            const int lane = tid & 31;
+            const int warp = tid >> 5;
+            if (lane == 0) sh_warp_sq[warp] = sq;
+            __syncthreads();
+            float tot = sh_warp_sq[0] + sh_warp_sq[1] + sh_warp_sq[2] + sh_warp_sq[3];
+            float inv_norm = rsqrtf(fmaxf(tot, eps * eps));
+            val *= inv_norm;
+            __syncthreads();
+
+            if (head_blk < GDN_HK) {
+                q_out[((size_t)t * GDN_HK + head_blk) * GDN_D + tid] = val;
+            } else {
+                k_out[((size_t)t * GDN_HK + (head_blk - GDN_HK)) * GDN_D + tid] = val;
+            }
+        } else {
+            v_out[((size_t)t * GDN_HV + (head_blk - 2 * GDN_HK)) * GDN_D + tid] = val;
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128, 4) gdn_recurrence_tree_sm89(
+    const float* __restrict__ q,        // [8, 16, 128]
+    const float* __restrict__ k,        // [8, 16, 128]
+    const float* __restrict__ v,        // [8, 48, 128]
+    const float* __restrict__ g_exp,    // [8, 48]
+    const float* __restrict__ beta_sig, // [8, 48]
+    const float* __restrict__ state_in, // [48, 128, 128]
+    float* __restrict__ attn_out        // [8, 48, 128]
+) {
+    const int h = blockIdx.x;                 // 0..47
+    const int hk = h & 15;                    // h % 16
+    const int lane = threadIdx.x;             // 0..31
+    const int wy = threadIdx.y;               // 0..3
+    const int col0 = (blockIdx.y * 4 + wy) * 4;
+
+    const float* s_in_h = state_in + (size_t)h * (GDN_D * GDN_D);
+
+    // 8 KiB bank-conflict-free shared-memory snapshot of state after t=0 (0 extra regs -> 0 spills!)
+    __shared__ float sh_s0[4][4][4][32];
+
+    float s[4][4];
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            s[c][r] = s_in_h[(col0 + c) * GDN_D + r * 32 + lane];
+        }
+    }
+
+    for (int t = 0; t < 8; ++t) {
+        if (t == 5) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                #pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    s[c][r] = sh_s0[wy][c][r][lane];
+                }
+            }
+        }
+
+        const float* qt = q + ((size_t)t * GDN_HK + hk) * GDN_D;
+        const float* kt = k + ((size_t)t * GDN_HK + hk) * GDN_D;
+        const float* vt = v + ((size_t)t * GDN_HV + h) * GDN_D;
+        const float gv = g_exp[(size_t)t * GDN_HV + h];
+        const float bv = beta_sig[(size_t)t * GDN_HV + h];
+
+        float kr[4], qr[4];
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const int idx = r * 32 + lane;
+            kr[r] = kt[idx];
+            qr[r] = qt[idx];
+        }
+
+        float* out_t = attn_out + ((size_t)t * GDN_HV + h) * GDN_D;
+
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            float kv_part = s[c][0] * kr[0] + s[c][1] * kr[1] + s[c][2] * kr[2] + s[c][3] * kr[3];
+            const float kv_col = warp_sum_32(kv_part);
+            const float delta = (vt[col0 + c] - gv * kv_col) * bv;
+
+            float o_part = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                const float ns = gv * s[c][r] + kr[r] * delta;
+                s[c][r] = ns;
+                o_part += ns * qr[r];
+            }
+            const float o_col = warp_sum_32(o_part);
+            if (lane == 0) {
+                out_t[col0 + c] = o_col * GDN_INV_SQRT128;
+            }
+        }
+
+        if (t == 0) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                #pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    sh_s0[wy][c][r][lane] = s[c][r];
+                }
+            }
+        }
+    }
+}
+
+// Grid: (48, n_acc_b, 1), Block: (256, 1, 1)
+// Copies Branch-B saved GDN inputs from slot (5 + k) -> slot (1 + k) across all 48 GDN layers.
+extern "C" __global__ void __launch_bounds__(256, 4) gdn_compact_branch_b_save(
+    float* __restrict__ save_qkv,  // [48, 8, 10240]
+    float* __restrict__ save_k,    // [48, 8, 2048]
+    float* __restrict__ save_v,    // [48, 8, 6144]
+    float* __restrict__ save_g,    // [48, 8, 48]
+    float* __restrict__ save_beta  // [48, 8, 48]
+) {
+    const size_t g_idx = blockIdx.x; // 0..47
+    const size_t k = blockIdx.y;     // 0..n_acc_b-1 (0..2)
+    const int tid = threadIdx.x;     // 0..255
+    const size_t dst_slot = 1 + k;
+    const size_t src_slot = 5 + k;
+
+    float4* qkv_dst = reinterpret_cast<float4*>(save_qkv + (g_idx * 8 + dst_slot) * GDN_QKV_DIM);
+    const float4* qkv_src = reinterpret_cast<const float4*>(save_qkv + (g_idx * 8 + src_slot) * GDN_QKV_DIM);
+    for (int i = tid; i < (GDN_QKV_DIM / 4); i += 256) {
+        qkv_dst[i] = qkv_src[i];
+    }
+
+    float4* k_dst = reinterpret_cast<float4*>(save_k + (g_idx * 8 + dst_slot) * 2048);
+    const float4* k_src = reinterpret_cast<const float4*>(save_k + (g_idx * 8 + src_slot) * 2048);
+    for (int i = tid; i < (2048 / 4); i += 256) {
+        k_dst[i] = k_src[i];
+    }
+
+    float4* v_dst = reinterpret_cast<float4*>(save_v + (g_idx * 8 + dst_slot) * 6144);
+    const float4* v_src = reinterpret_cast<const float4*>(save_v + (g_idx * 8 + src_slot) * 6144);
+    for (int i = tid; i < (6144 / 4); i += 256) {
+        v_dst[i] = v_src[i];
+    }
+
+    if (tid < GDN_HV) {
+        save_g[(g_idx * 8 + dst_slot) * GDN_HV + tid] = save_g[(g_idx * 8 + src_slot) * GDN_HV + tid];
+        save_beta[(g_idx * 8 + dst_slot) * GDN_HV + tid] = save_beta[(g_idx * 8 + src_slot) * GDN_HV + tid];
+    }
+}

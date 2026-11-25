@@ -531,6 +531,8 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var max_tokens: usize = 64;
     var temp: f32 = 0.0;
     var use_pld: bool = true;
+    var tree_thresh: f32 = dflash_mod.DFlashEngine.DEFAULT_TREE_THRESH;
+    var seed: u64 = 42;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -545,6 +547,12 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             use_spec = false;
         } else if (std.mem.eql(u8, args[i], "--no-pld")) {
             use_pld = false;
+        } else if (std.mem.eql(u8, args[i], "--tree-thresh") and i + 1 < args.len) {
+            i += 1;
+            tree_thresh = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--seed") and i + 1 < args.len) {
+            i += 1;
+            seed = try std.fmt.parseInt(u64, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--prompt") and i + 1 < args.len) {
             i += 1;
             prompt = args[i];
@@ -577,7 +585,7 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const prompt_toks = try tok.encode(allocator, prompt);
     defer allocator.free(prompt_toks);
 
-    var rng = std.Random.DefaultPrng.init(42);
+    var rng = std.Random.DefaultPrng.init(seed);
     const tp0 = nowMs();
     const pf = if (dflash_opt) |*df|
         try df.prefill(&eng, prompt_toks)
@@ -600,6 +608,8 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var total_drafted: usize = 0;
     var total_accepted: usize = 0;
     var pld_hits: usize = 0;
+    var tree_steps: usize = 0;
+    var branch_b_wins: usize = 0;
 
     if (dflash_opt) |*df| {
         const greedy = engine_mod.isGreedySampling(temp, 64, 0.95);
@@ -618,105 +628,258 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             var pending_commit: u32 = 0;
             var pl_state: dflash_mod.PromptLookupState = .{};
             while (gen.items.len < max_tokens) {
-                var draft_toks: [dflash_mod.N_DRAFT]u32 = undefined;
-                var draft_dists: [dflash_mod.N_DRAFT]engine_mod.CandidateDist = undefined;
+                var plan: dflash_mod.DFlashEngine.DraftPlan = .{};
                 const pl_nd: u32 = if (use_pld)
-                    pl_state.tryDraft(history.items, cur, &draft_toks, if (greedy) null else &draft_dists)
+                    pl_state.tryDraft(history.items, cur, &plan.tokens, if (greedy) null else &plan.dists)
                 else
                     0;
                 const used_lookup = (pl_nd == dflash_mod.N_DRAFT);
-                const n_draft = if (used_lookup) blk: {
+                if (used_lookup) {
                     pld_hits += 1;
+                    plan.is_tree = false;
+                    plan.n_draft = pl_nd;
                     if (pending_commit > 0) {
                         try df.commitAndInject(&eng, pending_commit);
                         pending_commit = 0;
                     }
-                    break :blk pl_nd;
-                } else if (pending_commit > 0) blk: {
-                    const nd = try df.commitInjectAndDraftSampled(
+                } else if (pending_commit > 0) {
+                    plan = try df.commitInjectAndDraftPlan(
                         &eng,
                         pending_commit,
                         cur,
                         0.0,
+                        tree_thresh,
                         draft_sampling,
-                        &draft_toks,
-                        if (greedy) null else &draft_dists,
                     );
                     pending_commit = 0;
-                    break :blk nd;
-                } else try df.draftSampled(
-                    &eng,
-                    cur,
-                    eng.pos,
-                    0.0,
-                    draft_sampling,
-                    &draft_toks,
-                    if (greedy) null else &draft_dists,
-                );
+                } else {
+                    plan = try df.draftPlan(
+                        &eng,
+                        cur,
+                        eng.pos,
+                        0.0,
+                        tree_thresh,
+                        draft_sampling,
+                    );
+                }
+
+                const n_draft = plan.n_draft;
                 total_drafted += n_draft;
 
                 var batch: [dflash_mod.BLOCK_SIZE]u32 = undefined;
                 batch[0] = cur;
-                for (0..n_draft) |k| batch[1 + k] = draft_toks[k];
+                for (0..n_draft) |k| batch[1 + k] = plan.tokens[k];
                 const m: u32 = 1 + n_draft;
 
-                const out = try eng.forward(batch[0..m], false, true);
+                const out = if (plan.is_tree) blk: {
+                    tree_steps += 1;
+                    break :blk try eng.forwardTree8(&batch);
+                } else try eng.forward(batch[0..m], false, true);
                 n_steps += 1;
 
                 var n_acc: u32 = 0;
                 var next_tok: u32 = 0;
                 var stopped = false;
+                var won_branch_b = false;
 
-                for (0..n_draft) |k| {
-                    const vr: engine_mod.VerifyResult = if (greedy) .{
-                        .accepted = out.tokens[k] == draft_toks[k],
-                        .token = out.tokens[k],
+                if (plan.is_tree) {
+                    const br_a_len = dflash_mod.DFlashEngine.TREE_BRANCH_A_LEN;
+                    const br_b_len = dflash_mod.DFlashEngine.TREE_BRANCH_B_LEN;
+                    const d_a0 = plan.tokens[0];
+                    const d_b0 = plan.tokens[br_a_len];
+
+                    const fr: engine_mod.ForkVerifyResult = if (greedy) .{
+                        .branch = if (out.tokens[0] == d_a0)
+                            .branch_a
+                        else if (out.tokens[0] == d_b0)
+                            .branch_b
+                        else
+                            .rejected,
+                        .token = out.tokens[0],
                     } else blk: {
-                        const target_dist = engine_mod.buildCandidateDist(&out.cands[k], temp, 64, 0.95);
-                        break :blk engine_mod.verifySpeculativeToken(&target_dist, &draft_dists[k], draft_toks[k], &rng);
+                        const target_dist_0 = engine_mod.buildCandidateDist(&out.cands[0], temp, 64, 0.95);
+                        break :blk engine_mod.verifySpeculativeFork(
+                            &target_dist_0,
+                            &plan.dists[0],
+                            d_a0,
+                            &plan.dists[br_a_len],
+                            d_b0,
+                            &rng,
+                        );
                     };
-                    if (tok.isEos(vr.token)) {
-                        stopped = true;
-                        break;
-                    }
-                    try gen.append(allocator, vr.token);
-                    piece_buf.clearRetainingCapacity();
-                    try tok.decodeTokenTo(vr.token, &piece_buf, allocator);
-                    std.debug.print("{s}", .{piece_buf.items});
-                    if (gen.items.len >= max_tokens) {
-                        stopped = true;
-                        break;
-                    }
-                    if (vr.accepted) {
-                        n_acc += 1;
-                    } else {
-                        next_tok = vr.token;
-                        break;
-                    }
-                }
-                total_accepted += n_acc;
-                pl_state.recordOutcome(used_lookup, n_acc);
 
-                if (!stopped and n_acc == n_draft) {
-                    const bonus = if (greedy)
-                        out.tokens[n_draft]
-                    else
-                        engine_mod.sampleFromCandidates(&out.cands[n_draft], temp, 64, 0.95, &rng);
-                    if (tok.isEos(bonus)) {
+                    if (tok.isEos(fr.token)) {
                         stopped = true;
                     } else {
-                        try gen.append(allocator, bonus);
+                        try gen.append(allocator, fr.token);
                         piece_buf.clearRetainingCapacity();
-                        try tok.decodeTokenTo(bonus, &piece_buf, allocator);
+                        try tok.decodeTokenTo(fr.token, &piece_buf, allocator);
                         std.debug.print("{s}", .{piece_buf.items});
-                        next_tok = bonus;
                         if (gen.items.len >= max_tokens) stopped = true;
+                    }
+
+                    if (!stopped) {
+                        switch (fr.branch) {
+                            .rejected => {
+                                next_tok = fr.token;
+                            },
+                            .branch_a => {
+                                n_acc = 1;
+                                for (1..br_a_len) |j| {
+                                    const vr: engine_mod.VerifyResult = if (greedy) .{
+                                        .accepted = out.tokens[j] == plan.tokens[j],
+                                        .token = out.tokens[j],
+                                    } else blk: {
+                                        const td = engine_mod.buildCandidateDist(&out.cands[j], temp, 64, 0.95);
+                                        break :blk engine_mod.verifySpeculativeToken(&td, &plan.dists[j], plan.tokens[j], &rng);
+                                    };
+                                    if (tok.isEos(vr.token)) {
+                                        stopped = true;
+                                        break;
+                                    }
+                                    try gen.append(allocator, vr.token);
+                                    piece_buf.clearRetainingCapacity();
+                                    try tok.decodeTokenTo(vr.token, &piece_buf, allocator);
+                                    std.debug.print("{s}", .{piece_buf.items});
+                                    if (gen.items.len >= max_tokens) {
+                                        stopped = true;
+                                        break;
+                                    }
+                                    if (vr.accepted) {
+                                        n_acc += 1;
+                                    } else {
+                                        next_tok = vr.token;
+                                        break;
+                                    }
+                                }
+                                if (!stopped and n_acc == br_a_len) {
+                                    const bonus = if (greedy)
+                                        out.tokens[br_a_len]
+                                    else
+                                        engine_mod.sampleFromCandidates(&out.cands[br_a_len], temp, 64, 0.95, &rng);
+                                    if (tok.isEos(bonus)) {
+                                        stopped = true;
+                                    } else {
+                                        try gen.append(allocator, bonus);
+                                        piece_buf.clearRetainingCapacity();
+                                        try tok.decodeTokenTo(bonus, &piece_buf, allocator);
+                                        std.debug.print("{s}", .{piece_buf.items});
+                                        next_tok = bonus;
+                                        if (gen.items.len >= max_tokens) stopped = true;
+                                    }
+                                }
+                            },
+                            .branch_b => {
+                                won_branch_b = true;
+                                branch_b_wins += 1;
+                                n_acc = 1;
+                                for (1..br_b_len) |j| {
+                                    const slot = br_a_len + j; // 5, 6 (predicts batch[6]=d_b1, batch[7]=d_b2)
+                                    const vr: engine_mod.VerifyResult = if (greedy) .{
+                                        .accepted = out.tokens[slot] == plan.tokens[slot],
+                                        .token = out.tokens[slot],
+                                    } else blk: {
+                                        const td = engine_mod.buildCandidateDist(&out.cands[slot], temp, 64, 0.95);
+                                        break :blk engine_mod.verifySpeculativeToken(&td, &plan.dists[slot], plan.tokens[slot], &rng);
+                                    };
+                                    if (tok.isEos(vr.token)) {
+                                        stopped = true;
+                                        break;
+                                    }
+                                    try gen.append(allocator, vr.token);
+                                    piece_buf.clearRetainingCapacity();
+                                    try tok.decodeTokenTo(vr.token, &piece_buf, allocator);
+                                    std.debug.print("{s}", .{piece_buf.items});
+                                    if (gen.items.len >= max_tokens) {
+                                        stopped = true;
+                                        break;
+                                    }
+                                    if (vr.accepted) {
+                                        n_acc += 1;
+                                    } else {
+                                        next_tok = vr.token;
+                                        break;
+                                    }
+                                }
+                                if (!stopped and n_acc == br_b_len) {
+                                    const bonus = if (greedy)
+                                        out.tokens[br_a_len + br_b_len]
+                                    else
+                                        engine_mod.sampleFromCandidates(&out.cands[br_a_len + br_b_len], temp, 64, 0.95, &rng);
+                                    if (tok.isEos(bonus)) {
+                                        stopped = true;
+                                    } else {
+                                        try gen.append(allocator, bonus);
+                                        piece_buf.clearRetainingCapacity();
+                                        try tok.decodeTokenTo(bonus, &piece_buf, allocator);
+                                        std.debug.print("{s}", .{piece_buf.items});
+                                        next_tok = bonus;
+                                        if (gen.items.len >= max_tokens) stopped = true;
+                                    }
+                                }
+                            },
+                        }
+                    }
+                    total_accepted += n_acc;
+                    pl_state.recordOutcome(false, n_acc);
+                } else {
+                    for (0..n_draft) |k| {
+                        const vr: engine_mod.VerifyResult = if (greedy) .{
+                            .accepted = out.tokens[k] == plan.tokens[k],
+                            .token = out.tokens[k],
+                        } else blk: {
+                            const target_dist = engine_mod.buildCandidateDist(&out.cands[k], temp, 64, 0.95);
+                            break :blk engine_mod.verifySpeculativeToken(&target_dist, &plan.dists[k], plan.tokens[k], &rng);
+                        };
+                        if (tok.isEos(vr.token)) {
+                            stopped = true;
+                            break;
+                        }
+                        try gen.append(allocator, vr.token);
+                        piece_buf.clearRetainingCapacity();
+                        try tok.decodeTokenTo(vr.token, &piece_buf, allocator);
+                        std.debug.print("{s}", .{piece_buf.items});
+                        if (gen.items.len >= max_tokens) {
+                            stopped = true;
+                            break;
+                        }
+                        if (vr.accepted) {
+                            n_acc += 1;
+                        } else {
+                            next_tok = vr.token;
+                            break;
+                        }
+                    }
+                    total_accepted += n_acc;
+                    pl_state.recordOutcome(used_lookup, n_acc);
+
+                    if (!stopped and n_acc == n_draft) {
+                        const bonus = if (greedy)
+                            out.tokens[n_draft]
+                        else
+                            engine_mod.sampleFromCandidates(&out.cands[n_draft], temp, 64, 0.95, &rng);
+                        if (tok.isEos(bonus)) {
+                            stopped = true;
+                        } else {
+                            try gen.append(allocator, bonus);
+                            piece_buf.clearRetainingCapacity();
+                            try tok.decodeTokenTo(bonus, &piece_buf, allocator);
+                            std.debug.print("{s}", .{piece_buf.items});
+                            next_tok = bonus;
+                            if (gen.items.len >= max_tokens) stopped = true;
+                        }
                     }
                 }
                 if (stopped) break;
 
                 const n_commit = n_acc + 1;
-                try history.appendSlice(allocator, batch[0..n_commit]);
+                if (won_branch_b) {
+                    try eng.compactBranchB(n_acc);
+                    try history.append(allocator, batch[0]);
+                    try history.appendSlice(allocator, batch[5 .. 5 + n_acc]);
+                } else {
+                    try history.appendSlice(allocator, batch[0..n_commit]);
+                }
                 pending_commit = n_commit;
                 cur = next_tok;
             }
@@ -738,7 +901,7 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const dec_toks = if (gen.items.len > 1) gen.items.len - 1 else 1;
     if (use_spec and n_steps > 0) {
         std.debug.print(
-            "\n\n[prompt: {d} toks in {d:.1} ms | generated: {d} toks in {d:.1} ms ({d:.2} tok/s) | steps: {d} ({d:.2} tok/step, acc {d}/{d} = {d:.1}%, pld={d}) | KV pool: {d} cells]\n",
+            "\n\n[prompt: {d} toks in {d:.1} ms | generated: {d} toks in {d:.1} ms ({d:.2} tok/s) | steps: {d} ({d:.2} tok/step, acc {d}/{d} = {d:.1}%, pld={d}, tree={d}/b={d}) | KV pool: {d} cells]\n",
             .{
                 prompt_toks.len,
                 tp1 - tp0,
@@ -751,6 +914,8 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 total_drafted,
                 if (total_drafted > 0) @as(f64, @floatFromInt(total_accepted)) * 100.0 / @as(f64, @floatFromInt(total_drafted)) else 0.0,
                 pld_hits,
+                tree_steps,
+                branch_b_wins,
                 eng.max_kv_cells,
             },
         );
