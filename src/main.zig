@@ -530,6 +530,7 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var prompt: []const u8 = "The capital of France is";
     var max_tokens: usize = 64;
     var temp: f32 = 0.0;
+    var use_pld: bool = true;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -542,6 +543,8 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             use_spec = true;
         } else if (std.mem.eql(u8, args[i], "--no-spec")) {
             use_spec = false;
+        } else if (std.mem.eql(u8, args[i], "--no-pld")) {
+            use_pld = false;
         } else if (std.mem.eql(u8, args[i], "--prompt") and i + 1 < args.len) {
             i += 1;
             prompt = args[i];
@@ -585,6 +588,9 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var cur = engine_mod.sampleFromCandidates(&pf.cands[0], temp, 64, 0.95, &rng);
     var gen: std.ArrayListUnmanaged(u32) = .empty;
     defer gen.deinit(allocator);
+    var history: std.ArrayListUnmanaged(u32) = .empty;
+    defer history.deinit(allocator);
+    try history.appendSlice(allocator, prompt_toks);
 
     const td0 = nowMs();
     var piece_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -593,6 +599,7 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var n_steps: usize = 0;
     var total_drafted: usize = 0;
     var total_accepted: usize = 0;
+    var pld_hits: usize = 0;
 
     if (dflash_opt) |*df| {
         const greedy = engine_mod.isGreedySampling(temp, 64, 0.95);
@@ -609,11 +616,24 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             std.debug.print("{s}", .{piece_buf.items});
 
             var pending_commit: u32 = 0;
+            var pl_state: dflash_mod.PromptLookupState = .{};
             while (gen.items.len < max_tokens) {
                 var draft_toks: [dflash_mod.N_DRAFT]u32 = undefined;
                 var draft_dists: [dflash_mod.N_DRAFT]engine_mod.CandidateDist = undefined;
-                const n_draft = if (pending_commit > 0)
-                    try df.commitInjectAndDraftSampled(
+                const pl_nd: u32 = if (use_pld)
+                    pl_state.tryDraft(history.items, cur, &draft_toks, if (greedy) null else &draft_dists)
+                else
+                    0;
+                const used_lookup = (pl_nd == dflash_mod.N_DRAFT);
+                const n_draft = if (used_lookup) blk: {
+                    pld_hits += 1;
+                    if (pending_commit > 0) {
+                        try df.commitAndInject(&eng, pending_commit);
+                        pending_commit = 0;
+                    }
+                    break :blk pl_nd;
+                } else if (pending_commit > 0) blk: {
+                    const nd = try df.commitInjectAndDraftSampled(
                         &eng,
                         pending_commit,
                         cur,
@@ -621,18 +641,18 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                         draft_sampling,
                         &draft_toks,
                         if (greedy) null else &draft_dists,
-                    )
-                else
-                    try df.draftSampled(
-                        &eng,
-                        cur,
-                        eng.pos,
-                        0.0,
-                        draft_sampling,
-                        &draft_toks,
-                        if (greedy) null else &draft_dists,
                     );
-                pending_commit = 0;
+                    pending_commit = 0;
+                    break :blk nd;
+                } else try df.draftSampled(
+                    &eng,
+                    cur,
+                    eng.pos,
+                    0.0,
+                    draft_sampling,
+                    &draft_toks,
+                    if (greedy) null else &draft_dists,
+                );
                 total_drafted += n_draft;
 
                 var batch: [dflash_mod.BLOCK_SIZE]u32 = undefined;
@@ -675,6 +695,7 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                     }
                 }
                 total_accepted += n_acc;
+                pl_state.recordOutcome(used_lookup, n_acc);
 
                 if (!stopped and n_acc == n_draft) {
                     const bonus = if (greedy)
@@ -694,7 +715,9 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 }
                 if (stopped) break;
 
-                pending_commit = n_acc + 1;
+                const n_commit = n_acc + 1;
+                try history.appendSlice(allocator, batch[0..n_commit]);
+                pending_commit = n_commit;
                 cur = next_tok;
             }
         }
@@ -715,7 +738,7 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const dec_toks = if (gen.items.len > 1) gen.items.len - 1 else 1;
     if (use_spec and n_steps > 0) {
         std.debug.print(
-            "\n\n[prompt: {d} toks in {d:.1} ms | generated: {d} toks in {d:.1} ms ({d:.2} tok/s) | steps: {d} ({d:.2} tok/step, acc {d}/{d} = {d:.1}%) | KV pool: {d} cells]\n",
+            "\n\n[prompt: {d} toks in {d:.1} ms | generated: {d} toks in {d:.1} ms ({d:.2} tok/s) | steps: {d} ({d:.2} tok/step, acc {d}/{d} = {d:.1}%, pld={d}) | KV pool: {d} cells]\n",
             .{
                 prompt_toks.len,
                 tp1 - tp0,
@@ -727,6 +750,7 @@ fn runGenerate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 total_accepted,
                 total_drafted,
                 if (total_drafted > 0) @as(f64, @floatFromInt(total_accepted)) * 100.0 / @as(f64, @floatFromInt(total_drafted)) else 0.0,
+                pld_hits,
                 eng.max_kv_cells,
             },
         );

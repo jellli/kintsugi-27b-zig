@@ -2346,11 +2346,25 @@ const ServerState = struct {
                         .rng = &rng,
                     };
                     var pending_commit: u32 = 0;
+                    var pl_state: dflash_mod.PromptLookupState = .{};
                     while (!stopped and stats.completion_tokens < params.max_tokens) {
                         var draft_toks: [dflash_mod.N_DRAFT]u32 = undefined;
                         var draft_dists: [dflash_mod.N_DRAFT]engine_mod.CandidateDist = undefined;
-                        const n_draft = if (pending_commit > 0)
-                            try df.commitInjectAndDraftSampled(
+                        const pl_nd = pl_state.tryDraft(
+                            self.active_tokens.items,
+                            cur,
+                            &draft_toks,
+                            if (greedy) null else &draft_dists,
+                        );
+                        const used_lookup = (pl_nd == dflash_mod.N_DRAFT);
+                        const n_draft = if (used_lookup) blk: {
+                            if (pending_commit > 0) {
+                                try df.commitAndInject(self.eng, pending_commit);
+                                pending_commit = 0;
+                            }
+                            break :blk pl_nd;
+                        } else if (pending_commit > 0) blk: {
+                            const nd = try df.commitInjectAndDraftSampled(
                                 self.eng,
                                 pending_commit,
                                 cur,
@@ -2358,18 +2372,18 @@ const ServerState = struct {
                                 draft_sampling,
                                 &draft_toks,
                                 if (greedy) null else &draft_dists,
-                            )
-                        else
-                            try df.draftSampled(
-                                self.eng,
-                                cur,
-                                self.eng.pos,
-                                0.0,
-                                draft_sampling,
-                                &draft_toks,
-                                if (greedy) null else &draft_dists,
                             );
-                        pending_commit = 0;
+                            pending_commit = 0;
+                            break :blk nd;
+                        } else try df.draftSampled(
+                            self.eng,
+                            cur,
+                            self.eng.pos,
+                            0.0,
+                            draft_sampling,
+                            &draft_toks,
+                            if (greedy) null else &draft_dists,
+                        );
                         stats.draft_n += n_draft;
 
                         var batch: [dflash_mod.BLOCK_SIZE]u32 = undefined;
@@ -2415,6 +2429,7 @@ const ServerState = struct {
                             }
                         }
                         stats.draft_n_accepted += n_acc;
+                        pl_state.recordOutcome(used_lookup, n_acc);
 
                         if (!stopped and n_acc == n_draft) {
                             const bonus = if (greedy and !has_penalties)

@@ -990,3 +990,124 @@ test "dflash Q4_0 row dequant and dot identity" {
     const dot = dotQ4_0Row256(&buf, 0, &vec);
     try std.testing.expectApproxEqAbs(@as(f32, 256.0), dot, 1e-4);
 }
+
+/// Zero-VRAM CPU N-gram suffix matcher (Prompt Lookup / PLD) over recent token history.
+/// Searches backwards over the last `16384` tokens of `history` for the longest/most-recent
+/// occurrence of `[history[end-(ngram-1)..end], cur]` (`max_ngram` down to `min_ngram`)
+/// that has at least `N_DRAFT` (7) continuation tokens following it.
+/// Returns `N_DRAFT` on hit (writing the 7 continuation tokens into `out_draft`) or `0` on miss.
+pub fn findPromptLookupDraft(
+    history: []const u32,
+    cur: u32,
+    min_ngram: usize,
+    max_ngram: usize,
+    out_draft: *[N_DRAFT]u32,
+) u32 {
+    if (min_ngram < 2 or max_ngram < min_ngram) return 0;
+    if (history.len < min_ngram + N_DRAFT) return 0;
+
+    const max_window: usize = 16384;
+    const win_start: usize = history.len -| max_window;
+    const eff_max = @min(max_ngram, history.len - N_DRAFT);
+
+    var ngram: usize = eff_max;
+    while (ngram >= min_ngram) : (ngram -= 1) {
+        const pref_len = ngram - 1;
+        const suffix_prefix = history[history.len - pref_len .. history.len];
+        // Need `i + ngram + N_DRAFT <= history.len` -> `i <= history.len - ngram - N_DRAFT`
+        const last_i = history.len - ngram - N_DRAFT;
+        if (last_i < win_start) continue;
+
+        var i: usize = last_i;
+        while (true) {
+            if (history[i + pref_len] == cur and std.mem.eql(u32, history[i .. i + pref_len], suffix_prefix)) {
+                const cont = history[i + ngram ..][0..N_DRAFT];
+                @memcpy(out_draft, cont);
+                return N_DRAFT;
+            }
+            if (i == win_start) break;
+            i -= 1;
+        }
+    }
+    return 0;
+}
+
+/// Adaptive hysteresis controller for Prompt Lookup drafting:
+///   - Normally requires a 6..8-gram match with a full 7-token continuation (virtually zero false positives).
+///   - Once a lookup hit accepts >= 3 tokens (active code edit / quote), lowers threshold to 5-gram.
+///   - On a false positive (< 3 accepted), enters a 4-step cooldown so DFlash2 takes over cleanly.
+///   - Emits `CandidateDist.pointMass` so lossless speculative rejection sampling remains 100% exact.
+pub const PromptLookupState = struct {
+    cooldown: u8 = 0,
+    hot: bool = false,
+
+    pub fn tryDraft(
+        self: *const PromptLookupState,
+        history: []const u32,
+        cur: u32,
+        draft_out: *[N_DRAFT]u32,
+        dists_out: ?*[N_DRAFT]engine_mod.CandidateDist,
+    ) u32 {
+        if (self.cooldown > 0) return 0;
+        const min_ngram: usize = if (self.hot) 5 else 6;
+        const nd = findPromptLookupDraft(history, cur, min_ngram, 8, draft_out);
+        if (nd < N_DRAFT) return 0;
+        if (dists_out) |do| {
+            for (0..N_DRAFT) |i| {
+                do[i] = engine_mod.CandidateDist.pointMass(draft_out[i]);
+            }
+        }
+        return N_DRAFT;
+    }
+
+    pub fn recordOutcome(self: *PromptLookupState, used_lookup: bool, n_acc: u32) void {
+        if (used_lookup) {
+            if (n_acc >= 3) {
+                self.hot = true;
+                self.cooldown = 0;
+            } else {
+                self.hot = false;
+                self.cooldown = 4;
+            }
+        } else {
+            if (self.cooldown > 0) self.cooldown -= 1;
+            self.hot = false;
+        }
+    }
+};
+
+test "findPromptLookupDraft matches most recent longest suffix and PromptLookupState handles hysteresis" {
+    // History has two occurrences of [10, 20, 30, 40, 50, 60]:
+    //   first at idx 0 -> continuation [1, 2, 3, 4, 5, 6, 7]
+    //   second at idx 16 -> continuation [101, 102, 103, 104, 105, 106, 107]
+    // Ending with [10, 20, 30, 40, 50] and cur = 60 -> must return the MORE RECENT [101..107]!
+    const history = [_]u32{
+        10, 20, 30, 40, 50, 60, 1,   2,   3,   4,   5,   6,   7,   99, 98, 97,
+        10, 20, 30, 40, 50, 60, 101, 102, 103, 104, 105, 106, 107, 88, 10, 20,
+        30, 40, 50,
+    };
+    var out: [N_DRAFT]u32 = undefined;
+    var dists: [N_DRAFT]engine_mod.CandidateDist = undefined;
+
+    var pl: PromptLookupState = .{};
+    const nd = pl.tryDraft(&history, 60, &out, &dists);
+    try std.testing.expectEqual(@as(u32, N_DRAFT), nd);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 101, 102, 103, 104, 105, 106, 107 }, &out);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), dists[0].probOf(101), 1e-6);
+
+    // False positive (< 3 accepted) triggers 4-step cooldown and suppresses lookup
+    pl.recordOutcome(true, 1);
+    try std.testing.expectEqual(@as(u32, 0), pl.tryDraft(&history, 60, &out, null));
+    pl.recordOutcome(false, 3);
+    pl.recordOutcome(false, 3);
+    pl.recordOutcome(false, 3);
+    pl.recordOutcome(false, 3);
+    // Cooldown expired -> matches again
+    try std.testing.expectEqual(@as(u32, N_DRAFT), pl.tryDraft(&history, 60, &out, null));
+
+    // Hot state (>= 3 accepted) unlocks 5-gram matching
+    pl.recordOutcome(true, 5);
+    const short_hist = [_]u32{ 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 99, 6, 7, 8, 9 };
+    try std.testing.expectEqual(@as(u32, N_DRAFT), pl.tryDraft(&short_hist, 10, &out, null));
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 11, 12, 13, 14, 15, 16, 17 }, &out);
+}
