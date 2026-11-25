@@ -81,16 +81,34 @@ pub const TensorInfo = struct {
 
     pub fn nElements(self: *const TensorInfo) u64 {
         var n: u64 = 1;
-        for (0..self.n_dims) |i| n *= self.dims[i];
+        for (0..self.n_dims) |i| n *|= self.dims[i];
+        return n;
+    }
+
+    pub fn checkedNElements(self: *const TensorInfo) !u64 {
+        var n: u64 = 1;
+        for (0..self.n_dims) |i| {
+            n = std.math.mul(u64, n, self.dims[i]) catch return error.InvalidGguf;
+        }
         return n;
     }
 
     pub fn byteSize(self: *const TensorInfo) u64 {
         const bs = self.ggml_type.blockSize();
         const ts = self.ggml_type.typeSize();
-        return (self.nElements() / bs) * ts;
+        return (self.nElements() / bs) *| ts;
+    }
+
+    pub fn checkedByteSize(self: *const TensorInfo) !u64 {
+        const bs = self.ggml_type.blockSize();
+        const ts = self.ggml_type.typeSize();
+        const ne = try self.checkedNElements();
+        if (ne % bs != 0) return error.InvalidGguf;
+        return std.math.mul(u64, ne / bs, ts) catch return error.InvalidGguf;
     }
 };
+
+const MAX_SKIP_DEPTH: usize = 16;
 
 pub const GgufFile = struct {
     fd: c_int,
@@ -122,43 +140,47 @@ pub const GgufFile = struct {
         if (!std.mem.eql(u8, mapped[0..4], "GGUF")) return error.InvalidMagic;
         cur += 4;
 
-        const version = readInt(u32, mapped, &cur);
+        const version = try readInt(u32, mapped, &cur);
         if (version < 2 or version > 3) return error.UnsupportedVersion;
-        const n_tensors = readInt(u64, mapped, &cur);
-        const n_kv = readInt(u64, mapped, &cur);
+        const n_tensors = try readInt(u64, mapped, &cur);
+        const n_kv = try readInt(u64, mapped, &cur);
+        // Sanity cap against absurd counts in corrupt headers (each entry consumes >= 8 bytes)
+        if (n_tensors > file_size / 8 or n_kv > file_size / 8) return error.InvalidGguf;
 
         var alignment: u64 = 32;
         var arch: []const u8 = "unknown";
 
-        for (0..n_kv) |_| {
-            const key = readStr(mapped, &cur);
-            const vtype = readInt(u32, mapped, &cur);
+        for (0..@as(usize, @intCast(n_kv))) |_| {
+            const key = try readStr(mapped, &cur);
+            const vtype = try readInt(u32, mapped, &cur);
             if (std.mem.eql(u8, key, "general.alignment") and vtype == 4) {
-                alignment = readInt(u32, mapped, &cur);
+                alignment = try readInt(u32, mapped, &cur);
+                if (alignment == 0 or (alignment & (alignment - 1)) != 0) return error.InvalidAlignment;
             } else if (std.mem.eql(u8, key, "general.architecture") and vtype == 8) {
-                arch = readStr(mapped, &cur);
+                arch = try readStr(mapped, &cur);
             } else {
-                try skipValue(mapped, &cur, vtype);
+                try skipValue(mapped, &cur, vtype, 0);
             }
         }
 
-        const tensors = try allocator.alloc(TensorInfo, @intCast(n_tensors));
+        const n_tensors_usize: usize = @intCast(n_tensors);
+        const tensors = try allocator.alloc(TensorInfo, n_tensors_usize);
         errdefer allocator.free(tensors);
 
         var index: std.StringHashMapUnmanaged(usize) = .empty;
         errdefer index.deinit(allocator);
-        try index.ensureTotalCapacity(allocator, @intCast(n_tensors));
+        try index.ensureTotalCapacity(allocator, @intCast(n_tensors_usize));
 
-        for (0..@as(usize, @intCast(n_tensors))) |i| {
-            const name = readStr(mapped, &cur);
-            const n_dims = readInt(u32, mapped, &cur);
+        for (0..n_tensors_usize) |i| {
+            const name = try readStr(mapped, &cur);
+            const n_dims = try readInt(u32, mapped, &cur);
             if (n_dims > 4) return error.TooManyDims;
             var dims: [4]u64 = .{ 1, 1, 1, 1 };
             for (0..n_dims) |d| {
-                dims[d] = readInt(u64, mapped, &cur);
+                dims[d] = try readInt(u64, mapped, &cur);
             }
-            const ttype: GgmlType = @enumFromInt(readInt(u32, mapped, &cur));
-            const offset = readInt(u64, mapped, &cur);
+            const ttype: GgmlType = @enumFromInt(try readInt(u32, mapped, &cur));
+            const offset = try readInt(u64, mapped, &cur);
             tensors[i] = .{
                 .name = name,
                 .n_dims = n_dims,
@@ -169,7 +191,16 @@ pub const GgufFile = struct {
             index.putAssumeCapacity(name, i);
         }
 
-        const data_offset = alignUp(@as(u64, cur), alignment);
+        const data_offset = try alignUp(@as(u64, cur), alignment);
+        if (data_offset > mapped.len) return error.UnexpectedEof;
+
+        // Validate every tensor slice fits inside mapped file so tensorBytes() is always in-bounds
+        for (tensors) |*t| {
+            const bsz = try t.checkedByteSize();
+            const start = std.math.add(u64, data_offset, t.offset) catch return error.InvalidGguf;
+            const end = std.math.add(u64, start, bsz) catch return error.InvalidGguf;
+            if (end > mapped.len) return error.UnexpectedEof;
+        }
 
         return .{
             .fd = fd,
@@ -233,39 +264,48 @@ pub const GgufFile = struct {
         }
 
         for (0..@as(usize, @intCast(self.n_kv))) |_| {
-            const key = readStr(self.mapped, &cur);
-            const vtype = readInt(u32, self.mapped, &cur);
+            const key = try readStr(self.mapped, &cur);
+            const vtype = try readInt(u32, self.mapped, &cur);
             if (std.mem.eql(u8, key, "tokenizer.ggml.tokens") and vtype == 9) {
-                const elem_type = readInt(u32, self.mapped, &cur);
-                const len: usize = @intCast(readInt(u64, self.mapped, &cur));
-                if (elem_type != 8) return error.InvalidTokenizerMeta;
+                const elem_type = try readInt(u32, self.mapped, &cur);
+                const len_u64 = try readInt(u64, self.mapped, &cur);
+                if (elem_type != 8 or len_u64 > self.mapped.len / 8) return error.InvalidTokenizerMeta;
+                const len: usize = @intCast(len_u64);
                 const arr = try allocator.alloc([]const u8, len);
-                for (0..len) |i| arr[i] = readStr(self.mapped, &cur);
+                errdefer allocator.free(arr);
+                for (0..len) |i| arr[i] = try readStr(self.mapped, &cur);
+                if (meta.tokens.len > 0) allocator.free(meta.tokens);
                 meta.tokens = arr;
             } else if (std.mem.eql(u8, key, "tokenizer.ggml.merges") and vtype == 9) {
-                const elem_type = readInt(u32, self.mapped, &cur);
-                const len: usize = @intCast(readInt(u64, self.mapped, &cur));
-                if (elem_type != 8) return error.InvalidTokenizerMeta;
+                const elem_type = try readInt(u32, self.mapped, &cur);
+                const len_u64 = try readInt(u64, self.mapped, &cur);
+                if (elem_type != 8 or len_u64 > self.mapped.len / 8) return error.InvalidTokenizerMeta;
+                const len: usize = @intCast(len_u64);
                 const arr = try allocator.alloc([]const u8, len);
-                for (0..len) |i| arr[i] = readStr(self.mapped, &cur);
+                errdefer allocator.free(arr);
+                for (0..len) |i| arr[i] = try readStr(self.mapped, &cur);
+                if (meta.merges.len > 0) allocator.free(meta.merges);
                 meta.merges = arr;
             } else if (std.mem.eql(u8, key, "tokenizer.ggml.token_type") and vtype == 9) {
-                const elem_type = readInt(u32, self.mapped, &cur);
-                const len: usize = @intCast(readInt(u64, self.mapped, &cur));
-                if (elem_type != 5) return error.InvalidTokenizerMeta;
+                const elem_type = try readInt(u32, self.mapped, &cur);
+                const len_u64 = try readInt(u64, self.mapped, &cur);
+                if (elem_type != 5 or len_u64 > self.mapped.len / 4) return error.InvalidTokenizerMeta;
+                const len: usize = @intCast(len_u64);
                 const arr = try allocator.alloc(i32, len);
-                for (0..len) |i| arr[i] = readInt(i32, self.mapped, &cur);
+                errdefer allocator.free(arr);
+                for (0..len) |i| arr[i] = try readInt(i32, self.mapped, &cur);
+                if (meta.token_types.len > 0) allocator.free(meta.token_types);
                 meta.token_types = arr;
             } else if (std.mem.eql(u8, key, "tokenizer.ggml.eos_token_id") and vtype == 4) {
-                meta.eos_id = readInt(u32, self.mapped, &cur);
+                meta.eos_id = try readInt(u32, self.mapped, &cur);
             } else if (std.mem.eql(u8, key, "tokenizer.ggml.bos_token_id") and vtype == 4) {
-                meta.bos_id = readInt(u32, self.mapped, &cur);
+                meta.bos_id = try readInt(u32, self.mapped, &cur);
             } else if (std.mem.eql(u8, key, "tokenizer.ggml.padding_token_id") and vtype == 4) {
-                meta.pad_id = readInt(u32, self.mapped, &cur);
+                meta.pad_id = try readInt(u32, self.mapped, &cur);
             } else if (std.mem.eql(u8, key, "tokenizer.ggml.mask_token_id") and vtype == 4) {
-                meta.mask_id = readInt(u32, self.mapped, &cur);
+                meta.mask_id = try readInt(u32, self.mapped, &cur);
             } else {
-                try skipValue(self.mapped, &cur, vtype);
+                try skipValue(self.mapped, &cur, vtype, 0);
             }
         }
         return meta;
@@ -274,65 +314,90 @@ pub const GgufFile = struct {
     pub fn readDflashTargetLayers(self: *const GgufFile, out: *[5]u32) !usize {
         var cur: usize = 4 + 4 + 8 + 8;
         for (0..@as(usize, @intCast(self.n_kv))) |_| {
-            const key = readStr(self.mapped, &cur);
-            const vtype = readInt(u32, self.mapped, &cur);
+            const key = try readStr(self.mapped, &cur);
+            const vtype = try readInt(u32, self.mapped, &cur);
             if (std.mem.eql(u8, key, "dflash.target_layers") and vtype == 9) {
-                const elem_type = readInt(u32, self.mapped, &cur);
-                const len: usize = @intCast(readInt(u64, self.mapped, &cur));
+                const elem_type = try readInt(u32, self.mapped, &cur);
+                const len_u64 = try readInt(u64, self.mapped, &cur);
+                if (len_u64 > self.mapped.len / 4) return error.InvalidTargetLayers;
+                const len: usize = @intCast(len_u64);
                 const n = @min(len, out.len);
                 for (0..len) |i| {
                     const v: u32 = switch (elem_type) {
-                        4 => readInt(u32, self.mapped, &cur),
-                        5 => @intCast(readInt(i32, self.mapped, &cur)),
+                        4 => try readInt(u32, self.mapped, &cur),
+                        5 => blk: {
+                            const iv = try readInt(i32, self.mapped, &cur);
+                            if (iv < 0) return error.InvalidTargetLayers;
+                            break :blk @intCast(iv);
+                        },
                         else => return error.InvalidTargetLayers,
                     };
                     if (i < n) out[i] = v;
                 }
                 return n;
             } else {
-                try skipValue(self.mapped, &cur, vtype);
+                try skipValue(self.mapped, &cur, vtype, 0);
             }
         }
         return 0;
     }
 };
 
-fn alignUp(v: u64, a: u64) u64 {
-    return (v + a - 1) & ~(a - 1);
+fn alignUp(v: u64, a: u64) !u64 {
+    if (a == 0 or (a & (a - 1)) != 0) return error.InvalidAlignment;
+    const sum = std.math.add(u64, v, a - 1) catch return error.InvalidGguf;
+    return sum & ~(a - 1);
 }
 
-fn readInt(comptime T: type, buf: []const u8, cur: *usize) T {
+fn readInt(comptime T: type, buf: []const u8, cur: *usize) !T {
     const sz = @sizeOf(T);
+    if (cur.* > buf.len or buf.len - cur.* < sz) return error.UnexpectedEof;
     const val = std.mem.readInt(T, buf[cur.*..][0..sz], .little);
     cur.* += sz;
     return val;
 }
 
-fn readStr(buf: []const u8, cur: *usize) []const u8 {
-    const len: usize = @intCast(readInt(u64, buf, cur));
+fn readStr(buf: []const u8, cur: *usize) ![]const u8 {
+    const len_u64 = try readInt(u64, buf, cur);
+    if (len_u64 > buf.len - cur.*) return error.UnexpectedEof;
+    const len: usize = @intCast(len_u64);
     const s = buf[cur.* .. cur.* + len];
     cur.* += len;
     return s;
 }
 
-fn skipValue(buf: []const u8, cur: *usize, vtype: u32) !void {
+fn skipBytes(buf: []const u8, cur: *usize, n: usize) !void {
+    if (cur.* > buf.len or buf.len - cur.* < n) return error.UnexpectedEof;
+    cur.* += n;
+}
+
+fn skipValue(buf: []const u8, cur: *usize, vtype: u32, depth: usize) !void {
+    if (depth > MAX_SKIP_DEPTH) return error.InvalidGguf;
     switch (vtype) {
-        0, 1, 7 => cur.* += 1,
-        2, 3 => cur.* += 2,
-        4, 5, 6 => cur.* += 4,
-        10, 11, 12 => cur.* += 8,
-        8 => _ = readStr(buf, cur),
+        0, 1, 7 => try skipBytes(buf, cur, 1),
+        2, 3 => try skipBytes(buf, cur, 2),
+        4, 5, 6 => try skipBytes(buf, cur, 4),
+        10, 11, 12 => try skipBytes(buf, cur, 8),
+        8 => _ = try readStr(buf, cur),
         9 => {
-            const elem_type = readInt(u32, buf, cur);
-            const len: usize = @intCast(readInt(u64, buf, cur));
-            switch (elem_type) {
-                0, 1, 7 => cur.* += len,
-                2, 3 => cur.* += len * 2,
-                4, 5, 6 => cur.* += len * 4,
-                10, 11, 12 => cur.* += len * 8,
-                else => {
-                    for (0..len) |_| try skipValue(buf, cur, elem_type);
-                },
+            const elem_type = try readInt(u32, buf, cur);
+            const len_u64 = try readInt(u64, buf, cur);
+            const elem_size: ?u64 = switch (elem_type) {
+                0, 1, 7 => 1,
+                2, 3 => 2,
+                4, 5, 6 => 4,
+                10, 11, 12 => 8,
+                else => null,
+            };
+            if (elem_size) |esz| {
+                const total = std.math.mul(u64, len_u64, esz) catch return error.UnexpectedEof;
+                if (total > buf.len - cur.*) return error.UnexpectedEof;
+                cur.* += @intCast(total);
+            } else {
+                if (len_u64 > buf.len - cur.*) return error.UnexpectedEof;
+                for (0..@as(usize, @intCast(len_u64))) |_| {
+                    try skipValue(buf, cur, elem_type, depth + 1);
+                }
             }
         },
         else => return error.UnknownGgufValueType,
@@ -349,4 +414,23 @@ test "GgmlType byte size calculation" {
     };
     // 5120 * 248320 / 32 * 18 = 715,161,600 B (~682 MiB)
     try std.testing.expectEqual(@as(u64, 715_161_600), q4.byteSize());
+    try std.testing.expectEqual(@as(u64, 715_161_600), try q4.checkedByteSize());
+}
+
+test "gguf bounds and overflow checks reject malformed data" {
+    try std.testing.expectError(error.InvalidAlignment, alignUp(16, 0));
+    try std.testing.expectError(error.InvalidAlignment, alignUp(16, 3));
+    try std.testing.expectEqual(@as(u64, 32), try alignUp(17, 32));
+
+    var cur: usize = 0;
+    const tiny = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    try std.testing.expectError(error.UnexpectedEof, readStr(&tiny, &cur));
+
+    // Array with huge element count overflowing len * 8
+    cur = 0;
+    const bad_arr = [_]u8{
+        10, 0, 0, 0, // elem_type = u64
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x3f, // len = huge
+    };
+    try std.testing.expectError(error.UnexpectedEof, skipValue(&bad_arr, &cur, 9, 0));
 }

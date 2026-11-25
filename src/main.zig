@@ -43,7 +43,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "generate")) {
         try runGenerate(allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "serve")) {
-        try runServe(allocator, args[2..]);
+        try runServe(init.gpa, args[2..]);
     } else {
         std.debug.print(
             \\kintsugi-zig — dedicated sm_89 CUDA runtime for Kintsugi-27B + DFlash2
@@ -1029,20 +1029,39 @@ fn runServe(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
+        if (std.mem.eql(u8, args[i], "--host")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("error: --host requires an argument\n", .{});
+                return error.InvalidArgs;
+            }
             i += 1;
             cfg.host = args[i];
-        } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--port")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("error: --port requires an argument\n", .{});
+                return error.InvalidArgs;
+            }
             i += 1;
             cfg.port = try std.fmt.parseInt(u16, args[i], 10);
-        } else if (std.mem.eql(u8, args[i], "--model") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--model")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("error: --model requires an argument\n", .{});
+                return error.InvalidArgs;
+            }
             i += 1;
             cfg.model_path = args[i];
-        } else if (std.mem.eql(u8, args[i], "--draft") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--draft")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("error: --draft requires an argument\n", .{});
+                return error.InvalidArgs;
+            }
             i += 1;
             cfg.drafter_path = args[i];
         } else if (std.mem.eql(u8, args[i], "--no-spec")) {
             cfg.use_spec = false;
+        } else {
+            std.debug.print("error: unknown serve flag '{s}'\n", .{args[i]});
+            return error.InvalidArgs;
         }
     }
     try server_mod.run(allocator, cfg);

@@ -33,6 +33,7 @@ pub const Tokenizer = struct {
 
         try self.vocab_map.ensureTotalCapacity(allocator, @intCast(meta.tokens.len));
         errdefer self.vocab_map.deinit(allocator);
+        errdefer self.specials.deinit(allocator);
         for (meta.tokens, 0..) |tok, idx| {
             self.vocab_map.putAssumeCapacity(tok, @intCast(idx));
             if (idx < meta.token_types.len and (meta.token_types[idx] == 3 or meta.token_types[idx] == 4) and tok.len > 0) {
@@ -123,10 +124,11 @@ pub const Tokenizer = struct {
         return try out.toOwnedSlice(allocator);
     }
 
-    pub fn encode(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
-        var ids: std.ArrayListUnmanaged(u32) = .empty;
-        errdefer ids.deinit(allocator);
-
+    pub fn encodeAppend(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8, parse_special: bool, ids: *std.ArrayListUnmanaged(u32)) !void {
+        if (!parse_special) {
+            try self.encodePlainSegment(allocator, text, ids);
+            return;
+        }
         var pos: usize = 0;
         var seg_start: usize = 0;
         while (pos < text.len) {
@@ -141,7 +143,7 @@ pub const Tokenizer = struct {
             }
             if (matched) |sp| {
                 if (pos > seg_start) {
-                    try self.encodePlainSegment(allocator, text[seg_start..pos], &ids);
+                    try self.encodePlainSegment(allocator, text[seg_start..pos], ids);
                 }
                 try ids.append(allocator, sp.id);
                 pos += sp.text.len;
@@ -151,8 +153,14 @@ pub const Tokenizer = struct {
             }
         }
         if (seg_start < text.len) {
-            try self.encodePlainSegment(allocator, text[seg_start..], &ids);
+            try self.encodePlainSegment(allocator, text[seg_start..], ids);
         }
+    }
+
+    pub fn encode(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+        var ids: std.ArrayListUnmanaged(u32) = .empty;
+        errdefer ids.deinit(allocator);
+        try self.encodeAppend(allocator, text, true, &ids);
         return try ids.toOwnedSlice(allocator);
     }
 

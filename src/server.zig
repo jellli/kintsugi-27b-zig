@@ -167,6 +167,16 @@ fn sendHttpJson(fd: std.c.fd_t, allocator: std.mem.Allocator, status: []const u8
     }
 }
 
+fn sendHttpNoContent(fd: std.c.fd_t) !void {
+    const hdr =
+        "HTTP/1.1 204 No Content\r\n" ++
+        "Access-Control-Allow-Origin: *\r\n" ++
+        "Access-Control-Allow-Headers: *\r\n" ++
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" ++
+        "Connection: close\r\n\r\n";
+    try sendAll(fd, hdr);
+}
+
 fn sendSseHeaders(fd: std.c.fd_t) !void {
     const hdr =
         "HTTP/1.1 200 OK\r\n" ++
@@ -203,47 +213,69 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+/// Incremental O(N) HTTP/1.1 Transfer-Encoding: chunked decoder with overflow-safe bounds checks.
+const ChunkedDecoder = struct {
+    pos: usize = 0,
+    done_chunks: bool = false,
+    out: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn deinit(self: *ChunkedDecoder, allocator: std.mem.Allocator) void {
+        self.out.deinit(allocator);
+    }
+
+    /// Advances over `data` (the cumulative chunked payload slice starting at byte 0).
+    /// Returns `true` when the terminating `0\r\n...\r\n` has been completely received.
+    fn advance(self: *ChunkedDecoder, allocator: std.mem.Allocator, data: []const u8) !bool {
+        while (true) {
+            if (self.done_chunks) {
+                if (data.len - self.pos >= 2 and std.mem.eql(u8, data[self.pos .. self.pos + 2], "\r\n")) {
+                    return true;
+                }
+                if (std.mem.indexOfPos(u8, data, self.pos, "\r\n\r\n") != null) {
+                    return true;
+                }
+                return false;
+            }
+
+            const crlf = std.mem.indexOfPos(u8, data, self.pos, "\r\n") orelse return false;
+            const size_line = data[self.pos..crlf];
+            const semi = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
+            const size_str = std.mem.trim(u8, size_line[0..semi], " \t");
+            if (size_str.len == 0) return error.InvalidChunkedBody;
+            const chunk_len = std.fmt.parseInt(usize, size_str, 16) catch return error.InvalidChunkedBody;
+            const data_start = crlf + 2;
+
+            if (chunk_len == 0) {
+                self.pos = data_start;
+                self.done_chunks = true;
+                continue;
+            }
+
+            if (chunk_len > MAX_REQ_BODY - self.out.items.len) return error.BodyTooLarge;
+            const avail = data.len - data_start;
+            if (avail < 2 or chunk_len > avail - 2) {
+                return false;
+            }
+            const chunk_end = data_start + chunk_len;
+            if (!std.mem.eql(u8, data[chunk_end .. chunk_end + 2], "\r\n")) {
+                return error.InvalidChunkedBody;
+            }
+            try self.out.appendSlice(allocator, data[data_start..chunk_end]);
+            self.pos = chunk_end + 2;
+        }
+    }
+};
+
 /// Decodes an HTTP/1.1 Transfer-Encoding: chunked body.
 /// Returns `null` if more bytes are needed to reach the terminating `0\r\n\r\n` chunk.
 pub fn tryDecodeChunkedBody(allocator: std.mem.Allocator, data: []const u8) !?[]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    var pos: usize = 0;
-    while (true) {
-        const crlf = std.mem.indexOfPos(u8, data, pos, "\r\n") orelse {
-            out.deinit(allocator);
-            return null;
-        };
-        const size_line = data[pos..crlf];
-        const semi = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
-        const size_str = std.mem.trim(u8, size_line[0..semi], " \t");
-        const chunk_len = std.fmt.parseInt(usize, size_str, 16) catch return error.InvalidChunkedBody;
-        pos = crlf + 2;
-
-        if (chunk_len == 0) {
-            // Wait for trailing CRLF (or trailers + CRLF)
-            if (pos + 2 <= data.len and std.mem.eql(u8, data[pos .. pos + 2], "\r\n")) {
-                return try out.toOwnedSlice(allocator);
-            }
-            if (std.mem.indexOfPos(u8, data, pos, "\r\n\r\n") != null) {
-                return try out.toOwnedSlice(allocator);
-            }
-            out.deinit(allocator);
-            return null;
-        }
-
-        if (out.items.len + chunk_len > MAX_REQ_BODY) return error.BodyTooLarge;
-        if (pos + chunk_len + 2 > data.len) {
-            out.deinit(allocator);
-            return null;
-        }
-        try out.appendSlice(allocator, data[pos .. pos + chunk_len]);
-        if (!std.mem.eql(u8, data[pos + chunk_len .. pos + chunk_len + 2], "\r\n")) {
-            return error.InvalidChunkedBody;
-        }
-        pos += chunk_len + 2;
+    var dec: ChunkedDecoder = .{};
+    errdefer dec.deinit(allocator);
+    if (try dec.advance(allocator, data)) {
+        return try dec.out.toOwnedSlice(allocator);
     }
+    dec.deinit(allocator);
+    return null;
 }
 
 fn readHttpRequest(allocator: std.mem.Allocator, fd: std.c.fd_t) !?HttpRequest {
@@ -303,9 +335,11 @@ fn readHttpRequest(allocator: std.mem.Allocator, fd: std.c.fd_t) !?HttpRequest {
     errdefer if (owned_body) |ob| allocator.free(ob);
 
     if (is_chunked) {
+        var dec: ChunkedDecoder = .{};
+        errdefer dec.deinit(allocator);
         while (true) {
-            if (try tryDecodeChunkedBody(allocator, buf.items[hend..])) |decoded| {
-                owned_body = decoded;
+            if (try dec.advance(allocator, buf.items[hend..])) {
+                owned_body = try dec.out.toOwnedSlice(allocator);
                 break;
             }
             const n = std.c.recv(fd, &tmp, tmp.len, 0);
@@ -317,7 +351,7 @@ fn readHttpRequest(allocator: std.mem.Allocator, fd: std.c.fd_t) !?HttpRequest {
         const total_needed = hend + content_length;
         while (buf.items.len < total_needed) {
             const n = std.c.recv(fd, &tmp, tmp.len, 0);
-            if (n <= 0) break;
+            if (n <= 0) return error.IncompleteBody;
             try buf.appendSlice(allocator, tmp[0..@intCast(n)]);
         }
     }
@@ -338,7 +372,7 @@ fn readHttpRequest(allocator: std.mem.Allocator, fd: std.c.fd_t) !?HttpRequest {
     const body_slice = if (owned_body) |ob|
         ob
     else
-        raw[hend..@min(raw.len, hend + content_length)];
+        raw[hend .. hend + content_length];
 
     return .{
         .method = method,
@@ -373,12 +407,27 @@ fn parseMaxTokens(v: std.json.Value) ?usize {
 
 fn parseGenParams(obj: std.json.ObjectMap) GenParams {
     var p: GenParams = .{};
+    var got_max_tokens = false;
     if (obj.get("max_completion_tokens")) |v| {
-        if (parseMaxTokens(v)) |n| p.max_tokens = n;
-    } else if (obj.get("max_tokens")) |v| {
-        if (parseMaxTokens(v)) |n| p.max_tokens = n;
-    } else if (obj.get("n_predict")) |v| {
-        if (parseMaxTokens(v)) |n| p.max_tokens = n;
+        if (parseMaxTokens(v)) |n| {
+            p.max_tokens = n;
+            got_max_tokens = true;
+        }
+    }
+    if (!got_max_tokens) {
+        if (obj.get("max_tokens")) |v| {
+            if (parseMaxTokens(v)) |n| {
+                p.max_tokens = n;
+                got_max_tokens = true;
+            }
+        }
+    }
+    if (!got_max_tokens) {
+        if (obj.get("n_predict")) |v| {
+            if (parseMaxTokens(v)) |n| {
+                p.max_tokens = n;
+            }
+        }
     }
     if (obj.get("temperature")) |v| {
         if (jsonFloat(v)) |f| p.temperature = f;
@@ -520,16 +569,26 @@ pub fn parseReasoningEffort(obj: std.json.ObjectMap) ReasoningEffort {
                 }
             }
             if (th.object.get("budget_tokens")) |bv| {
-                const budget: i64 = switch (bv) {
-                    .integer => |i| i,
-                    .float => |f| @intFromFloat(f),
-                    else => -1,
-                };
-                if (budget == 0) return .none;
-                if (budget > 0) {
-                    if (budget <= 2048) return .low;
-                    if (budget <= 8192) return .medium;
-                    return .xhigh;
+                switch (bv) {
+                    .integer => |budget| {
+                        if (budget == 0) return .none;
+                        if (budget > 0) {
+                            if (budget <= 2048) return .low;
+                            if (budget <= 8192) return .medium;
+                            return .xhigh;
+                        }
+                    },
+                    .float => |f| {
+                        if (!std.math.isNan(f)) {
+                            if (f == 0.0) return .none;
+                            if (f > 0.0) {
+                                if (f <= 2048.0) return .low;
+                                if (f <= 8192.0) return .medium;
+                                return .xhigh;
+                            }
+                        }
+                    },
+                    else => {},
                 }
             }
         } else if (th == .string) {
@@ -591,49 +650,71 @@ fn appendJsonValue(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocato
     try out.appendSlice(allocator, s);
 }
 
-pub fn formatChatMl(
+const ChatMlEncoded = struct {
+    tokens: []u32,
+    sys_end_tok: ?usize = null,
+    turn_end_tok: ?usize = null,
+};
+
+fn isSystemLikeRole(role: []const u8) bool {
+    return std.mem.eql(u8, role, "system") or std.mem.eql(u8, role, "developer");
+}
+
+fn emitChatMl(
     allocator: std.mem.Allocator,
     messages: []const std.json.Value,
     effort: ReasoningEffort,
     tools_opt: ?[]const std.json.Value,
-) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-
+    sink: anytype,
+) !void {
     const reasoning_instr = effort.instructions();
     const has_tools = if (tools_opt) |ts| ts.len > 0 else false;
 
-    // 1. System block (matching Kintsugi-27B GGUF tokenizer.chat_template)
-    var first_is_system = false;
+    // 1. Leading system / developer block (matching Kintsugi-27B GGUF tokenizer.chat_template)
+    var leading_sys_count: usize = 0;
     var sys_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer sys_buf.deinit(allocator);
-    if (messages.len > 0 and messages[0] == .object) {
-        if (messages[0].object.get("role")) |rv| {
-            if (rv == .string and std.mem.eql(u8, rv.string, "system")) {
-                first_is_system = true;
-                try appendMessageContent(&sys_buf, allocator, messages[0].object.get("content"));
-            }
+    while (leading_sys_count < messages.len and messages[leading_sys_count] == .object) {
+        const rv = messages[leading_sys_count].object.get("role") orelse break;
+        if (rv != .string or !isSystemLikeRole(rv.string)) break;
+        var part: std.ArrayListUnmanaged(u8) = .empty;
+        defer part.deinit(allocator);
+        try appendMessageContent(&part, allocator, messages[leading_sys_count].object.get("content"));
+        const trimmed_part = std.mem.trim(u8, part.items, " \t\r\n");
+        if (trimmed_part.len > 0) {
+            if (sys_buf.items.len > 0) try sys_buf.appendSlice(allocator, "\n\n");
+            try sys_buf.appendSlice(allocator, trimmed_part);
         }
+        leading_sys_count += 1;
     }
     const sys_trimmed = std.mem.trim(u8, sys_buf.items, " \t\r\n");
 
     if (has_tools) {
-        try out.appendSlice(allocator, "<|im_start|>system\n");
+        try sink.appendSpecial("<|im_start|>");
+        try sink.appendPlain("system\n");
         if (reasoning_instr.len > 0) {
-            try out.appendSlice(allocator, reasoning_instr);
-            try out.appendSlice(allocator, "\n\n");
+            try sink.appendPlain(reasoning_instr);
+            try sink.appendPlain("\n\n");
         }
-        try out.appendSlice(allocator, "# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        try sink.appendPlain("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        var tool_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer tool_buf.deinit(allocator);
         for (tools_opt.?) |tool| {
-            try out.append(allocator, '\n');
-            try appendJsonValue(&out, allocator, tool);
+            try sink.appendPlain("\n");
+            tool_buf.clearRetainingCapacity();
+            try appendJsonValue(&tool_buf, allocator, tool);
+            try sink.appendPlain(tool_buf.items);
         }
-        try out.appendSlice(
-            allocator,
-            "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n" ++
-                "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n" ++
+        try sink.appendPlain("\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n");
+        try sink.appendSpecial("<tool_call>");
+        try sink.appendPlain(
+            "\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n" ++
                 "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n" ++
-                "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n" ++
+                "</parameter>\n</function>\n",
+        );
+        try sink.appendSpecial("</tool_call>");
+        try sink.appendPlain(
+            "\n\n<IMPORTANT>\nReminder:\n" ++
                 "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n" ++
                 "- Required parameters MUST be specified\n" ++
                 "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n" ++
@@ -641,47 +722,59 @@ pub fn formatChatMl(
                 "</IMPORTANT>",
         );
         if (sys_trimmed.len > 0) {
-            try out.appendSlice(allocator, "\n\n");
-            try out.appendSlice(allocator, sys_trimmed);
+            try sink.appendPlain("\n\n");
+            try sink.appendPlain(sys_trimmed);
         }
-        try out.appendSlice(allocator, "<|im_end|>\n");
+        try sink.appendSpecial("<|im_end|>");
+        try sink.appendPlain("\n");
+        try sink.markSystemBoundary();
     } else if (sys_trimmed.len > 0 or reasoning_instr.len > 0) {
-        try out.appendSlice(allocator, "<|im_start|>system\n");
+        try sink.appendSpecial("<|im_start|>");
+        try sink.appendPlain("system\n");
         if (reasoning_instr.len > 0) {
-            try out.appendSlice(allocator, reasoning_instr);
-            if (sys_trimmed.len > 0) try out.appendSlice(allocator, "\n\n");
+            try sink.appendPlain(reasoning_instr);
+            if (sys_trimmed.len > 0) try sink.appendPlain("\n\n");
         }
         if (sys_trimmed.len > 0) {
-            try out.appendSlice(allocator, sys_trimmed);
+            try sink.appendPlain(sys_trimmed);
         }
-        try out.appendSlice(allocator, "<|im_end|>\n");
+        try sink.appendSpecial("<|im_end|>");
+        try sink.appendPlain("\n");
+        try sink.markSystemBoundary();
     }
 
     // 2. Conversation turns
     var msg_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer msg_buf.deinit(allocator);
+    var val_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer val_buf.deinit(allocator);
     var in_tool_group = false;
 
-    for (messages, 0..) |m, idx| {
+    for (messages[leading_sys_count..]) |m| {
         if (m != .object) continue;
-        const role = if (m.object.get("role")) |rv| (if (rv == .string) rv.string else "user") else "user";
-        if (idx == 0 and first_is_system) continue;
+        const raw_role = if (m.object.get("role")) |rv| (if (rv == .string) rv.string else "user") else "user";
+        const role = if (std.mem.eql(u8, raw_role, "developer")) "system" else raw_role;
 
         if (std.mem.eql(u8, role, "tool")) {
             if (!in_tool_group) {
-                try out.appendSlice(allocator, "<|im_start|>user");
+                try sink.appendSpecial("<|im_start|>");
+                try sink.appendPlain("user");
                 in_tool_group = true;
             }
             msg_buf.clearRetainingCapacity();
             try appendMessageContent(&msg_buf, allocator, m.object.get("content"));
-            try out.appendSlice(allocator, "\n<tool_response>\n");
-            try out.appendSlice(allocator, std.mem.trim(u8, msg_buf.items, " \t\r\n"));
-            try out.appendSlice(allocator, "\n</tool_response>");
+            try sink.appendPlain("\n");
+            try sink.appendSpecial("<tool_response>");
+            try sink.appendPlain("\n");
+            try sink.appendPlain(std.mem.trim(u8, msg_buf.items, " \t\r\n"));
+            try sink.appendPlain("\n");
+            try sink.appendSpecial("</tool_response>");
             continue;
         }
 
         if (in_tool_group) {
-            try out.appendSlice(allocator, "<|im_end|>\n");
+            try sink.appendSpecial("<|im_end|>");
+            try sink.appendPlain("\n");
             in_tool_group = false;
         }
 
@@ -690,7 +783,8 @@ pub fn formatChatMl(
         const content_trimmed = std.mem.trim(u8, msg_buf.items, " \t\r\n");
 
         if (std.mem.eql(u8, role, "assistant")) {
-            try out.appendSlice(allocator, "<|im_start|>assistant\n");
+            try sink.appendSpecial("<|im_start|>");
+            try sink.appendPlain("assistant\n");
             const rc_raw = if (m.object.get("reasoning_content") orelse m.object.get("reasoning")) |rv|
                 (if (rv == .string) rv.string else "")
             else
@@ -699,12 +793,23 @@ pub fn formatChatMl(
 
             if (rc_trimmed.len == 0 and std.mem.startsWith(u8, content_trimmed, "<think>")) {
                 // Client already embedded <think>...</think> inline in content
-                try out.appendSlice(allocator, content_trimmed);
+                try sink.appendSpecial("<think>");
+                const rest = content_trimmed["<think>".len..];
+                if (std.mem.indexOf(u8, rest, "</think>")) |cidx| {
+                    try sink.appendPlain(rest[0..cidx]);
+                    try sink.appendSpecial("</think>");
+                    try sink.appendPlain(rest[cidx + "</think>".len ..]);
+                } else {
+                    try sink.appendPlain(rest);
+                }
             } else {
-                try out.appendSlice(allocator, "<think>\n");
-                try out.appendSlice(allocator, rc_trimmed);
-                try out.appendSlice(allocator, "\n</think>\n\n");
-                try out.appendSlice(allocator, content_trimmed);
+                try sink.appendSpecial("<think>");
+                try sink.appendPlain("\n");
+                try sink.appendPlain(rc_trimmed);
+                try sink.appendPlain("\n");
+                try sink.appendSpecial("</think>");
+                try sink.appendPlain("\n\n");
+                try sink.appendPlain(content_trimmed);
             }
 
             if (m.object.get("tool_calls")) |tcv| {
@@ -717,13 +822,14 @@ pub fn formatChatMl(
                             tc_item.object;
                         const fn_name = if (fn_obj.get("name")) |nv| (if (nv == .string) nv.string else "") else "";
                         if (tc_i == 0) {
-                            if (content_trimmed.len > 0) try out.appendSlice(allocator, "\n\n");
+                            if (content_trimmed.len > 0) try sink.appendPlain("\n\n");
                         } else {
-                            try out.append(allocator, '\n');
+                            try sink.appendPlain("\n");
                         }
-                        try out.appendSlice(allocator, "<tool_call>\n<function=");
-                        try out.appendSlice(allocator, fn_name);
-                        try out.appendSlice(allocator, ">\n");
+                        try sink.appendSpecial("<tool_call>");
+                        try sink.appendPlain("\n<function=");
+                        try sink.appendPlain(fn_name);
+                        try sink.appendPlain(">\n");
                         if (fn_obj.get("arguments")) |av| {
                             var parsed_args: ?std.json.Parsed(std.json.Value) = null;
                             defer if (parsed_args) |*pa| pa.deinit();
@@ -741,43 +847,147 @@ pub fn formatChatMl(
                             if (args_map_opt) |amap| {
                                 var it = amap.iterator();
                                 while (it.next()) |entry| {
-                                    try out.appendSlice(allocator, "<parameter=");
-                                    try out.appendSlice(allocator, entry.key_ptr.*);
-                                    try out.appendSlice(allocator, ">\n");
+                                    try sink.appendPlain("<parameter=");
+                                    try sink.appendPlain(entry.key_ptr.*);
+                                    try sink.appendPlain(">\n");
                                     if (entry.value_ptr.* == .string) {
-                                        try out.appendSlice(allocator, entry.value_ptr.string);
+                                        try sink.appendPlain(entry.value_ptr.string);
                                     } else {
-                                        try appendJsonValue(&out, allocator, entry.value_ptr.*);
+                                        val_buf.clearRetainingCapacity();
+                                        try appendJsonValue(&val_buf, allocator, entry.value_ptr.*);
+                                        try sink.appendPlain(val_buf.items);
                                     }
-                                    try out.appendSlice(allocator, "\n</parameter>\n");
+                                    try sink.appendPlain("\n</parameter>\n");
+                                }
+                            } else if (av == .string) {
+                                const raw_args = std.mem.trim(u8, av.string, " \t\r\n");
+                                if (raw_args.len > 0) {
+                                    try sink.appendPlain("<parameter=arguments>\n");
+                                    try sink.appendPlain(raw_args);
+                                    try sink.appendPlain("\n</parameter>\n");
                                 }
                             }
                         }
-                        try out.appendSlice(allocator, "</function>\n</tool_call>");
+                        try sink.appendPlain("</function>\n");
+                        try sink.appendSpecial("</tool_call>");
                     }
                 }
             }
-            try out.appendSlice(allocator, "<|im_end|>\n");
+            try sink.appendSpecial("<|im_end|>");
+            try sink.appendPlain("\n");
         } else {
-            try out.appendSlice(allocator, "<|im_start|>");
-            try out.appendSlice(allocator, role);
-            try out.append(allocator, '\n');
-            try out.appendSlice(allocator, content_trimmed);
-            try out.appendSlice(allocator, "<|im_end|>\n");
+            try sink.appendSpecial("<|im_start|>");
+            try sink.appendPlain(role);
+            try sink.appendPlain("\n");
+            try sink.appendPlain(content_trimmed);
+            try sink.appendSpecial("<|im_end|>");
+            try sink.appendPlain("\n");
         }
     }
     if (in_tool_group) {
-        try out.appendSlice(allocator, "<|im_end|>\n");
+        try sink.appendSpecial("<|im_end|>");
+        try sink.appendPlain("\n");
     }
 
     // 3. Generation prompt (exact GGUF chat_template!)
-    try out.appendSlice(allocator, "<|im_start|>assistant\n");
+    try sink.appendSpecial("<|im_start|>");
+    try sink.appendPlain("assistant\n");
+    try sink.markTurnBoundary();
     if (effort == .none) {
-        try out.appendSlice(allocator, "<think>\n\n</think>\n\n");
+        try sink.appendSpecial("<think>");
+        try sink.appendPlain("\n\n");
+        try sink.appendSpecial("</think>");
+        try sink.appendPlain("\n\n");
     } else {
-        try out.appendSlice(allocator, "<think>\n");
+        try sink.appendSpecial("<think>");
+        try sink.appendPlain("\n");
     }
-    return try out.toOwnedSlice(allocator);
+}
+
+pub fn formatChatMl(
+    allocator: std.mem.Allocator,
+    messages: []const std.json.Value,
+    effort: ReasoningEffort,
+    tools_opt: ?[]const std.json.Value,
+) ![]u8 {
+    const TextSink = struct {
+        allocator: std.mem.Allocator,
+        out: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn appendSpecial(s: *@This(), text: []const u8) !void {
+            try s.out.appendSlice(s.allocator, text);
+        }
+        fn appendPlain(s: *@This(), text: []const u8) !void {
+            try s.out.appendSlice(s.allocator, text);
+        }
+        fn markSystemBoundary(_: *@This()) !void {}
+        fn markTurnBoundary(_: *@This()) !void {}
+    };
+
+    var sink: TextSink = .{ .allocator = allocator };
+    errdefer sink.out.deinit(allocator);
+    try emitChatMl(allocator, messages, effort, tools_opt, &sink);
+    return try sink.out.toOwnedSlice(allocator);
+}
+
+/// Encodes ChatML messages directly to token IDs in a single BPE pass:
+/// - Template delimiters (`<|im_start|>`, `<|im_end|>`, `<think>`, `</think>`, `<tool_call>`, etc.)
+///   are encoded with special-token lookup.
+/// - Untrusted message / tool / system text is encoded as plain BPE so literal `<|im_end|>` inside
+///   code or files cannot inject EOS or hijack turns.
+/// - Exact system-prompt and pre-`<think>` turn boundaries are recorded with zero duplicate BPE.
+fn encodeChatMl(
+    allocator: std.mem.Allocator,
+    tok: *const tokenizer_mod.Tokenizer,
+    messages: []const std.json.Value,
+    effort: ReasoningEffort,
+    tools_opt: ?[]const std.json.Value,
+) !ChatMlEncoded {
+    const TokenSink = struct {
+        allocator: std.mem.Allocator,
+        tok: *const tokenizer_mod.Tokenizer,
+        plain: std.ArrayListUnmanaged(u8) = .empty,
+        ids: std.ArrayListUnmanaged(u32) = .empty,
+        sys_end_tok: ?usize = null,
+        turn_end_tok: ?usize = null,
+
+        fn flushPlain(s: *@This()) !void {
+            if (s.plain.items.len == 0) return;
+            try s.tok.encodeAppend(s.allocator, s.plain.items, false, &s.ids);
+            s.plain.clearRetainingCapacity();
+        }
+        fn appendSpecial(s: *@This(), text: []const u8) !void {
+            try s.flushPlain();
+            try s.tok.encodeAppend(s.allocator, text, true, &s.ids);
+        }
+        fn appendPlain(s: *@This(), text: []const u8) !void {
+            try s.plain.appendSlice(s.allocator, text);
+        }
+        fn markSystemBoundary(s: *@This()) !void {
+            try s.flushPlain();
+            if (s.ids.items.len >= 256) {
+                s.sys_end_tok = s.ids.items.len;
+            }
+        }
+        fn markTurnBoundary(s: *@This()) !void {
+            try s.flushPlain();
+            if (s.ids.items.len >= 64) {
+                s.turn_end_tok = s.ids.items.len;
+            }
+        }
+    };
+
+    var sink: TokenSink = .{ .allocator = allocator, .tok = tok };
+    defer sink.plain.deinit(allocator);
+    errdefer sink.ids.deinit(allocator);
+
+    try emitChatMl(allocator, messages, effort, tools_opt, &sink);
+    try sink.flushPlain();
+    return .{
+        .tokens = try sink.ids.toOwnedSlice(allocator),
+        .sys_end_tok = sink.sys_end_tok,
+        .turn_end_tok = sink.turn_end_tok,
+    };
 }
 
 fn findStopInText(text: []const u8, stops: []const []const u8) ?usize {
@@ -953,6 +1163,44 @@ fn stripOneTrailingNl(s: []const u8) []const u8 {
     return s;
 }
 
+fn extractSchemaType(prop_obj: std.json.ObjectMap) ?[]const u8 {
+    if (prop_obj.get("type")) |type_val| {
+        switch (type_val) {
+            .string => |s| return s,
+            .array => |arr| {
+                var non_null: ?[]const u8 = null;
+                for (arr.items) |item| {
+                    if (item == .string and !std.mem.eql(u8, item.string, "null")) {
+                        if (std.mem.eql(u8, item.string, "string")) return "string";
+                        if (non_null == null) non_null = item.string;
+                    }
+                }
+                return non_null;
+            },
+            else => {},
+        }
+    }
+    for ([_][]const u8{ "anyOf", "oneOf" }) |union_key| {
+        if (prop_obj.get(union_key)) |uv| {
+            if (uv == .array) {
+                var non_null: ?[]const u8 = null;
+                for (uv.array.items) |branch| {
+                    if (branch == .object) {
+                        if (branch.object.get("type")) |bt| {
+                            if (bt == .string and !std.mem.eql(u8, bt.string, "null")) {
+                                if (std.mem.eql(u8, bt.string, "string")) return "string";
+                                if (non_null == null) non_null = bt.string;
+                            }
+                        }
+                    }
+                }
+                if (non_null != null) return non_null;
+            }
+        }
+    }
+    return null;
+}
+
 fn lookupToolParamType(
     tools_opt: ?[]const std.json.Value,
     fn_name: []const u8,
@@ -973,9 +1221,7 @@ fn lookupToolParamType(
         if (props_val != .object) return null;
         const prop_val = props_val.object.get(param_name) orelse return null;
         if (prop_val != .object) return null;
-        const type_val = prop_val.object.get("type") orelse return null;
-        if (type_val == .string) return type_val.string;
-        return null;
+        return extractSchemaType(prop_val.object);
     }
     return null;
 }
@@ -1001,6 +1247,7 @@ const ToolCallParser = struct {
     tools_opt: ?[]const std.json.Value,
     phase: Phase = .outside,
     buf: std.ArrayListUnmanaged(u8) = .empty,
+    scan_pos: usize = 0,
     calls: std.ArrayListUnmanaged(ToolCallRecord) = .empty,
     call_opened_brace: bool = false,
     strip_leading_nl: bool = false,
@@ -1027,6 +1274,7 @@ const ToolCallParser = struct {
             std.mem.copyForwards(u8, self.buf.items[0..rem], self.buf.items[n..]);
         }
         self.buf.shrinkRetainingCapacity(rem);
+        self.scan_pos -|= n;
     }
 
     fn trimFrontWs(self: *ToolCallParser) void {
@@ -1159,6 +1407,7 @@ const ToolCallParser = struct {
                             try sink.onContent(before);
                         }
                         self.consumeFront(idx + "<tool_call>".len);
+                        self.scan_pos = 0;
                         self.phase = .await_call_body;
                         continue;
                     }
@@ -1184,6 +1433,7 @@ const ToolCallParser = struct {
                     if (self.buf.items.len == 0) break;
 
                     if (self.buf.items[0] == '{') {
+                        self.scan_pos = 0;
                         self.phase = .in_json_call;
                         continue;
                     }
@@ -1194,6 +1444,7 @@ const ToolCallParser = struct {
                                 try sink.onContent("<tool_call>");
                                 try sink.onContent(self.buf.items);
                                 self.buf.clearRetainingCapacity();
+                                self.scan_pos = 0;
                                 self.phase = .outside;
                             }
                             break;
@@ -1201,11 +1452,13 @@ const ToolCallParser = struct {
                         const fn_name = std.mem.trim(u8, self.buf.items["<function=".len .. gt_idx], " \t\r\n");
                         try self.beginCall(fn_name, sink);
                         self.consumeFront(gt_idx + 1);
+                        self.scan_pos = 0;
                         self.phase = .await_param;
                         continue;
                     }
                     if (std.mem.startsWith(u8, self.buf.items, "</tool_call>")) {
                         self.consumeFront("</tool_call>".len);
+                        self.scan_pos = 0;
                         self.phase = .outside;
                         continue;
                     }
@@ -1216,19 +1469,26 @@ const ToolCallParser = struct {
                     }
                     // Unexpected body inside <tool_call>: fall back to content
                     try sink.onContent("<tool_call>");
+                    self.scan_pos = 0;
                     self.phase = .outside;
                     continue;
                 },
 
                 .in_json_call => {
-                    const end_idx = std.mem.indexOf(u8, self.buf.items, "</tool_call>") orelse break;
+                    const close_tag = "</tool_call>";
+                    const search_from = self.scan_pos -| (close_tag.len - 1);
+                    const end_idx = std.mem.indexOfPos(u8, self.buf.items, search_from, close_tag) orelse {
+                        self.scan_pos = self.buf.items.len;
+                        break;
+                    };
                     const raw_json = std.mem.trim(u8, self.buf.items[0..end_idx], " \t\r\n");
                     const ok = try self.emitJsonFallbackCall(raw_json, sink);
                     if (!ok) {
                         try sink.onContent("<tool_call>");
-                        try sink.onContent(self.buf.items[0 .. end_idx + "</tool_call>".len]);
+                        try sink.onContent(self.buf.items[0 .. end_idx + close_tag.len]);
                     }
-                    self.consumeFront(end_idx + "</tool_call>".len);
+                    self.consumeFront(end_idx + close_tag.len);
+                    self.scan_pos = 0;
                     self.phase = .outside;
                     continue;
                 },
@@ -1238,7 +1498,14 @@ const ToolCallParser = struct {
                     if (self.buf.items.len == 0) break;
 
                     if (std.mem.startsWith(u8, self.buf.items, "<parameter=")) {
-                        const gt_idx = std.mem.indexOfScalarPos(u8, self.buf.items, "<parameter=".len, '>') orelse break;
+                        const gt_idx = std.mem.indexOfScalarPos(u8, self.buf.items, "<parameter=".len, '>') orelse {
+                            if (self.buf.items.len > 256) {
+                                // Malformed huge parameter header; drop current malformed tag to avoid unbounded buffering
+                                self.buf.clearRetainingCapacity();
+                                self.scan_pos = 0;
+                            }
+                            break;
+                        };
                         const param_name = std.mem.trim(u8, self.buf.items["<parameter=".len .. gt_idx], " \t\r\n");
                         const cur_fn_name = self.calls.items[self.calls.items.len - 1].name;
                         const ptype = lookupToolParamType(self.tools_opt, cur_fn_name, param_name);
@@ -1259,6 +1526,7 @@ const ToolCallParser = struct {
 
                         try self.emitArgsDelta(key_prefix.items, sink);
                         self.consumeFront(gt_idx + 1);
+                        self.scan_pos = 0;
                         self.cur_param_type = ptype;
                         self.strip_leading_nl = true;
                         self.phase = if (is_str) .in_string_param else .in_typed_param;
@@ -1267,12 +1535,14 @@ const ToolCallParser = struct {
                     if (std.mem.startsWith(u8, self.buf.items, "</function>")) {
                         self.consumeFront("</function>".len);
                         try self.emitArgsDelta(if (self.call_opened_brace) "}" else "{}", sink);
+                        self.scan_pos = 0;
                         self.phase = .await_call_close;
                         continue;
                     }
                     if (std.mem.startsWith(u8, self.buf.items, "</tool_call>")) {
                         self.consumeFront("</tool_call>".len);
                         try self.emitArgsDelta(if (self.call_opened_brace) "}" else "{}", sink);
+                        self.scan_pos = 0;
                         self.phase = .outside;
                         continue;
                     }
@@ -1288,6 +1558,7 @@ const ToolCallParser = struct {
                         continue;
                     }
                     self.buf.clearRetainingCapacity();
+                    self.scan_pos = 0;
                     break;
                 },
 
@@ -1297,6 +1568,7 @@ const ToolCallParser = struct {
                         const val_chunk = stripOneTrailingNl(self.buf.items[0..end_idx]);
                         try self.emitJsonEscapedValueChunk(val_chunk, true, sink);
                         self.consumeFront(end_idx + "</parameter>".len);
+                        self.scan_pos = 0;
                         self.phase = .await_param;
                         continue;
                     }
@@ -1315,13 +1587,17 @@ const ToolCallParser = struct {
 
                 .in_typed_param => {
                     if (!self.tryStripOneLeadingNl()) break;
-                    if (std.mem.indexOf(u8, self.buf.items, "</parameter>")) |end_idx| {
+                    const close_tag = "</parameter>";
+                    const search_from = self.scan_pos -| (close_tag.len - 1);
+                    if (std.mem.indexOfPos(u8, self.buf.items, search_from, close_tag)) |end_idx| {
                         const val_chunk = stripOneTrailingNl(self.buf.items[0..end_idx]);
                         try self.emitTypedParamValue(val_chunk, sink);
-                        self.consumeFront(end_idx + "</parameter>".len);
+                        self.consumeFront(end_idx + close_tag.len);
+                        self.scan_pos = 0;
                         self.phase = .await_param;
                         continue;
                     }
+                    self.scan_pos = self.buf.items.len;
                     break;
                 },
 
@@ -1330,6 +1606,7 @@ const ToolCallParser = struct {
                     if (self.buf.items.len == 0) break;
                     if (std.mem.startsWith(u8, self.buf.items, "</tool_call>")) {
                         self.consumeFront("</tool_call>".len);
+                        self.scan_pos = 0;
                         self.phase = .outside;
                         continue;
                     }
@@ -1337,9 +1614,11 @@ const ToolCallParser = struct {
                         break;
                     }
                     if (std.mem.startsWith(u8, self.buf.items, "<function=")) {
+                        self.scan_pos = 0;
                         self.phase = .await_call_body;
                         continue;
                     }
+                    self.scan_pos = 0;
                     self.phase = .outside;
                     continue;
                 },
@@ -1347,7 +1626,7 @@ const ToolCallParser = struct {
         }
     }
 
-    fn finish(self: *ToolCallParser, sink: anytype) !void {
+    fn finish(self: *ToolCallParser, sink: anytype, truncated_by_length: bool) !void {
         switch (self.phase) {
             .outside => {
                 if (self.buf.items.len > 0 and !(self.calls.items.len > 0 and isAllAsciiWs(self.buf.items))) {
@@ -1355,17 +1634,32 @@ const ToolCallParser = struct {
                 }
             },
             .in_string_param => {
-                const rem = stripOneTrailingNl(self.buf.items);
-                try self.emitJsonEscapedValueChunk(rem, true, sink);
-                try self.emitArgsDelta("}", sink);
+                if (truncated_by_length) {
+                    // Do NOT fabricate closing quotes/braces on max_tokens truncation so clients don't execute half-written tool calls
+                    if (self.buf.items.len > 0) {
+                        try self.emitJsonEscapedValueChunk(self.buf.items, false, sink);
+                    }
+                } else {
+                    const rem = stripOneTrailingNl(self.buf.items);
+                    try self.emitJsonEscapedValueChunk(rem, true, sink);
+                    try self.emitArgsDelta("}", sink);
+                }
             },
             .in_typed_param => {
-                const rem = stripOneTrailingNl(self.buf.items);
-                try self.emitTypedParamValue(rem, sink);
-                try self.emitArgsDelta("}", sink);
+                if (truncated_by_length) {
+                    if (self.buf.items.len > 0) {
+                        try self.emitArgsDelta(self.buf.items, sink);
+                    }
+                } else {
+                    const rem = stripOneTrailingNl(self.buf.items);
+                    try self.emitTypedParamValue(rem, sink);
+                    try self.emitArgsDelta("}", sink);
+                }
             },
             .await_param => {
-                try self.emitArgsDelta(if (self.call_opened_brace) "}" else "{}", sink);
+                if (!truncated_by_length) {
+                    try self.emitArgsDelta(if (self.call_opened_brace) "}" else "{}", sink);
+                }
             },
             .in_json_call => {
                 const raw_json = std.mem.trim(u8, self.buf.items, " \t\r\n");
@@ -1383,6 +1677,7 @@ const ToolCallParser = struct {
             .await_call_close => {},
         }
         self.buf.clearRetainingCapacity();
+        self.scan_pos = 0;
         self.phase = .outside;
     }
 };
@@ -1418,6 +1713,7 @@ const ServerState = struct {
     tok: *tokenizer_mod.Tokenizer,
     eng: *engine_mod.Engine,
     dflash: ?*dflash_mod.DFlashEngine,
+    boot_nonce: u32 = 0,
     req_counter: u64 = 0,
     active_tokens: std.ArrayListUnmanaged(u32) = .empty,
     checkpoints: [MAX_CHECKPOINTS]PrefixCheckpoint = .{ .{}, .{}, .{}, .{} },
@@ -1430,7 +1726,7 @@ const ServerState = struct {
 
     fn nextReqId(self: *ServerState, prefix: []const u8, buf: []u8) []const u8 {
         self.req_counter += 1;
-        return std.fmt.bufPrint(buf, "{s}-kintsugi-{d}", .{ prefix, self.req_counter }) catch "kintsugi-0";
+        return std.fmt.bufPrint(buf, "{s}-kintsugi-{x:0>8}-{d}", .{ prefix, self.boot_nonce, self.req_counter }) catch "kintsugi-0";
     }
 
     fn invalidateCheckpointsAfter(self: *ServerState, keep_pos: u32) void {
@@ -1520,53 +1816,17 @@ const ServerState = struct {
         return res;
     }
 
-    /// Detect the token length of the first ChatML message (`...<|im_end|>\n`, e.g. system prompt + tools)
-    /// when it is long enough to be worth pinning as a reusable prefix checkpoint.
-    fn detectSystemBoundary(self: *ServerState, prompt: []const u8, prompt_toks: []const u32) ?usize {
-        const marker = "<|im_end|>\n";
-        const idx = std.mem.indexOf(u8, prompt, marker) orelse return null;
-        const byte_end = idx + marker.len;
-        if (byte_end < 512 or byte_end >= prompt.len) return null;
-        const sys_toks = self.tok.encode(self.allocator, prompt[0..byte_end]) catch return null;
-        defer self.allocator.free(sys_toks);
-        if (sys_toks.len < 256 or sys_toks.len >= prompt_toks.len) return null;
-        if (!std.mem.eql(u32, sys_toks, prompt_toks[0..sys_toks.len])) return null;
-        return sys_toks.len;
-    }
-
-    /// If the ChatML prompt ends with `<think>\n\n</think>\n\n` (effort=none) or `<think>\n` (thinking enabled),
-    /// return the token length right BEFORE `<think>` (at `<|im_start|>assistant\n`).
-    /// On the next turn, clients that strip historical `reasoning_content` send `<think>\n\n</think>\n\n`
-    /// where `\n\n` merges into a single BPE token (differing from `<think>\n` at the last token).
-    /// Checkpointing right before `<think>` guarantees multi-turn cache hits whether clients keep or strip reasoning!
-    fn detectTurnBoundary(self: *ServerState, prompt: []const u8, prompt_toks: []const u32) ?usize {
-        const suffix: []const u8 = if (std.mem.endsWith(u8, prompt, "<think>\n\n</think>\n\n"))
-            "<think>\n\n</think>\n\n"
-        else if (std.mem.endsWith(u8, prompt, "<think>\n"))
-            "<think>\n"
-        else
-            return null;
-        const prefix_bytes = prompt.len - suffix.len;
-        if (prefix_bytes == 0) return null;
-        const pre_toks = self.tok.encode(self.allocator, prompt[0..prefix_bytes]) catch return null;
-        defer self.allocator.free(pre_toks);
-        if (pre_toks.len < 64 or pre_toks.len >= prompt_toks.len) return null;
-        if (!std.mem.eql(u32, pre_toks, prompt_toks[0..pre_toks.len])) return null;
-        return pre_toks.len;
-    }
-
     fn runGeneration(
         self: *ServerState,
         fd: std.c.fd_t,
         mode: Mode,
-        prompt: []const u8,
+        prompt_toks: []const u32,
+        sys_end_tok: ?usize,
+        turn_end_tok: ?usize,
         params_in: GenParams,
         effort: ReasoningEffort,
         tools_opt: ?[]const std.json.Value,
     ) !void {
-        const prompt_toks = try self.tok.encode(self.allocator, prompt);
-        defer self.allocator.free(prompt_toks);
-
         if (prompt_toks.len == 0) {
             try sendHttpJson(fd, self.allocator, "400 Bad Request", "{\"error\":{\"message\":\"prompt must not be empty\"}}");
             return;
@@ -1601,14 +1861,7 @@ const ServerState = struct {
         const req_id = self.nextReqId(if (mode == .chat) "chatcmpl" else "cmpl", &id_buf);
         const created = unixSeconds();
 
-        if (params.stream) {
-            try sendSseHeaders(fd);
-            if (mode == .chat) {
-                try sendSseChunk(self.allocator, fd, mode, req_id, created, null, false, true, null, null);
-            }
-        }
-
-        // Prefix cache lookup: find deepest checkpoint <= min(lcp, prompt_toks.len - 1)
+        // Prefix cache lookup & prefill run BEFORE sending SSE 200 OK headers so prefill errors return HTTP 500 JSON cleanly
         const tp0 = nowMs();
         const lcp = longestCommonPrefix(self.active_tokens.items, prompt_toks);
         const max_resume: usize = @min(lcp, prompt_toks.len - 1);
@@ -1623,36 +1876,43 @@ const ServerState = struct {
         }
 
         var resume_pos: usize = 0;
-        if (best_ckpt_idx) |cidx| {
-            self.ckpt_clock += 1;
-            const ckpt = &self.checkpoints[cidx];
-            ckpt.last_used = self.ckpt_clock;
-            resume_pos = ckpt.pos;
-            self.invalidateCheckpointsAfter(ckpt.pos);
-            try self.eng.loadGdnStateFromHost(ckpt.gdn_state.?, ckpt.gdn_conv.?, ckpt.pos);
-            if (self.dflash) |df| {
-                try df.loadKvRingFromHost(ckpt.dflash_kv.?);
+        {
+            errdefer {
+                self.active_tokens.clearRetainingCapacity();
+                self.invalidateCheckpointsAfter(0);
+                self.eng.reset() catch {};
             }
-            self.active_tokens.shrinkRetainingCapacity(resume_pos);
-        } else {
-            self.invalidateCheckpointsAfter(0);
-            self.active_tokens.clearRetainingCapacity();
-            try self.eng.reset();
+            if (best_ckpt_idx) |cidx| {
+                self.ckpt_clock += 1;
+                const ckpt = &self.checkpoints[cidx];
+                ckpt.last_used = self.ckpt_clock;
+                resume_pos = ckpt.pos;
+                self.invalidateCheckpointsAfter(ckpt.pos);
+                try self.eng.loadGdnStateFromHost(ckpt.gdn_state.?, ckpt.gdn_conv.?, ckpt.pos);
+                if (self.dflash) |df| {
+                    try df.loadKvRingFromHost(ckpt.dflash_kv.?);
+                }
+                self.active_tokens.shrinkRetainingCapacity(resume_pos);
+            } else {
+                self.invalidateCheckpointsAfter(0);
+                self.active_tokens.clearRetainingCapacity();
+                try self.eng.reset();
+            }
         }
         self.eng.capture_enabled = (self.dflash != null);
 
         var rng = std.Random.DefaultPrng.init(params.seed);
 
-        // Prefill uncached suffix (saving a pinned system-prompt checkpoint & turn-end checkpoint if crossed)
+        // Prefill uncached suffix (saving pinned system-prompt & pre-<think> turn-end checkpoints when crossed)
         var cur_pos: usize = resume_pos;
-        if (self.detectSystemBoundary(prompt, prompt_toks)) |sys_end| {
+        if (sys_end_tok) |sys_end| {
             if (cur_pos < sys_end and sys_end < prompt_toks.len) {
                 _ = try self.prefillSegment(prompt_toks[cur_pos..sys_end], false);
                 try self.saveCheckpoint(@intCast(sys_end), true);
                 cur_pos = sys_end;
             }
         }
-        if (self.detectTurnBoundary(prompt, prompt_toks)) |turn_end| {
+        if (turn_end_tok) |turn_end| {
             if (cur_pos < turn_end and turn_end < prompt_toks.len) {
                 _ = try self.prefillSegment(prompt_toks[cur_pos..turn_end], false);
                 try self.saveCheckpoint(@intCast(turn_end), false);
@@ -1666,6 +1926,13 @@ const ServerState = struct {
             try self.saveCheckpoint(@intCast(prompt_toks.len), false);
         }
         const tp1 = nowMs();
+
+        if (params.stream) {
+            try sendSseHeaders(fd);
+            if (mode == .chat) {
+                try sendSseChunk(self.allocator, fd, mode, req_id, created, null, false, true, null, null);
+            }
+        }
 
         var stats: GenStats = .{
             .prompt_tokens = prompt_toks.len,
@@ -1684,6 +1951,9 @@ const ServerState = struct {
 
         var piece_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer piece_buf.deinit(self.allocator);
+
+        var think_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer think_buf.deinit(self.allocator);
 
         var max_stop_len: usize = 0;
         for (params.stops[0..params.n_stops]) |st| {
@@ -1709,6 +1979,7 @@ const ServerState = struct {
 
             fn onContent(s: *@This(), chunk: []const u8) !void {
                 if (chunk.len == 0 or s.hit_stop) return;
+                const old_len = s.full_t.items.len;
                 try s.full_t.appendSlice(s.allocator, chunk);
                 if (s.params.stream) {
                     try s.pend.appendSlice(s.allocator, chunk);
@@ -1740,8 +2011,10 @@ const ServerState = struct {
                         }
                     }
                 } else if (s.params.n_stops > 0) {
-                    if (findStopInText(s.full_t.items, s.params.stops[0..s.params.n_stops])) |sidx| {
-                        s.full_t.shrinkRetainingCapacity(sidx);
+                    // O(chunk + max_sl) incremental stop scan instead of O(N^2) from index 0
+                    const scan_start = old_len -| (s.max_sl -| 1);
+                    if (findStopInText(s.full_t.items[scan_start..], s.params.stops[0..s.params.n_stops])) |rel_idx| {
+                        s.full_t.shrinkRetainingCapacity(scan_start + rel_idx);
                         s.stats.finish_reason = "stop";
                         s.hit_stop = true;
                     }
@@ -1780,19 +2053,40 @@ const ServerState = struct {
             in_thinking: bool,
             strip_post_think_nl: bool = false,
             has_tools: bool,
+            max_sl: usize,
             reasoning: *std.ArrayListUnmanaged(u8),
+            tbuf: *std.ArrayListUnmanaged(u8),
             parser: *ToolCallParser,
             sink: *LiveToolSink,
         };
         var think_st: ThinkState = .{
             .in_thinking = (mode == .chat and effort != .none),
             .has_tools = has_tools,
+            .max_sl = max_stop_len,
             .reasoning = &reasoning_text,
+            .tbuf = &think_buf,
             .parser = &tool_parser,
             .sink = &tool_sink,
         };
 
         const emitToken = struct {
+            fn flushReasoning(
+                allocator: std.mem.Allocator,
+                fd_c: std.c.fd_t,
+                mode_c: Mode,
+                req_id_c: []const u8,
+                created_c: i64,
+                stream: bool,
+                t_st: *ThinkState,
+                chunk: []const u8,
+            ) !void {
+                if (chunk.len == 0) return;
+                try t_st.reasoning.appendSlice(allocator, chunk);
+                if (stream) {
+                    try sendSseChunk(allocator, fd_c, mode_c, req_id_c, created_c, chunk, true, false, null, null);
+                }
+            }
+
             fn call(
                 st_self: *ServerState,
                 tok_id: u32,
@@ -1802,7 +2096,6 @@ const ServerState = struct {
                 created_c: i64,
                 p_c: GenParams,
                 p_buf: *std.ArrayListUnmanaged(u8),
-                pend: *std.ArrayListUnmanaged(u8),
                 t_st: *ThinkState,
                 g_stats: *GenStats,
             ) !bool {
@@ -1816,9 +2109,10 @@ const ServerState = struct {
 
                 var piece: []const u8 = p_buf.items;
 
-                // Separate <think>...</think> into OpenAI/DeepSeek reasoning_content vs content
+                // Separate <think>...</think> into OpenAI/DeepSeek reasoning_content vs content,
+                // holding back partial `</think>` / stop tails across token boundaries.
                 if (mode_c == .chat and t_st.in_thinking) {
-                    if (std.mem.eql(u8, piece, "<think>")) {
+                    if (t_st.reasoning.items.len == 0 and t_st.tbuf.items.len == 0 and std.mem.eql(u8, piece, "<think>")) {
                         // Prompt already opened <think>\n; ignore any redundant opening tag
                         if (g_stats.completion_tokens >= p_c.max_tokens) {
                             g_stats.finish_reason = "length";
@@ -1826,23 +2120,35 @@ const ServerState = struct {
                         }
                         return false;
                     }
-                    if (std.mem.indexOf(u8, piece, "</think>")) |close_idx| {
-                        const before = piece[0..close_idx];
-                        if (before.len > 0) {
-                            try t_st.reasoning.appendSlice(st_self.allocator, before);
-                            if (p_c.stream) try pend.appendSlice(st_self.allocator, before);
+                    try t_st.tbuf.appendSlice(st_self.allocator, piece);
+
+                    // Check stop sequences even during thinking
+                    if (p_c.n_stops > 0) {
+                        const close_pos = std.mem.indexOf(u8, t_st.tbuf.items, "</think>");
+                        if (findStopInText(t_st.tbuf.items, p_c.stops[0..p_c.n_stops])) |sidx| {
+                            if (close_pos == null or sidx < close_pos.?) {
+                                try flushReasoning(st_self.allocator, fd_c, mode_c, req_id_c, created_c, p_c.stream, t_st, t_st.tbuf.items[0..sidx]);
+                                t_st.tbuf.clearRetainingCapacity();
+                                g_stats.finish_reason = "stop";
+                                return true;
+                            }
                         }
-                        // Flush all remaining reasoning bytes before switching to content mode
-                        if (p_c.stream and pend.items.len > 0) {
-                            try sendSseChunk(st_self.allocator, fd_c, mode_c, req_id_c, created_c, pend.items, true, false, null, null);
-                            pend.clearRetainingCapacity();
-                        }
+                    }
+
+                    if (std.mem.indexOf(u8, t_st.tbuf.items, "</think>")) |close_idx| {
+                        try flushReasoning(st_self.allocator, fd_c, mode_c, req_id_c, created_c, p_c.stream, t_st, t_st.tbuf.items[0..close_idx]);
                         t_st.in_thinking = false;
                         t_st.strip_post_think_nl = true;
 
-                        const after = piece[close_idx + "</think>".len ..];
+                        const after_start = close_idx + "</think>".len;
+                        const after = t_st.tbuf.items[after_start..];
                         const after_trimmed = std.mem.trimStart(u8, after, "\r\n");
-                        if (after_trimmed.len == 0) {
+                        p_buf.clearRetainingCapacity();
+                        if (after_trimmed.len > 0) {
+                            try p_buf.appendSlice(st_self.allocator, after_trimmed);
+                        }
+                        t_st.tbuf.clearRetainingCapacity();
+                        if (p_buf.items.len == 0) {
                             if (g_stats.completion_tokens >= p_c.max_tokens) {
                                 g_stats.finish_reason = "length";
                                 return true;
@@ -1850,7 +2156,26 @@ const ServerState = struct {
                             return false;
                         }
                         t_st.strip_post_think_nl = false;
-                        piece = after_trimmed;
+                        piece = p_buf.items;
+                    } else {
+                        const tag_hold = partialTagSuffixLen(t_st.tbuf.items, "</think>");
+                        const stop_hold = if (p_c.n_stops > 0) (t_st.max_sl -| 1) else 0;
+                        const hold = @max(tag_hold, stop_hold);
+                        if (t_st.tbuf.items.len > hold) {
+                            const safe_len = t_st.tbuf.items.len - hold;
+                            const ready = utf8ReadyPrefixLen(t_st.tbuf.items[0..safe_len]);
+                            if (ready > 0) {
+                                try flushReasoning(st_self.allocator, fd_c, mode_c, req_id_c, created_c, p_c.stream, t_st, t_st.tbuf.items[0..ready]);
+                                const rem = t_st.tbuf.items.len - ready;
+                                std.mem.copyForwards(u8, t_st.tbuf.items[0..rem], t_st.tbuf.items[ready..]);
+                                t_st.tbuf.shrinkRetainingCapacity(rem);
+                            }
+                        }
+                        if (g_stats.completion_tokens >= p_c.max_tokens) {
+                            g_stats.finish_reason = "length";
+                            return true;
+                        }
+                        return false;
                     }
                 } else if (mode_c == .chat and t_st.strip_post_think_nl) {
                     const trimmed = std.mem.trimStart(u8, piece, "\r\n");
@@ -1865,19 +2190,7 @@ const ServerState = struct {
                     piece = trimmed;
                 }
 
-                if (mode_c == .chat and t_st.in_thinking) {
-                    try t_st.reasoning.appendSlice(st_self.allocator, piece);
-                    if (p_c.stream) {
-                        try pend.appendSlice(st_self.allocator, piece);
-                        const ready = utf8ReadyPrefixLen(pend.items);
-                        if (ready > 0) {
-                            try sendSseChunk(st_self.allocator, fd_c, mode_c, req_id_c, created_c, pend.items[0..ready], true, false, null, null);
-                            const rem = pend.items.len - ready;
-                            std.mem.copyForwards(u8, pend.items[0..rem], pend.items[ready..]);
-                            pend.shrinkRetainingCapacity(rem);
-                        }
-                    }
-                } else if (t_st.has_tools) {
+                if (t_st.has_tools) {
                     try t_st.parser.feed(piece, t_st.sink);
                     if (t_st.sink.hit_stop) return true;
                 } else {
@@ -1897,7 +2210,7 @@ const ServerState = struct {
 
         const td0 = nowMs();
         if (params.max_tokens > 0) {
-            var stopped = try emitToken(self, cur, fd, mode, req_id, created, params, &piece_buf, &stream_pending, &think_st, &stats);
+            var stopped = try emitToken(self, cur, fd, mode, req_id, created, params, &piece_buf, &think_st, &stats);
 
             if (!stopped) {
                 if (self.dflash) |df| {
@@ -1922,7 +2235,7 @@ const ServerState = struct {
                                 out.tokens[k]
                             else
                                 engine_mod.sampleFromCandidates(&out.cands[k], params.temperature, params.top_k, params.top_p, &rng);
-                            stopped = try emitToken(self, t_tok, fd, mode, req_id, created, params, &piece_buf, &stream_pending, &think_st, &stats);
+                            stopped = try emitToken(self, t_tok, fd, mode, req_id, created, params, &piece_buf, &think_st, &stats);
                             if (stopped) break;
                             if (t_tok == draft_toks[k]) {
                                 n_acc += 1;
@@ -1938,7 +2251,7 @@ const ServerState = struct {
                                 out.tokens[n_draft]
                             else
                                 engine_mod.sampleFromCandidates(&out.cands[n_draft], params.temperature, params.top_k, params.top_p, &rng);
-                            stopped = try emitToken(self, bonus, fd, mode, req_id, created, params, &piece_buf, &stream_pending, &think_st, &stats);
+                            stopped = try emitToken(self, bonus, fd, mode, req_id, created, params, &piece_buf, &think_st, &stats);
                             next_tok = bonus;
                         }
                         if (stopped) break;
@@ -1955,13 +2268,22 @@ const ServerState = struct {
                         const out = try self.eng.forward(&[_]u32{cur}, true, true);
                         try self.active_tokens.append(self.allocator, cur);
                         cur = engine_mod.sampleFromCandidates(&out.cands[0], params.temperature, params.top_k, params.top_p, &rng);
-                        stopped = try emitToken(self, cur, fd, mode, req_id, created, params, &piece_buf, &stream_pending, &think_st, &stats);
+                        stopped = try emitToken(self, cur, fd, mode, req_id, created, params, &piece_buf, &think_st, &stats);
                     }
                 }
             }
         }
+        // Flush any held-back thinking tail if generation ended while still in thinking mode
+        if (think_buf.items.len > 0) {
+            try reasoning_text.appendSlice(self.allocator, think_buf.items);
+            if (params.stream) {
+                try sendSseChunk(self.allocator, fd, mode, req_id, created, think_buf.items, true, false, null, null);
+            }
+            think_buf.clearRetainingCapacity();
+        }
         if (has_tools) {
-            try tool_parser.finish(&tool_sink);
+            const truncated = std.mem.eql(u8, stats.finish_reason, "length");
+            try tool_parser.finish(&tool_sink, truncated);
             if (tool_parser.calls.items.len > 0 and std.mem.eql(u8, stats.finish_reason, "stop")) {
                 stats.finish_reason = "tool_calls";
             }
@@ -1972,7 +2294,7 @@ const ServerState = struct {
         if (params.stream) {
             // Flush any buffered UTF-8 / stop-tail bytes before final chunk
             if (stream_pending.items.len > 0) {
-                try sendSseChunk(self.allocator, fd, mode, req_id, created, stream_pending.items, mode == .chat and think_st.in_thinking, false, null, null);
+                try sendSseChunk(self.allocator, fd, mode, req_id, created, stream_pending.items, false, false, null, null);
                 stream_pending.clearRetainingCapacity();
             }
             try sendSseChunk(self.allocator, fd, mode, req_id, created, null, false, false, stats.finish_reason, stats);
@@ -2077,11 +2399,25 @@ const ServerState = struct {
     }
 
     fn handleClient(self: *ServerState, fd: std.c.fd_t) !void {
-        var req = (try readHttpRequest(self.allocator, fd)) orelse return;
+        const req_opt = readHttpRequest(self.allocator, fd) catch |err| {
+            switch (err) {
+                error.BodyTooLarge, error.HeadersTooLarge => {
+                    sendHttpJson(fd, self.allocator, "413 Payload Too Large", "{\"error\":{\"message\":\"request exceeds size limit\"}}") catch {};
+                    return;
+                },
+                error.MalformedRequest, error.InvalidContentLength, error.InvalidChunkedBody, error.IncompleteBody, error.IncompleteChunkedBody => {
+                    sendHttpJson(fd, self.allocator, "400 Bad Request", "{\"error\":{\"message\":\"malformed or incomplete HTTP request\"}}") catch {};
+                    return;
+                },
+                error.RecvFailed => return,
+                else => return err,
+            }
+        };
+        var req = req_opt orelse return;
         defer req.deinit(self.allocator);
 
         if (std.mem.eql(u8, req.method, "OPTIONS")) {
-            try sendHttpJson(fd, self.allocator, "204 No Content", "");
+            try sendHttpNoContent(fd);
             return;
         }
 
@@ -2152,7 +2488,9 @@ const ServerState = struct {
                 return;
             }
             const params = parseGenParams(parsed.value.object);
-            try self.runGeneration(fd, .completion, prompt_val.string, params, .none, null);
+            const prompt_toks = try self.tok.encode(self.allocator, prompt_val.string);
+            defer self.allocator.free(prompt_toks);
+            try self.runGeneration(fd, .completion, prompt_toks, null, null, params, .none, null);
             return;
         }
 
@@ -2175,14 +2513,18 @@ const ServerState = struct {
                 return;
             }
             const effort = parseReasoningEffort(parsed.value.object);
-            const tools_opt: ?[]const std.json.Value = if (parsed.value.object.get("tools")) |tv|
-                (if (tv == .array) tv.array.items else null)
+            const tool_choice_none = if (parsed.value.object.get("tool_choice")) |tc|
+                (tc == .string and std.ascii.eqlIgnoreCase(tc.string, "none"))
+            else
+                false;
+            const tools_opt: ?[]const std.json.Value = if (!tool_choice_none)
+                (if (parsed.value.object.get("tools")) |tv| (if (tv == .array) tv.array.items else null) else null)
             else
                 null;
-            const formatted = try formatChatMl(self.allocator, msgs_val.array.items, effort, tools_opt);
-            defer self.allocator.free(formatted);
+            const encoded = try encodeChatMl(self.allocator, self.tok, msgs_val.array.items, effort, tools_opt);
+            defer self.allocator.free(encoded.tokens);
             const params = parseGenParams(parsed.value.object);
-            try self.runGeneration(fd, .chat, formatted, params, effort, tools_opt);
+            try self.runGeneration(fd, .chat, encoded.tokens, encoded.sys_end_tok, encoded.turn_end_tok, params, effort, tools_opt);
             return;
         }
 
@@ -2296,15 +2638,21 @@ pub fn run(allocator: std.mem.Allocator, cfg: ServeConfig) !void {
         },
     );
 
+    var mono_ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &mono_ts);
+    const boot_nonce: u32 = @truncate(@as(u64, @bitCast(unixSeconds())) ^ @as(u64, @bitCast(@as(i64, mono_ts.nsec))));
+
     var state: ServerState = .{
         .allocator = allocator,
         .tok = &tok,
         .eng = &eng,
         .dflash = if (dflash_opt != null) &dflash_opt.? else null,
+        .boot_nonce = boot_nonce,
     };
     defer state.deinit();
 
-    const rcv_timeout: std.c.timeval = .{ .sec = 10, .usec = 0 };
+    const rcv_timeout: std.c.timeval = .{ .sec = 15, .usec = 0 };
+    const snd_timeout: std.c.timeval = .{ .sec = 30, .usec = 0 };
 
     while (true) {
         var client_addr: std.c.sockaddr.storage = undefined;
@@ -2314,6 +2662,7 @@ pub fn run(allocator: std.mem.Allocator, cfg: ServeConfig) !void {
         defer _ = std.c.close(client_fd);
 
         _ = std.c.setsockopt(client_fd, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, &rcv_timeout, @sizeOf(std.c.timeval));
+        _ = std.c.setsockopt(client_fd, std.c.SOL.SOCKET, std.c.SO.SNDTIMEO, &snd_timeout, @sizeOf(std.c.timeval));
 
         state.handleClient(client_fd) catch |err| {
             std.debug.print("[kintsugi-zig] request error: {}\n", .{err});
@@ -2346,7 +2695,7 @@ test "parseIpv4 parses localhost and dotted quads" {
     try std.testing.expectEqual(std.mem.nativeToBig(u32, 0x00000000), try parseIpv4("0.0.0.0"));
 }
 
-test "tryDecodeChunkedBody decodes multi-chunk HTTP bodies and handles partial data" {
+test "tryDecodeChunkedBody decodes multi-chunk HTTP bodies, handles partial data, and rejects overflow" {
     const partial = "5\r\nhello\r\n6\r\n world";
     try std.testing.expect((try tryDecodeChunkedBody(std.testing.allocator, partial)) == null);
 
@@ -2354,11 +2703,23 @@ test "tryDecodeChunkedBody decodes multi-chunk HTTP bodies and handles partial d
     const decoded = (try tryDecodeChunkedBody(std.testing.allocator, complete)).?;
     defer std.testing.allocator.free(decoded);
     try std.testing.expectEqualStrings("hello world", decoded);
+
+    // Overflow attack: chunk_len = usize max must return BodyTooLarge without integer wraparound
+    const overflow = "ffffffffffffffff\r\nabc\r\n0\r\n\r\n";
+    try std.testing.expectError(error.BodyTooLarge, tryDecodeChunkedBody(std.testing.allocator, overflow));
 }
 
-test "formatChatMl supports both string and multimodal array message content" {
+test "parseGenParams falls back when max_completion_tokens is null" {
+    const payload = "{\"max_completion_tokens\":null,\"max_tokens\":256}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const p = parseGenParams(parsed.value.object);
+    try std.testing.expectEqual(@as(usize, 256), p.max_tokens);
+}
+
+test "formatChatMl supports string, multimodal array, developer role, multi-system, and raw tool args" {
     const payload =
-        \\[{"role":"system","content":"You are helpful."},{"role":"user","content":[{"type":"text","text":"Line 1"},{"type":"text","text":"Line 2"}]}]
+        \\[{"role":"developer","content":"Rule 1."},{"role":"system","content":"Rule 2."},{"role":"user","content":[{"type":"text","text":"Line 1"},{"type":"text","text":"Line 2"}]},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"run","arguments":"not-valid-json"}}]}]
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
     defer parsed.deinit();
@@ -2366,10 +2727,8 @@ test "formatChatMl supports both string and multimodal array message content" {
     const formatted = try formatChatMl(std.testing.allocator, parsed.value.array.items, .none, null);
     defer std.testing.allocator.free(formatted);
 
-    try std.testing.expectEqualStrings(
-        "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nLine 1\nLine 2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
-        formatted,
-    );
+    try std.testing.expect(std.mem.startsWith(u8, formatted, "<|im_start|>system\nRule 1.\n\nRule 2.<|im_end|>\n<|im_start|>user\nLine 1\nLine 2<|im_end|>\n"));
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "<parameter=arguments>\nnot-valid-json\n</parameter>\n") != null);
 }
 
 test "formatChatMl injects official reasoning_effort instructions and <think> prompt" {
@@ -2396,7 +2755,7 @@ test "formatChatMl injects official reasoning_effort instructions and <think> pr
     try std.testing.expect(std.mem.endsWith(u8, xhigh, "<|im_start|>assistant\n<think>\n"));
 }
 
-test "parseReasoningEffort handles OpenAI, DeepSeek, Anthropic and vLLM fields" {
+test "parseReasoningEffort handles OpenAI, DeepSeek, Anthropic, vLLM fields and huge float budgets safely" {
     const cases = [_]struct { json: []const u8, expected: ReasoningEffort }{
         .{ .json = "{}", .expected = .xhigh },
         .{ .json = "{\"reasoning_effort\":\"low\"}", .expected = .low },
@@ -2410,6 +2769,7 @@ test "parseReasoningEffort handles OpenAI, DeepSeek, Anthropic and vLLM fields" 
         .{ .json = "{\"thinking\":{\"type\":\"disabled\"}}", .expected = .none },
         .{ .json = "{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024}}", .expected = .low },
         .{ .json = "{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":4096}}", .expected = .medium },
+        .{ .json = "{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1e30}}", .expected = .xhigh },
         .{ .json = "{\"chat_template_kwargs\":{\"reasoning_effort\":\"low\"}}", .expected = .low },
         .{ .json = "{\"chat_template_kwargs\":{\"enable_thinking\":false}}", .expected = .none },
     };
@@ -2422,7 +2782,7 @@ test "parseReasoningEffort handles OpenAI, DeepSeek, Anthropic and vLLM fields" 
 
 test "ToolCallParser streams HTML write tool call byte-by-byte without losing UTF-8 or quotes" {
     const tools_json =
-        \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}}}}}]
+        \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"file_path":{"type":["string","null"]},"content":{"anyOf":[{"type":"string"},{"type":"null"}]}}}}}]
     ;
     var parsed_tools = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, tools_json, .{});
     defer parsed_tools.deinit();
@@ -2466,11 +2826,11 @@ test "ToolCallParser streams HTML write tool call byte-by-byte without losing UT
     for (xml) |b| {
         try parser.feed(&[_]u8{b}, &sink);
     }
-    try parser.finish(&sink);
+    try parser.finish(&sink, false);
 
     try std.testing.expectEqualStrings("", sink.content.items);
     try std.testing.expectEqual(@as(usize, 1), sink.starts);
-    try std.testing.expect(sink.args_chunks > 5); // actually streamed incrementally!
+    try std.testing.expect(sink.args_chunks > 5); // actually streamed incrementally even with nullable/anyOf schemas!
     try std.testing.expectEqual(@as(usize, 1), parser.calls.items.len);
     try std.testing.expectEqualStrings("write", parser.calls.items[0].name);
     try std.testing.expectEqualStrings(parser.calls.items[0].arguments.items, sink.streamed_args.items);
@@ -2479,6 +2839,31 @@ test "ToolCallParser streams HTML write tool call byte-by-byte without losing UT
     defer args_parsed.deinit();
     try std.testing.expectEqualStrings("index.html", args_parsed.value.object.get("file_path").?.string);
     try std.testing.expectEqualStrings(html, args_parsed.value.object.get("content").?.string);
+}
+
+test "ToolCallParser does not synthesize closing braces on max_tokens length truncation" {
+    const tools_json =
+        \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}}}}}]
+    ;
+    var parsed_tools = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, tools_json, .{});
+    defer parsed_tools.deinit();
+
+    const MockSink = struct {
+        fn onContent(_: *@This(), _: []const u8) !void {}
+        fn onToolCallStart(_: *@This(), _: usize, _: []const u8, _: []const u8) !void {}
+        fn onToolCallArgsDelta(_: *@This(), _: usize, _: []const u8) !void {}
+    };
+    var sink: MockSink = .{};
+    var parser = ToolCallParser.init(std.testing.allocator, "req_trunc", parsed_tools.value.array.items);
+    defer parser.deinit();
+
+    try parser.feed("<tool_call>\n<function=write>\n<parameter=file_path>\na.html\n</parameter>\n<parameter=content>\n<html><body>half", &sink);
+    try parser.finish(&sink, true);
+
+    try std.testing.expectEqual(@as(usize, 1), parser.calls.items.len);
+    // Arguments must remain invalid/unclosed JSON so caller won't silently write a truncated file
+    const parse_res = std.json.parseFromSlice(std.json.Value, std.testing.allocator, parser.calls.items[0].arguments.items, .{});
+    try std.testing.expect(parse_res == error.UnexpectedEndOfInput);
 }
 
 test "ToolCallParser handles pre-text, multiple calls, typed params, zero-arg calls, and JSON fallback" {
@@ -2519,7 +2904,7 @@ test "ToolCallParser handles pre-text, multiple calls, typed params, zero-arg ca
         const end = @min(i + 3, raw.len);
         try parser.feed(raw[i..end], &sink);
     }
-    try parser.finish(&sink);
+    try parser.finish(&sink, false);
 
     try std.testing.expectEqualStrings("Let me check.\n\n", sink.content.items);
     try std.testing.expectEqual(@as(usize, 3), parser.calls.items.len);
